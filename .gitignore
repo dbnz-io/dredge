@@ -1,3 +1,26 @@
-__pycache__*
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets / local config
+.env
+*.pem
+*.key
+
+# Project-specific
 vbdemo*
-logs_dump_dredge/*
+logs_dump_dredge/
