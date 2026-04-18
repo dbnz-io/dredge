@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 import boto3
@@ -59,11 +60,19 @@ class AwsSessionFactory:
     def __init__(self, config: AwsAuthConfig) -> None:
         self._config = config
         self._cached_session: Optional[boto3.Session] = None
+        # Set only for assumed-role sessions; None means no expiry is tracked.
+        self._session_expiry: Optional[datetime] = None
 
     def get_session(self) -> boto3.Session:
-        if self._cached_session is None:
+        if self._cached_session is None or self._is_expiring_soon():
             self._cached_session = self._build_session()
         return self._cached_session
+
+    def _is_expiring_soon(self) -> bool:
+        """Return True if the cached session expires within 5 minutes."""
+        if self._session_expiry is None:
+            return False
+        return datetime.now(timezone.utc) >= self._session_expiry - timedelta(minutes=5)
 
     # ------------ internal helpers ------------
 
@@ -119,6 +128,10 @@ class AwsSessionFactory:
 
         resp = sts.assume_role(**assume_args)
         creds = resp["Credentials"]
+
+        # Track expiry so get_session() can refresh before credentials expire.
+        # AWS always returns Expiration for AssumeRole; use .get() for test safety.
+        self._session_expiry = creds.get("Expiration")
 
         return boto3.Session(
             aws_access_key_id=creds["AccessKeyId"],

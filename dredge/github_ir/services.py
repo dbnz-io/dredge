@@ -36,3 +36,15 @@ class GitHubServiceRegistry:
     def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{self._base_url}{path}"
         return self._session.get(url, params=params)
+
+    def post(self, path: str, json: Optional[Dict[str, Any]] = None) -> requests.Response:
+        return self._session.post(f"{self._base_url}{path}", json=json)
+
+    def put(self, path: str, json: Optional[Dict[str, Any]] = None) -> requests.Response:
+        return self._session.put(f"{self._base_url}{path}", json=json)
+
+    def delete(self, path: str) -> requests.Response:
+        return self._session.delete(f"{self._base_url}{path}")
+
+    def patch(self, path: str, json: Optional[Dict[str, Any]] = None) -> requests.Response:
+        return self._session.patch(f"{self._base_url}{path}", json=json)

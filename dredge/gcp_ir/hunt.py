@@ -10,6 +10,9 @@ from google.cloud import logging_v2 as logging
 from .config import GcpIRConfig
 from .services import GcpLoggingService
 from .models import OperationResult
+from ..log import get_logger, event as log_event
+
+_log = get_logger(__name__)
 
 
 class GcpIRHunt:
@@ -102,8 +105,9 @@ class GcpIRHunt:
                     throttle_max_retries=throttle_max_retries,
                     throttle_base_delay=throttle_base_delay,
                 )
-            except Exception as exc:
+            except (RuntimeError, g_exceptions.GoogleAPICallError) as exc:
                 result.add_error(f"GCP Logging API failed: {exc}")
+                _log.error(log_event("gcp_ir_hunt", "search_logs.api_error", target=result.target, error=str(exc)))
                 break
 
             # iterator.pages yields each page; we break after first page
@@ -290,5 +294,6 @@ class GcpIRHunt:
                         f"GCP Logging rate limit exceeded and retries exhausted: {exc}"
                     ) from exc
                 delay = throttle_base_delay * (2 ** attempt)
+                _log.warning(log_event("gcp_ir_hunt", "rate_limit", attempt=attempt, delay=delay))
                 time.sleep(delay)
                 attempt += 1
