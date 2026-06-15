@@ -8,7 +8,7 @@
 
 <div align="center">
 
-![CI](https://github.com/solidarity-labs/dredge-internal/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/dbnz-io/dredge-internal/actions/workflows/ci.yml/badge.svg)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 ![Coverage](https://img.shields.io/badge/coverage-86%25-brightgreen)
 
@@ -105,7 +105,7 @@ Dredge is designed for rapid cloud IR — especially when you don't have all the
 ## Installation
 
 ```bash
-git clone https://github.com/solidarity-labs/dredge-cli.git
+git clone https://github.com/dbnz-io/dredge-cli.git
 cd dredge-cli
 pip install -e .
 ```
@@ -290,16 +290,16 @@ Or set `GITHUB_TOKEN` in your environment.
 
 ```bash
 # Hunt today's activity for a user
-dredge --github-org solidarity-labs --github-token "$GITHUB_TOKEN" \
+dredge --github-org dbnz-io --github-token "$GITHUB_TOKEN" \
   github-hunt-audit --actor sabastante --today --include all
 
 # Hunt an action over a date range
-dredge --github-enterprise solidaritylabs --github-token "$GITHUB_TOKEN" \
+dredge --github-enterprise dbnz-io --github-token "$GITHUB_TOKEN" \
   github-hunt-audit --action repo.create \
   --start-time 2025-01-01T00:00:00Z --end-time 2025-01-07T23:59:59Z
 
 # Hunt suspicious IP activity
-dredge --github-org solidarity-labs --github-token "$GITHUB_TOKEN" \
+dredge --github-org dbnz-io --github-token "$GITHUB_TOKEN" \
   github-hunt-audit --source-ip 203.0.113.50 --today --include all
 ```
 
@@ -335,7 +335,7 @@ print(result.details["findings"])
 from dredge import Dredge
 from dredge.github_ir.config import GitHubIRConfig
 
-cfg = GitHubIRConfig(org="solidarity-labs", token="ghp_xxx")
+cfg = GitHubIRConfig(org="dbnz-io", token="ghp_xxx")
 d = Dredge(github_config=cfg)
 
 res = d.github_ir.hunt.search_today(actor="sabastante")
