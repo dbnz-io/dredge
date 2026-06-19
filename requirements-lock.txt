@@ -16,7 +16,7 @@ cffi==2.0.0
     # via cryptography
 charset-normalizer==3.4.7
     # via requests
-cryptography==46.0.6
+cryptography==48.0.1
     # via google-auth
 google-api-core[grpc]==2.30.2
     # via
