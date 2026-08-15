@@ -304,6 +304,34 @@ class TestBlockS3PublicAccess:
         result = AwsIRResponse(services, DredgeConfig()).block_s3_public_access("123456")
         assert result.success is False
 
+    def test_rollback_state_captures_prior_config(self):
+        services = make_services()
+        services.s3control.get_public_access_block.return_value = {
+            "PublicAccessBlockConfiguration": {"BlockPublicAcls": False}
+        }
+        result = AwsIRResponse(services, DredgeConfig()).block_s3_public_access("123456")
+        assert result.success is True
+        assert result.details["rollback_state"]["public_access_block_configuration"] == {
+            "BlockPublicAcls": False
+        }
+
+    def test_rollback_state_none_when_no_prior_config(self):
+        services = make_services()
+        services.s3control.get_public_access_block.side_effect = make_client_error(
+            code="NoSuchPublicAccessBlockConfiguration"
+        )
+        result = AwsIRResponse(services, DredgeConfig()).block_s3_public_access("123456")
+        assert result.success is True
+        assert result.details["rollback_state"] == {"public_access_block_configuration": None}
+
+    def test_rollback_capture_failure_is_non_fatal(self):
+        services = make_services()
+        services.s3control.get_public_access_block.side_effect = make_client_error(code="AccessDenied")
+        result = AwsIRResponse(services, DredgeConfig()).block_s3_public_access("123456")
+        assert result.success is True
+        assert "rollback_state" not in result.details
+        services.s3control.put_public_access_block.assert_called_once()
+
 
 class TestBlockS3BucketPublicAccess:
     def test_dry_run(self):
@@ -334,6 +362,44 @@ class TestBlockS3BucketPublicAccess:
         result = AwsIRResponse(services, DredgeConfig()).block_s3_bucket_public_access("my-bucket")
         assert result.success is False
 
+    def test_rollback_state_captures_pab_and_acl(self):
+        services = make_services()
+        services.s3.get_public_access_block.return_value = {
+            "PublicAccessBlockConfiguration": {"BlockPublicAcls": False}
+        }
+        services.s3.get_bucket_acl.return_value = {
+            "Owner": {"ID": "owner-1"},
+            "Grants": [{"Grantee": {"Type": "CanonicalUser"}, "Permission": "FULL_CONTROL"}],
+        }
+        result = AwsIRResponse(services, DredgeConfig()).block_s3_bucket_public_access("my-bucket")
+        assert result.success is True
+        rollback_state = result.details["rollback_state"]
+        assert rollback_state["public_access_block_configuration"] == {"BlockPublicAcls": False}
+        assert rollback_state["access_control_policy"] == {
+            "Owner": {"ID": "owner-1"},
+            "Grants": [{"Grantee": {"Type": "CanonicalUser"}, "Permission": "FULL_CONTROL"}],
+        }
+
+    def test_rollback_state_pab_none_when_absent(self):
+        services = make_services()
+        services.s3.get_public_access_block.side_effect = make_client_error(
+            code="NoSuchPublicAccessBlockConfiguration"
+        )
+        services.s3.get_bucket_acl.return_value = {"Owner": {"ID": "o"}, "Grants": []}
+        result = AwsIRResponse(services, DredgeConfig()).block_s3_bucket_public_access("my-bucket")
+        assert result.success is True
+        assert result.details["rollback_state"]["public_access_block_configuration"] is None
+
+    def test_rollback_capture_failure_is_non_fatal(self):
+        services = make_services()
+        services.s3.get_public_access_block.side_effect = make_client_error(code="AccessDenied")
+        services.s3.get_bucket_acl.side_effect = make_client_error(code="AccessDenied")
+        result = AwsIRResponse(services, DredgeConfig()).block_s3_bucket_public_access("my-bucket")
+        assert result.success is True
+        assert "rollback_state" not in result.details
+        services.s3.put_public_access_block.assert_called_once()
+        services.s3.put_bucket_acl.assert_called_once()
+
 
 class TestBlockS3ObjectPublicAccess:
     def test_dry_run(self):
@@ -352,6 +418,27 @@ class TestBlockS3ObjectPublicAccess:
         services.s3.put_object_acl.side_effect = make_client_error()
         result = AwsIRResponse(services, DredgeConfig()).block_s3_object_public_access("bucket", "k")
         assert result.success is False
+
+    def test_rollback_state_captures_prior_acl(self):
+        services = make_services()
+        services.s3.get_object_acl.return_value = {
+            "Owner": {"ID": "owner-1"},
+            "Grants": [{"Grantee": {"Type": "CanonicalUser"}, "Permission": "READ"}],
+        }
+        result = AwsIRResponse(services, DredgeConfig()).block_s3_object_public_access("bucket", "k")
+        assert result.success is True
+        assert result.details["rollback_state"]["access_control_policy"] == {
+            "Owner": {"ID": "owner-1"},
+            "Grants": [{"Grantee": {"Type": "CanonicalUser"}, "Permission": "READ"}],
+        }
+
+    def test_rollback_capture_failure_is_non_fatal(self):
+        services = make_services()
+        services.s3.get_object_acl.side_effect = make_client_error(code="AccessDenied")
+        result = AwsIRResponse(services, DredgeConfig()).block_s3_object_public_access("bucket", "k")
+        assert result.success is True
+        assert "rollback_state" not in result.details
+        services.s3.put_object_acl.assert_called_once()
 
 
 class TestIsolateEc2Instances:
@@ -781,6 +868,28 @@ class TestDisableLambdaFunction:
         services.lambda_.put_function_concurrency.side_effect = make_client_error()
         result = AwsIRResponse(services, DredgeConfig()).disable_lambda_function("my-fn")
         assert result.success is False
+
+    def test_rollback_state_captures_prior_concurrency(self):
+        services = make_services()
+        services.lambda_.get_function_concurrency.return_value = {"ReservedConcurrentExecutions": 5}
+        result = AwsIRResponse(services, DredgeConfig()).disable_lambda_function("my-fn")
+        assert result.success is True
+        assert result.details["rollback_state"] == {"reserved_concurrent_executions": 5}
+
+    def test_rollback_state_none_when_no_prior_concurrency(self):
+        services = make_services()
+        services.lambda_.get_function_concurrency.return_value = {}
+        result = AwsIRResponse(services, DredgeConfig()).disable_lambda_function("my-fn")
+        assert result.success is True
+        assert result.details["rollback_state"] == {"reserved_concurrent_executions": None}
+
+    def test_rollback_capture_failure_is_non_fatal(self):
+        services = make_services()
+        services.lambda_.get_function_concurrency.side_effect = make_client_error(code="AccessDenied")
+        result = AwsIRResponse(services, DredgeConfig()).disable_lambda_function("my-fn")
+        assert result.success is True
+        assert "rollback_state" not in result.details
+        services.lambda_.put_function_concurrency.assert_called_once()
 
 
 class TestDisableKmsKey:
@@ -1426,4 +1535,295 @@ class TestDeleteEcrImage:
         services = make_services()
         services.ecr.batch_delete_image.side_effect = make_client_error()
         result = AwsIRResponse(services, DredgeConfig()).delete_ecr_image("my-repo", "sha256:abc")
+        assert result.success is False
+
+
+class TestAuthorizeSecurityGroupRules:
+    def test_no_rules_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError):
+            AwsIRResponse(services, DredgeConfig()).authorize_security_group_rules("sg-1")
+
+    def test_dry_run(self):
+        services = make_services()
+        rules = [{"IpProtocol": "-1"}]
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).authorize_security_group_rules(
+            "sg-1", ingress_rules=rules
+        )
+        assert result.details.get("dry_run") is True
+        services.ec2.authorize_security_group_ingress.assert_not_called()
+
+    def test_authorizes_ingress_only(self):
+        services = make_services()
+        rules = [{"IpProtocol": "-1"}]
+        result = AwsIRResponse(services, DredgeConfig()).authorize_security_group_rules(
+            "sg-1", ingress_rules=rules
+        )
+        assert result.success is True
+        assert result.details["ingress_rules_authorized"] == 1
+        services.ec2.authorize_security_group_ingress.assert_called_once_with(GroupId="sg-1", IpPermissions=rules)
+        services.ec2.authorize_security_group_egress.assert_not_called()
+
+    def test_authorizes_egress_only(self):
+        services = make_services()
+        rules = [{"IpProtocol": "tcp"}]
+        result = AwsIRResponse(services, DredgeConfig()).authorize_security_group_rules(
+            "sg-1", egress_rules=rules
+        )
+        assert result.success is True
+        assert result.details["egress_rules_authorized"] == 1
+        services.ec2.authorize_security_group_egress.assert_called_once()
+        services.ec2.authorize_security_group_ingress.assert_not_called()
+
+    def test_ingress_api_error(self):
+        services = make_services()
+        services.ec2.authorize_security_group_ingress.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).authorize_security_group_rules(
+            "sg-1", ingress_rules=[{"IpProtocol": "-1"}]
+        )
+        assert result.success is False
+        assert any("Failed to authorize ingress rules" in e for e in result.errors)
+
+    def test_egress_api_error(self):
+        services = make_services()
+        services.ec2.authorize_security_group_egress.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).authorize_security_group_rules(
+            "sg-1", egress_rules=[{"IpProtocol": "-1"}]
+        )
+        assert result.success is False
+        assert any("Failed to authorize egress rules" in e for e in result.errors)
+
+
+class TestEnableAccessKey:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).enable_access_key("u", "K")
+        assert result.details.get("dry_run") is True
+        services.iam.update_access_key.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).enable_access_key("u", "K")
+        assert result.success is True
+        assert "re-enabled" in result.details["status"]
+        services.iam.update_access_key.assert_called_once_with(
+            UserName="u", AccessKeyId="K", Status="Active"
+        )
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.iam.update_access_key.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).enable_access_key("u", "K")
+        assert result.success is False
+
+
+class TestRevokeDenyAllSessionPolicy:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).revoke_deny_all_session_policy("alice")
+        assert result.details.get("dry_run") is True
+        services.iam.delete_user_policy.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).revoke_deny_all_session_policy("alice")
+        assert result.success is True
+        assert result.details["policy_removed"] is True
+        services.iam.delete_user_policy.assert_called_once_with(
+            UserName="alice", PolicyName="DredgeRevokeActiveSessions"
+        )
+
+    def test_already_absent_is_success(self):
+        services = make_services()
+        exc_cls = type("NoSuchEntityException", (Exception,), {})
+        services.iam.exceptions.NoSuchEntityException = exc_cls
+        services.iam.delete_user_policy.side_effect = exc_cls()
+        result = AwsIRResponse(services, DredgeConfig()).revoke_deny_all_session_policy("alice")
+        assert result.success is True
+        assert result.details["policy_removed"] is False
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.iam.exceptions.NoSuchEntityException = type("NoSuchEntityException", (Exception,), {})
+        services.iam.delete_user_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).revoke_deny_all_session_policy("alice")
+        assert result.success is False
+
+
+class TestRestoreS3AccountPublicAccessBlock:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_s3_account_public_access_block(
+            "123456", {"BlockPublicAcls": True}
+        )
+        assert result.details.get("dry_run") is True
+        services.s3control.put_public_access_block.assert_not_called()
+        services.s3control.delete_public_access_block.assert_not_called()
+
+    def test_restores_prior_config(self):
+        services = make_services()
+        config = {"BlockPublicAcls": False}
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_account_public_access_block(
+            "123456", config
+        )
+        assert result.success is True
+        services.s3control.put_public_access_block.assert_called_once_with(
+            AccountId="123456", PublicAccessBlockConfiguration=config
+        )
+        services.s3control.delete_public_access_block.assert_not_called()
+
+    def test_deletes_when_none_existed_before(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_account_public_access_block(
+            "123456", None
+        )
+        assert result.success is True
+        services.s3control.delete_public_access_block.assert_called_once_with(AccountId="123456")
+        services.s3control.put_public_access_block.assert_not_called()
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.s3control.put_public_access_block.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_account_public_access_block(
+            "123456", {"BlockPublicAcls": True}
+        )
+        assert result.success is False
+
+
+class TestRestoreS3BucketPublicAccessBlockAndAcl:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_s3_bucket_public_access_block_and_acl(
+            "my-bucket",
+            public_access_block_configuration={"BlockPublicAcls": True},
+            access_control_policy={"Owner": {"ID": "o"}, "Grants": []},
+        )
+        assert result.details.get("dry_run") is True
+        services.s3.put_public_access_block.assert_not_called()
+        services.s3.put_bucket_acl.assert_not_called()
+
+    def test_restores_pab_and_acl(self):
+        services = make_services()
+        config = {"BlockPublicAcls": False}
+        acl = {"Owner": {"ID": "o"}, "Grants": []}
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_bucket_public_access_block_and_acl(
+            "my-bucket", public_access_block_configuration=config, access_control_policy=acl
+        )
+        assert result.success is True
+        assert result.details["public_access_block_restored"] is True
+        assert result.details["acl_restored"] is True
+        services.s3.put_public_access_block.assert_called_once_with(
+            Bucket="my-bucket", PublicAccessBlockConfiguration=config
+        )
+        services.s3.put_bucket_acl.assert_called_once_with(Bucket="my-bucket", AccessControlPolicy=acl)
+
+    def test_deletes_pab_when_none_existed_before_and_skips_acl_when_none(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_bucket_public_access_block_and_acl(
+            "my-bucket", public_access_block_configuration=None, access_control_policy=None
+        )
+        assert result.success is True
+        services.s3.delete_public_access_block.assert_called_once_with(Bucket="my-bucket")
+        services.s3.put_bucket_acl.assert_not_called()
+        assert "acl_restored" not in result.details
+
+    def test_pab_error_does_not_block_acl_restore(self):
+        services = make_services()
+        services.s3.put_public_access_block.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_bucket_public_access_block_and_acl(
+            "my-bucket",
+            public_access_block_configuration={"BlockPublicAcls": True},
+            access_control_policy={"Owner": {"ID": "o"}, "Grants": []},
+        )
+        assert result.success is False
+        assert result.details["acl_restored"] is True
+        services.s3.put_bucket_acl.assert_called_once()
+
+    def test_acl_error_recorded(self):
+        services = make_services()
+        services.s3.put_bucket_acl.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_bucket_public_access_block_and_acl(
+            "my-bucket",
+            public_access_block_configuration={"BlockPublicAcls": True},
+            access_control_policy={"Owner": {"ID": "o"}, "Grants": []},
+        )
+        assert result.success is False
+        assert result.details["public_access_block_restored"] is True
+
+
+class TestRestoreS3ObjectAcl:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_s3_object_acl(
+            "bucket", "k", {"Owner": {"ID": "o"}, "Grants": []}
+        )
+        assert result.details.get("dry_run") is True
+        services.s3.put_object_acl.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        acl = {"Owner": {"ID": "o"}, "Grants": []}
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_object_acl("bucket", "k", acl)
+        assert result.success is True
+        assert result.details["acl_restored"] is True
+        services.s3.put_object_acl.assert_called_once_with(Bucket="bucket", Key="k", AccessControlPolicy=acl)
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.s3.put_object_acl.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_object_acl(
+            "bucket", "k", {"Owner": {"ID": "o"}, "Grants": []}
+        )
+        assert result.success is False
+
+
+class TestRestoreLambdaConcurrency:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_lambda_concurrency("my-fn", 5)
+        assert result.details.get("dry_run") is True
+        services.lambda_.put_function_concurrency.assert_not_called()
+        services.lambda_.delete_function_concurrency.assert_not_called()
+
+    def test_restores_prior_value(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_lambda_concurrency("my-fn", 5)
+        assert result.success is True
+        services.lambda_.put_function_concurrency.assert_called_once_with(
+            FunctionName="my-fn", ReservedConcurrentExecutions=5
+        )
+        services.lambda_.delete_function_concurrency.assert_not_called()
+
+    def test_deletes_override_when_none_existed_before(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_lambda_concurrency("my-fn", None)
+        assert result.success is True
+        services.lambda_.delete_function_concurrency.assert_called_once_with(FunctionName="my-fn")
+        services.lambda_.put_function_concurrency.assert_not_called()
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.lambda_.put_function_concurrency.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_lambda_concurrency("my-fn", 5)
+        assert result.success is False
+
+
+class TestRestoreSecretsManagerSecret:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_secrets_manager_secret("my-secret")
+        assert result.details.get("dry_run") is True
+        services.secretsmanager.restore_secret.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_secrets_manager_secret("my-secret")
+        assert result.success is True
+        assert "restored" in result.details["status"]
+        services.secretsmanager.restore_secret.assert_called_once_with(SecretId="my-secret")
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.secretsmanager.restore_secret.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_secrets_manager_secret("my-secret")
         assert result.success is False

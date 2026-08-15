@@ -3,7 +3,13 @@ name = "dredge"
 version = "0.1.1"
 description = "Cloud Incident Response & Threat Hunting for AWS + GitHub"
 readme = "README.md"
-requires-python = ">=3.9"
+# google-cloud-python (google-cloud-logging's own dependency chain, via
+# google-cloud-core) dropped Python 3.9 support and moved to a 3.10+ floor.
+# Claiming 3.9 here (as this project did until CI actually tested it) sends
+# pip into a multi-hour, unbounded backtracking search on 3.9 trying to find
+# a mutually-compatible boto3/google-cloud-logging/grpcio version set that
+# doesn't exist -- not a real code incompatibility, just a stale floor.
+requires-python = ">=3.10"
 license = {text = "MPL-2.0"}
 authors = [
     { name="Solidarity Labs", email="sabastante@solidaritylabs.io" }

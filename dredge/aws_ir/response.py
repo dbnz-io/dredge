@@ -298,6 +298,23 @@ class AwsIRResponse:
 
         s3control = self._services.s3control
 
+        # Capture prior state for rollback before mutating. Best-effort:
+        # a failure here never blocks the actual containment action below.
+        # NoSuchPublicAccessBlockConfiguration means no PAB existed before
+        # -- rollback_state=None-config is a real, valid prior state (not
+        # a capture failure), distinct from result.details["rollback_state"]
+        # being entirely absent (capture itself failed).
+        try:
+            prior = s3control.get_public_access_block(AccountId=account_id)
+            result.details["rollback_state"] = {
+                "public_access_block_configuration": prior["PublicAccessBlockConfiguration"]
+            }
+        except botocore.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "NoSuchPublicAccessBlockConfiguration":
+                result.details["rollback_state"] = {"public_access_block_configuration": None}
+            else:
+                _log.warning(event("aws_ir_response", "block_s3_public_access.rollback_capture_error", target=result.target, error=str(exc)))
+
         try:
             s3control.put_public_access_block(
                 AccountId=account_id,
@@ -520,6 +537,29 @@ class AwsIRResponse:
 
         s3 = self._services.s3
 
+        # Capture prior state for rollback before mutating (best-effort --
+        # never blocks containment below). Bucket ACL is captured as the
+        # full Owner/Grants structure get_bucket_acl returns, which is
+        # exactly what put_bucket_acl's AccessControlPolicy expects for a
+        # faithful restore -- not just the canned "private" string this
+        # function itself sets.
+        rollback_state: dict = {}
+        try:
+            prior_pab = s3.get_public_access_block(Bucket=bucket_name)
+            rollback_state["public_access_block_configuration"] = prior_pab["PublicAccessBlockConfiguration"]
+        except botocore.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "NoSuchPublicAccessBlockConfiguration":
+                rollback_state["public_access_block_configuration"] = None
+            else:
+                _log.warning(event("aws_ir_response", "block_s3_bucket_public_access.rollback_capture_error", bucket=bucket_name, error=str(exc)))
+        try:
+            prior_acl = s3.get_bucket_acl(Bucket=bucket_name)
+            rollback_state["access_control_policy"] = {"Owner": prior_acl["Owner"], "Grants": prior_acl["Grants"]}
+        except botocore.exceptions.ClientError as exc:
+            _log.warning(event("aws_ir_response", "block_s3_bucket_public_access.rollback_capture_error", bucket=bucket_name, error=str(exc)))
+        if rollback_state:
+            result.details["rollback_state"] = rollback_state
+
         try:
             # 1) Block Public Access (bucket-level)
             s3.put_public_access_block(
@@ -573,6 +613,15 @@ class AwsIRResponse:
             return result
 
         s3 = self._services.s3
+
+        # Capture prior ACL for rollback before mutating (best-effort).
+        try:
+            prior_acl = s3.get_object_acl(Bucket=bucket_name, Key=key)
+            result.details["rollback_state"] = {
+                "access_control_policy": {"Owner": prior_acl["Owner"], "Grants": prior_acl["Grants"]}
+            }
+        except botocore.exceptions.ClientError as exc:
+            _log.warning(event("aws_ir_response", "block_s3_object_public_access.rollback_capture_error", target=result.target, error=str(exc)))
 
         try:
             s3.put_object_acl(
@@ -949,6 +998,18 @@ class AwsIRResponse:
             return result
 
         lambda_ = self._services.lambda_
+
+        # Capture prior reserved concurrency for rollback before mutating
+        # (best-effort). GetFunctionConcurrency simply omits the key rather
+        # than raising when no reserved concurrency was set -- None here
+        # means "delete the override to restore", not "capture failed".
+        try:
+            prior = lambda_.get_function_concurrency(FunctionName=function_name)
+            result.details["rollback_state"] = {
+                "reserved_concurrent_executions": prior.get("ReservedConcurrentExecutions")
+            }
+        except botocore.exceptions.ClientError as exc:
+            _log.warning(event("aws_ir_response", "disable_lambda_function.rollback_capture_error", target=result.target, error=str(exc)))
 
         try:
             lambda_.put_function_concurrency(
@@ -1781,5 +1842,315 @@ class AwsIRResponse:
         except botocore.exceptions.ClientError as exc:
             result.add_error(str(exc))
             _log.warning(event("aws_ir_response", "delete_ecr_image.error", target=result.target, error=str(exc)))
+
+        return result
+
+    # --------------------
+    # Rollback / undo actions
+    #
+    # One undo per containment action that's actually reversible (see
+    # each corresponding action's own docstring/rollback_state details for
+    # what it captures). Deliberately does NOT cover every response
+    # module -- delete_user/delete_access_key/delete_mfa_devices are
+    # genuine deletions with no undo, and disable_user/disable_role/
+    # quarantine_s3_bucket/isolate_ec2_instances either delete data
+    # without reading it first (inline policies, trust policy, bucket
+    # policy) or never captured prior state (original security groups) --
+    # both are gaps in the *original* action, not something an undo
+    # function alone can paper over.
+    # --------------------
+
+    def authorize_security_group_rules(
+        self,
+        group_id: str,
+        *,
+        ingress_rules: Optional[List[Dict]] = None,
+        egress_rules: Optional[List[Dict]] = None,
+    ) -> OperationResult:
+        """
+        Undo for deauthorize_security_group_rules: re-authorize the exact
+        ingress/egress rules that were revoked. Caller already has these
+        from the original revoke call -- no capture step needed.
+        """
+        if not ingress_rules and not egress_rules:
+            raise ValueError("At least one of ingress_rules or egress_rules must be provided")
+
+        result = OperationResult(
+            operation="authorize_security_group_rules",
+            target=f"sg={group_id}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "authorize_security_group_rules.dry_run", target=result.target))
+            return result
+
+        ec2 = self._services.ec2
+
+        if ingress_rules:
+            try:
+                ec2.authorize_security_group_ingress(GroupId=group_id, IpPermissions=ingress_rules)
+                result.details["ingress_rules_authorized"] = len(ingress_rules)
+                _log.info(event("aws_ir_response", "authorize_security_group_rules.ingress_ok", sg=group_id, count=len(ingress_rules)))
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to authorize ingress rules: {exc}")
+                _log.warning(event("aws_ir_response", "authorize_security_group_rules.ingress_error", sg=group_id, error=str(exc)))
+
+        if egress_rules:
+            try:
+                ec2.authorize_security_group_egress(GroupId=group_id, IpPermissions=egress_rules)
+                result.details["egress_rules_authorized"] = len(egress_rules)
+                _log.info(event("aws_ir_response", "authorize_security_group_rules.egress_ok", sg=group_id, count=len(egress_rules)))
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to authorize egress rules: {exc}")
+                _log.warning(event("aws_ir_response", "authorize_security_group_rules.egress_error", sg=group_id, error=str(exc)))
+
+        return result
+
+    def enable_access_key(self, user_name: str, access_key_id: str) -> OperationResult:
+        """
+        Undo for disable_access_key: set the given access key back to Active.
+        """
+        result = OperationResult(
+            operation="enable_access_key",
+            target=f"user={user_name},access_key_id={access_key_id}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "enable_access_key.dry_run", target=result.target))
+            return result
+
+        iam = self._services.iam
+        try:
+            iam.update_access_key(
+                UserName=user_name,
+                AccessKeyId=access_key_id,
+                Status="Active",
+            )
+            result.details["status"] = "Access key re-enabled"
+            _log.info(event("aws_ir_response", "enable_access_key.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "enable_access_key.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def revoke_deny_all_session_policy(self, user_name: str) -> OperationResult:
+        """
+        Undo for revoke_active_sessions: delete the DredgeRevokeActiveSessions
+        inline policy it attached. The policy name is hardcoded and known --
+        no capture step needed. Already-removed (NoSuchEntityException) is
+        treated as success, not an error: the end state (policy absent) is
+        the same either way.
+        """
+        result = OperationResult(
+            operation="revoke_deny_all_session_policy",
+            target=f"user={user_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "revoke_deny_all_session_policy.dry_run", target=result.target))
+            return result
+
+        iam = self._services.iam
+        try:
+            iam.delete_user_policy(UserName=user_name, PolicyName="DredgeRevokeActiveSessions")
+            result.details["policy_removed"] = True
+            _log.info(event("aws_ir_response", "revoke_deny_all_session_policy.success", target=result.target))
+        except iam.exceptions.NoSuchEntityException:
+            result.details["policy_removed"] = False
+            result.details["status"] = "Policy already absent"
+            _log.info(event("aws_ir_response", "revoke_deny_all_session_policy.already_absent", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "revoke_deny_all_session_policy.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def restore_s3_account_public_access_block(
+        self, account_id: str, public_access_block_configuration: Optional[Dict]
+    ) -> OperationResult:
+        """
+        Undo for block_s3_public_access. public_access_block_configuration
+        is the rollback_state that action captured -- None means no PAB
+        config existed before, so restoring means deleting the override
+        entirely, not putting back an empty one.
+        """
+        result = OperationResult(
+            operation="restore_s3_account_public_access_block",
+            target=f"account={account_id}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_s3_account_public_access_block.dry_run", target=result.target))
+            return result
+
+        s3control = self._services.s3control
+        try:
+            if public_access_block_configuration is None:
+                s3control.delete_public_access_block(AccountId=account_id)
+                result.details["status"] = "Public access block removed (none existed before)"
+            else:
+                s3control.put_public_access_block(
+                    AccountId=account_id,
+                    PublicAccessBlockConfiguration=public_access_block_configuration,
+                )
+                result.details["status"] = "Public access block restored to prior configuration"
+            _log.info(event("aws_ir_response", "restore_s3_account_public_access_block.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "restore_s3_account_public_access_block.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def restore_s3_bucket_public_access_block_and_acl(
+        self,
+        bucket_name: str,
+        *,
+        public_access_block_configuration: Optional[Dict],
+        access_control_policy: Optional[Dict],
+    ) -> OperationResult:
+        """
+        Undo for block_s3_bucket_public_access. Both arguments come from
+        that action's own rollback_state. The bucket policy is untouched
+        by either action, so there's nothing to restore for it here.
+        """
+        result = OperationResult(
+            operation="restore_s3_bucket_public_access_block_and_acl",
+            target=f"bucket={bucket_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_s3_bucket_public_access_block_and_acl.dry_run", target=result.target))
+            return result
+
+        s3 = self._services.s3
+
+        try:
+            if public_access_block_configuration is None:
+                s3.delete_public_access_block(Bucket=bucket_name)
+            else:
+                s3.put_public_access_block(
+                    Bucket=bucket_name,
+                    PublicAccessBlockConfiguration=public_access_block_configuration,
+                )
+            result.details["public_access_block_restored"] = True
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(f"Failed to restore bucket PublicAccessBlock: {exc}")
+            _log.warning(event("aws_ir_response", "restore_s3_bucket_public_access_block_and_acl.access_block_error", bucket=bucket_name, error=str(exc)))
+
+        if access_control_policy is not None:
+            try:
+                s3.put_bucket_acl(Bucket=bucket_name, AccessControlPolicy=access_control_policy)
+                result.details["acl_restored"] = True
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to restore bucket ACL: {exc}")
+                _log.warning(event("aws_ir_response", "restore_s3_bucket_public_access_block_and_acl.acl_error", bucket=bucket_name, error=str(exc)))
+
+        if result.success:
+            _log.info(event("aws_ir_response", "restore_s3_bucket_public_access_block_and_acl.success", target=result.target))
+
+        return result
+
+    def restore_s3_object_acl(self, bucket_name: str, key: str, access_control_policy: Dict) -> OperationResult:
+        """
+        Undo for block_s3_object_public_access. access_control_policy is
+        that action's own rollback_state.
+        """
+        result = OperationResult(
+            operation="restore_s3_object_acl",
+            target=f"bucket={bucket_name},key={key}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_s3_object_acl.dry_run", target=result.target))
+            return result
+
+        s3 = self._services.s3
+        try:
+            s3.put_object_acl(Bucket=bucket_name, Key=key, AccessControlPolicy=access_control_policy)
+            result.details["acl_restored"] = True
+            _log.info(event("aws_ir_response", "restore_s3_object_acl.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(f"Failed to restore object ACL: {exc}")
+            _log.warning(event("aws_ir_response", "restore_s3_object_acl.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def restore_lambda_concurrency(
+        self, function_name: str, reserved_concurrent_executions: Optional[int]
+    ) -> OperationResult:
+        """
+        Undo for disable_lambda_function. reserved_concurrent_executions is
+        that action's own rollback_state -- None means no reserved
+        concurrency was set before, so restoring means deleting the
+        override, not putting back 0 (which is what disable_lambda_function
+        itself sets, i.e. still throttled).
+        """
+        result = OperationResult(
+            operation="restore_lambda_concurrency",
+            target=f"function={function_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_lambda_concurrency.dry_run", target=result.target))
+            return result
+
+        lambda_ = self._services.lambda_
+        try:
+            if reserved_concurrent_executions is None:
+                lambda_.delete_function_concurrency(FunctionName=function_name)
+                result.details["status"] = "Reserved concurrency override removed (none existed before)"
+            else:
+                lambda_.put_function_concurrency(
+                    FunctionName=function_name,
+                    ReservedConcurrentExecutions=reserved_concurrent_executions,
+                )
+                result.details["status"] = "Reserved concurrency restored to prior value"
+            _log.info(event("aws_ir_response", "restore_lambda_concurrency.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "restore_lambda_concurrency.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def restore_secrets_manager_secret(self, secret_id: str) -> OperationResult:
+        """
+        Undo for disable_secrets_manager_secret. AWS's own RestoreSecret
+        clears the pending-deletion marker -- the secret was never actually
+        gone within the recovery window, so no capture step was needed for
+        this action in the first place.
+        """
+        result = OperationResult(
+            operation="restore_secrets_manager_secret",
+            target=f"secret={secret_id}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_secrets_manager_secret.dry_run", target=result.target))
+            return result
+
+        try:
+            self._services.secretsmanager.restore_secret(SecretId=secret_id)
+            result.details["status"] = "Secret restored, pending-deletion marker cleared"
+            _log.info(event("aws_ir_response", "restore_secrets_manager_secret.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "restore_secrets_manager_secret.error", target=result.target, error=str(exc)))
 
         return result

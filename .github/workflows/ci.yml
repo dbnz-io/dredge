@@ -20,10 +20,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 is the floor pyproject.toml claims (requires-python = ">=3.9"),
-        # never actually tested before this workflow existed. 3.13 matches
-        # the Dockerfile's real deploy target.
-        python-version: ["3.9", "3.13"]
+        # 3.10 is the floor pyproject.toml claims (requires-python = ">=3.10"
+        # -- was ">=3.9" until this workflow's first real run proved that
+        # false: google-cloud-logging's own dependency chain dropped 3.9
+        # support, and pip on 3.9 backtracks for 40+ minutes before failing
+        # with resolution-too-deep trying to find a version set that no
+        # longer exists). 3.13 matches the Dockerfile's real deploy target.
+        python-version: ["3.10", "3.13"]
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
