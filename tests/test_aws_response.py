@@ -503,6 +503,27 @@ class TestDeleteMfaDevices:
         assert result.success is True
         assert result.details["devices_deleted"] == []
 
+    def test_virtual_device_delete_error(self):
+        iam = _make_iam()
+        iam.get_paginator.side_effect = lambda op: _make_paginator(
+            [{"MFADevices": [{"SerialNumber": "arn:aws:iam::123:mfa/alice"}]}]
+        ) if op == "list_mfa_devices" else _make_paginator([{}])
+        iam.delete_virtual_mfa_device.side_effect = make_client_error()
+        services = make_services()
+        services.iam = iam
+
+        result = AwsIRResponse(services, DredgeConfig()).delete_mfa_devices("alice")
+        assert result.success is False
+        iam.deactivate_mfa_device.assert_called_once()
+        assert any("delete virtual MFA device" in e for e in result.errors)
+
+    def test_fatal_paginator_error(self):
+        services = make_services()
+        services.iam.get_paginator.return_value.paginate.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).delete_mfa_devices("alice")
+        assert result.success is False
+        assert any("Fatal error deleting MFA devices" in e for e in result.errors)
+
 
 class TestRevokeActiveSessions:
     def test_dry_run_skips_api(self):
@@ -627,6 +648,34 @@ class TestTerminateEc2Instances:
         ec2.create_snapshot.assert_not_called()
         ec2.terminate_instances.assert_called_once()
 
+    def test_block_device_without_ebs_skipped(self):
+        ec2 = MagicMock()
+        # An instance-store volume: a BlockDeviceMapping entry with no "Ebs" key.
+        ec2.describe_instances.return_value = {
+            "Reservations": [{
+                "Instances": [{
+                    "InstanceId": "i-001",
+                    "BlockDeviceMappings": [{"DeviceName": "/dev/sdb"}],
+                }]
+            }]
+        }
+        ec2.terminate_instances.return_value = {"TerminatingInstances": []}
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRResponse(services, DredgeConfig()).terminate_ec2_instances(["i-001"])
+        assert result.success is True
+        ec2.create_snapshot.assert_not_called()
+        ec2.terminate_instances.assert_called_once()
+
+    def test_describe_instances_fatal_error(self):
+        services = make_services()
+        services.ec2.describe_instances.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).terminate_ec2_instances(["i-001"])
+        assert result.success is False
+        assert any("Fatal error terminating instances" in e for e in result.errors)
+        services.ec2.terminate_instances.assert_not_called()
+
 
 def _make_nacl(nacl_id, entries=None):
     return {"NetworkAclId": nacl_id, "Entries": entries or []}
@@ -681,6 +730,34 @@ class TestBlockNaclCidrs:
         result = AwsIRResponse(services, DredgeConfig()).block_nacl_cidrs("vpc-x", ["10.0.0.1/32"])
         assert result.success is False
         assert result.errors
+
+    def test_while_loop_increments_past_conflict_both_directions(self):
+        # rule_number_start (1) is free, so next_in/next_eg reset to 1 --
+        # but a pre-existing entry at 2 collides with the *second* cidr's
+        # candidate, forcing the while loop itself to increment (not just
+        # the initial "start past max used" branch the other conflict test
+        # exercises).
+        ec2 = MagicMock()
+        existing = [{"RuleNumber": 2, "Egress": False}, {"RuleNumber": 2, "Egress": True}]
+        ec2.describe_network_acls.return_value = {"NetworkAcls": [_make_nacl("acl-1", entries=existing)]}
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRResponse(services, DredgeConfig()).block_nacl_cidrs(
+            "vpc-x", ["10.0.0.1/32", "10.0.0.2/32"], rule_number_start=1
+        )
+        assert result.success is True
+        calls = ec2.create_network_acl_entry.call_args_list
+        used_numbers = {c[1]["RuleNumber"] for c in calls}
+        assert 2 not in used_numbers  # taken by a pre-existing entry in both directions
+
+    def test_describe_network_acls_fatal_error(self):
+        services = make_services()
+        services.ec2.describe_network_acls.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).block_nacl_cidrs("vpc-x", ["10.0.0.1/32"])
+        assert result.success is False
+        assert any("Fatal error blocking NACL CIDRs" in e for e in result.errors)
+        services.ec2.create_network_acl_entry.assert_not_called()
 
 
 class TestDisableLambdaFunction:
@@ -851,6 +928,16 @@ class TestIsolateRdsInstance:
         result = AwsIRResponse(services, DredgeConfig()).isolate_rds_instance("db-bad")
         assert result.success is False
         assert result.errors
+
+    def test_missing_vpc_id_raises(self):
+        services = make_services()
+        services.rds.describe_db_instances.return_value = {
+            "DBInstances": [{"DBSubnetGroup": {}, "VpcSecurityGroups": []}]
+        }
+        result = AwsIRResponse(services, DredgeConfig()).isolate_rds_instance("db-1")
+        assert result.success is False
+        assert any("Could not determine VPC ID" in e for e in result.errors)
+        services.ec2.describe_security_groups.assert_not_called()
 
     def test_api_error_records_failure(self):
         services = make_services()
@@ -1048,6 +1135,15 @@ class TestDeauthorizeSecurityGroupRules:
         )
         assert result.success is False
 
+    def test_egress_api_error(self):
+        services = make_services()
+        services.ec2.revoke_security_group_egress.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).deauthorize_security_group_rules(
+            "sg-1", egress_rules=[{"IpProtocol": "-1"}]
+        )
+        assert result.success is False
+        assert any("Failed to revoke egress rules" in e for e in result.errors)
+
 
 class TestDetachIamPolicy:
     def test_no_principal_raises(self):
@@ -1150,3 +1246,184 @@ class TestQuarantineS3Bucket:
         policy_doc = _json.loads(call_kwargs["Policy"])
         resources = policy_doc["Statement"][0]["Resource"]
         assert any("sensitive-bucket" in r for r in resources)
+
+
+# =====================================================================
+# Coverage completion pass: functions with no test class before this
+# =====================================================================
+
+
+class TestRemoveUserFromGroup:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).remove_user_from_group("alice", "admins")
+        assert result.details.get("dry_run") is True
+        services.iam.remove_user_from_group.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).remove_user_from_group("alice", "admins")
+        assert result.success is True
+        assert result.details["removed"] is True
+        services.iam.remove_user_from_group.assert_called_once_with(UserName="alice", GroupName="admins")
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.iam.remove_user_from_group.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).remove_user_from_group("alice", "admins")
+        assert result.success is False
+
+
+class TestPutDenyAllInlinePolicy:
+    def test_no_principal_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError):
+            AwsIRResponse(services, DredgeConfig()).put_deny_all_inline_policy()
+
+    def test_both_principals_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError):
+            AwsIRResponse(services, DredgeConfig()).put_deny_all_inline_policy(user_name="u", role_name="r")
+
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).put_deny_all_inline_policy(user_name="alice")
+        assert result.details.get("dry_run") is True
+        services.iam.put_user_policy.assert_not_called()
+
+    def test_happy_path_user(self):
+        import json as _json
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).put_deny_all_inline_policy(user_name="alice")
+        assert result.success is True
+        assert result.details["policy_name"] == "DredgeIRDenyAll"
+        assert result.details["applied"] is True
+        call_kwargs = services.iam.put_user_policy.call_args[1]
+        assert call_kwargs["UserName"] == "alice"
+        assert call_kwargs["PolicyName"] == "DredgeIRDenyAll"
+        doc = _json.loads(call_kwargs["PolicyDocument"])
+        assert doc["Statement"][0]["Effect"] == "Deny"
+        assert doc["Statement"][0]["Action"] == "*"
+        services.iam.put_role_policy.assert_not_called()
+
+    def test_happy_path_role(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).put_deny_all_inline_policy(role_name="my-role")
+        assert result.success is True
+        call_kwargs = services.iam.put_role_policy.call_args[1]
+        assert call_kwargs["RoleName"] == "my-role"
+        services.iam.put_user_policy.assert_not_called()
+
+    def test_custom_policy_name(self):
+        services = make_services()
+        AwsIRResponse(services, DredgeConfig()).put_deny_all_inline_policy(
+            user_name="alice", policy_name="CustomDeny"
+        )
+        call_kwargs = services.iam.put_user_policy.call_args[1]
+        assert call_kwargs["PolicyName"] == "CustomDeny"
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.iam.put_user_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).put_deny_all_inline_policy(user_name="alice")
+        assert result.success is False
+
+
+class TestRevokeIamRoleSessions:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).revoke_iam_role_sessions("my-role")
+        assert result.details.get("dry_run") is True
+        services.iam.put_role_policy.assert_not_called()
+
+    def test_happy_path(self):
+        import json as _json
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).revoke_iam_role_sessions("my-role")
+        assert result.success is True
+        assert result.details["applied"] is True
+        assert "revocation_time" in result.details
+        call_kwargs = services.iam.put_role_policy.call_args[1]
+        assert call_kwargs["RoleName"] == "my-role"
+        assert call_kwargs["PolicyName"] == "DredgeIRRevokeOldSessions"
+        doc = _json.loads(call_kwargs["PolicyDocument"])
+        assert doc["Statement"][0]["Effect"] == "Deny"
+        assert "aws:TokenIssueTime" in doc["Statement"][0]["Condition"]["DateLessThan"]
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.iam.put_role_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).revoke_iam_role_sessions("my-role")
+        assert result.success is False
+
+
+class TestDisableLambdaEventSourceMapping:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).disable_lambda_event_source_mapping("uuid-1")
+        assert result.details.get("dry_run") is True
+        services.lambda_.update_event_source_mapping.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        services.lambda_.update_event_source_mapping.return_value = {
+            "State": "Disabling",
+            "FunctionArn": "arn:aws:lambda:us-east-1:123:function:my-fn",
+        }
+        result = AwsIRResponse(services, DredgeConfig()).disable_lambda_event_source_mapping("uuid-1")
+        assert result.success is True
+        assert result.details["state"] == "Disabling"
+        assert result.details["function_arn"] == "arn:aws:lambda:us-east-1:123:function:my-fn"
+        services.lambda_.update_event_source_mapping.assert_called_once_with(UUID="uuid-1", Enabled=False)
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.lambda_.update_event_source_mapping.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).disable_lambda_event_source_mapping("uuid-1")
+        assert result.success is False
+
+
+class TestDeleteEcrImage:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).delete_ecr_image("my-repo", "sha256:abc")
+        assert result.details.get("dry_run") is True
+        services.ecr.batch_delete_image.assert_not_called()
+
+    def test_happy_path_no_failures(self):
+        services = make_services()
+        services.ecr.batch_delete_image.return_value = {
+            "imageIds": [{"imageDigest": "sha256:abc"}],
+            "failures": [],
+        }
+        result = AwsIRResponse(services, DredgeConfig()).delete_ecr_image("my-repo", "sha256:abc")
+        assert result.success is True
+        assert result.details["deleted"] is True
+        services.ecr.batch_delete_image.assert_called_once_with(
+            repositoryName="my-repo", imageIds=[{"imageDigest": "sha256:abc"}]
+        )
+
+    def test_registry_id_passed_through(self):
+        services = make_services()
+        services.ecr.batch_delete_image.return_value = {"imageIds": [], "failures": []}
+        AwsIRResponse(services, DredgeConfig()).delete_ecr_image(
+            "my-repo", "sha256:abc", registry_id="123456789012"
+        )
+        call_kwargs = services.ecr.batch_delete_image.call_args[1]
+        assert call_kwargs["registryId"] == "123456789012"
+
+    def test_partial_failure_recorded_not_raised(self):
+        services = make_services()
+        services.ecr.batch_delete_image.return_value = {
+            "imageIds": [],
+            "failures": [{"failureCode": "ImageNotFound", "failureReason": "not found"}],
+        }
+        result = AwsIRResponse(services, DredgeConfig()).delete_ecr_image("my-repo", "sha256:abc")
+        assert result.success is False
+        assert any("ImageNotFound" in e for e in result.errors)
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.ecr.batch_delete_image.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).delete_ecr_image("my-repo", "sha256:abc")
+        assert result.success is False

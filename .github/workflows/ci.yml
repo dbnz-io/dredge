@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    # No AWS/GitHub/GCP credentials needed -- every test mocks the
+    # respective client entirely (see CLAUDE.md: "no real cloud
+    # credentials are needed").
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor pyproject.toml claims (requires-python = ">=3.9"),
+        # never actually tested before this workflow existed. 3.13 matches
+        # the Dockerfile's real deploy target.
+        python-version: ["3.9", "3.13"]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e . pytest pytest-cov pytest-mock
+
+      - name: Run tests with coverage
+        run: pytest --cov=dredge --cov-report=term-missing --cov-fail-under=80 -q

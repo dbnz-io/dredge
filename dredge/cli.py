@@ -1277,11 +1277,11 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     func = getattr(args, "func", None)
-    if func is None:
+    if func is None:  # pragma: no cover -- unreachable: every subparser sets func, and subparsers.add_subparsers(required=True) makes argparse itself raise SystemExit(2) before main() ever sees a commandless Namespace
         parser.print_help()
         raise SystemExit(1)
     func(args)
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover -- only executes via `python -m dredge.cli`, not on import; exercising it needs a different (subprocess) test mechanism for 1 line of value
     main()
 

@@ -268,3 +268,223 @@ class TestListRepoWebhooks:
         result = forensics.list_repo_webhooks("repo")
 
         assert len(result.details["webhooks"]) == 115
+
+
+# ---- get_commit_history ----
+
+class TestGetCommitHistory:
+    def test_success(self):
+        forensics, svc = _make_forensics()
+        commits = [{"sha": "abc123"}, {"sha": "def456"}]
+        svc.get.return_value = FakeResponse(200, commits)
+
+        result = forensics.get_commit_history("my-repo", "main")
+
+        assert result.success is True
+        assert len(result.details["commits"]) == 2
+        assert result.details["statistics"]["branch"] == "main"
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/repos/test-org/my-repo/commits"
+
+    def test_branch_passed_as_sha_param(self):
+        forensics, svc = _make_forensics()
+        svc.get.return_value = FakeResponse(200, [])
+
+        forensics.get_commit_history("repo", "feature-branch")
+
+        params = svc.get.call_args[1]["params"]
+        assert params["sha"] == "feature-branch"
+
+    def test_pagination_collects_multiple_pages(self):
+        forensics, svc = _make_forensics()
+        page1 = [{"sha": f"c{i}"} for i in range(100)]
+        page2 = [{"sha": f"c{i}"} for i in range(100, 110)]
+        svc.get.side_effect = [FakeResponse(200, page1), FakeResponse(200, page2)]
+
+        # default max_commits=100 exits after exactly one full page (100
+        # items already satisfies `len(items) < max_items`) -- ask for more
+        # than one page's worth to actually exercise pagination.
+        result = forensics.get_commit_history("repo", "main", max_commits=110)
+
+        assert len(result.details["commits"]) == 110
+
+    def test_max_commits_respected(self):
+        forensics, svc = _make_forensics()
+        commits = [{"sha": f"c{i}"} for i in range(100)]
+        svc.get.return_value = FakeResponse(200, commits)
+
+        result = forensics.get_commit_history("repo", "main", max_commits=10)
+
+        assert len(result.details["commits"]) == 10
+
+    def test_http_error_recorded(self):
+        forensics, svc = _make_forensics()
+        svc.get.return_value = FakeResponse(404, {"message": "Not Found"})
+
+        result = forensics.get_commit_history("repo", "main")
+
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        forensics, svc = _make_forensics()
+        svc.get.side_effect = requests.exceptions.ConnectionError("boom")
+
+        result = forensics.get_commit_history("repo", "main")
+
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
+
+# ---- get_file_at_commit ----
+
+class TestGetFileAtCommit:
+    def test_base64_content_decoded(self):
+        import base64
+
+        forensics, svc = _make_forensics()
+        content_b64 = base64.b64encode(b"hello world").decode()
+        svc.get.return_value = FakeResponse(
+            200, {"name": "config.yml", "content": content_b64, "encoding": "base64"}
+        )
+
+        result = forensics.get_file_at_commit("repo", "config.yml", "main")
+
+        assert result.success is True
+        assert result.details["content_decoded"] == "hello world"
+        svc.get.assert_called_once_with(
+            "/repos/test-org/repo/contents/config.yml", params={"ref": "main"}
+        )
+
+    def test_non_base64_content_not_decoded(self):
+        forensics, svc = _make_forensics()
+        svc.get.return_value = FakeResponse(200, {"name": "dir", "content": ""})
+
+        result = forensics.get_file_at_commit("repo", "some/dir", "main")
+
+        assert result.success is True
+        assert "content_decoded" not in result.details
+
+    def test_malformed_base64_falls_back_to_none(self):
+        forensics, svc = _make_forensics()
+        svc.get.return_value = FakeResponse(
+            200, {"content": "not-valid-base64!!!", "encoding": "base64"}
+        )
+
+        result = forensics.get_file_at_commit("repo", "file.txt", "main")
+
+        assert result.success is True
+        assert result.details["content_decoded"] is None
+
+    def test_404_records_file_not_found(self):
+        forensics, svc = _make_forensics()
+        svc.get.return_value = FakeResponse(404, {"message": "Not Found"})
+
+        result = forensics.get_file_at_commit("repo", "missing.txt", "main")
+
+        assert result.success is False
+        assert "File not found" in result.errors[0]
+
+    def test_other_http_error_recorded(self):
+        forensics, svc = _make_forensics()
+        svc.get.return_value = FakeResponse(403, {"message": "Forbidden"})
+
+        result = forensics.get_file_at_commit("repo", "file.txt", "main")
+
+        assert result.success is False
+        assert "File not found" not in result.errors[0]
+
+    def test_network_error_recorded(self):
+        forensics, svc = _make_forensics()
+        svc.get.side_effect = requests.exceptions.ConnectionError("boom")
+
+        result = forensics.get_file_at_commit("repo", "file.txt", "main")
+
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
+
+# ---- list_repo_actions_workflows ----
+
+class TestListRepoActionsWorkflows:
+    def test_success(self):
+        forensics, svc = _make_forensics()
+        svc.get.return_value = FakeResponse(
+            200, {"workflows": [{"id": 1, "name": "CI"}, {"id": 2, "name": "Deploy"}]}
+        )
+
+        result = forensics.list_repo_actions_workflows("my-repo")
+
+        assert result.success is True
+        assert len(result.details["workflows"]) == 2
+        assert result.details["statistics"]["repo"] == "my-repo"
+        svc.get.assert_called_once_with("/repos/test-org/my-repo/actions/workflows")
+
+    def test_http_error_recorded(self):
+        forensics, svc = _make_forensics()
+        svc.get.return_value = FakeResponse(404, {"message": "Not Found"})
+
+        result = forensics.list_repo_actions_workflows("repo")
+
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        forensics, svc = _make_forensics()
+        svc.get.side_effect = requests.exceptions.ConnectionError("boom")
+
+        result = forensics.list_repo_actions_workflows("repo")
+
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
+
+# ---- get_team_repos ----
+
+class TestGetTeamRepos:
+    def test_success(self):
+        forensics, svc = _make_forensics()
+        repos = [{"name": "repo-a"}, {"name": "repo-b"}]
+        svc.get.return_value = FakeResponse(200, repos)
+
+        result = forensics.get_team_repos("security")
+
+        assert result.success is True
+        assert len(result.details["repos"]) == 2
+        assert result.details["statistics"]["team"] == "security"
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/orgs/test-org/teams/security/repos"
+
+    def test_pagination_collects_multiple_pages(self):
+        forensics, svc = _make_forensics()
+        page1 = [{"name": f"r{i}"} for i in range(100)]
+        page2 = [{"name": f"r{i}"} for i in range(100, 105)]
+        svc.get.side_effect = [FakeResponse(200, page1), FakeResponse(200, page2)]
+
+        result = forensics.get_team_repos("security")
+
+        assert len(result.details["repos"]) == 105
+
+    def test_max_repos_respected(self):
+        forensics, svc = _make_forensics()
+        repos = [{"name": f"r{i}"} for i in range(100)]
+        svc.get.return_value = FakeResponse(200, repos)
+
+        result = forensics.get_team_repos("security", max_repos=3)
+
+        assert len(result.details["repos"]) == 3
+
+    def test_http_error_recorded(self):
+        forensics, svc = _make_forensics()
+        svc.get.return_value = FakeResponse(404, {"message": "Not Found"})
+
+        result = forensics.get_team_repos("security")
+
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        forensics, svc = _make_forensics()
+        svc.get.side_effect = requests.exceptions.ConnectionError("boom")
+
+        result = forensics.get_team_repos("security")
+
+        assert result.success is False
+        assert "boom" in result.errors[0]

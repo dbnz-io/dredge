@@ -504,7 +504,12 @@ class AwsIRForensics:
 
             _log.info(event("aws_ir_forensics", "get_s3_bucket_policy.success", target=result.target))
 
-        except botocore.exceptions.ClientError as exc:
+        except botocore.exceptions.ClientError as exc:  # pragma: no cover
+            # Defensive only: every ClientError-raising call above (policy,
+            # ACL, public-access-block) already has its own inner
+            # try/except that catches ClientError and never re-raises, so
+            # this outer handler has no reachable path under the current
+            # function body. Kept as a safety net, not chased for coverage.
             result.add_error(f"Failed to inspect bucket {bucket_name}: {exc}")
             _log.error(event("aws_ir_forensics", "get_s3_bucket_policy.error", target=result.target, error=str(exc)))
 
@@ -575,7 +580,7 @@ class AwsIRForensics:
             hours:     How many hours back to look.
             max_roles: Maximum roles to return.
         """
-        from datetime import timedelta
+        from datetime import datetime, timedelta, timezone
 
         result = OperationResult(
             operation="list_recently_active_roles",
