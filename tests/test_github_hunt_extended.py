@@ -376,3 +376,369 @@ class TestListDeployKeys:
         result = hunt.list_deploy_keys("repo")
         assert result.success is False
         assert result.errors
+
+
+# ---- list_github_apps ----
+
+class TestListGithubApps:
+    def test_correct_endpoint(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"id": 1, "app_slug": "ci-bot"}])
+
+        result = hunt.list_github_apps()
+
+        assert result.success is True
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/orgs/test-org/installations"
+
+    def test_installations_collected(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"id": 1}, {"id": 2}])
+
+        result = hunt.list_github_apps()
+
+        assert len(result.details["installations"]) == 2
+        assert result.details["statistics"]["total"] == 2
+
+    def test_max_items_respected(self):
+        hunt, svc = _make_hunt()
+        installations = [{"id": i} for i in range(100)]
+        svc.get.return_value = FakeResponse(200, installations)
+
+        result = hunt.list_github_apps(max_items=4)
+
+        assert len(result.details["installations"]) == 4
+
+    def test_api_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(403, {"message": "forbidden"})
+
+        result = hunt.list_github_apps()
+
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.side_effect = requests.exceptions.Timeout("timed out")
+
+        result = hunt.list_github_apps()
+
+        assert result.success is False
+        assert result.errors
+
+    def test_enterprise_config_records_error(self):
+        hunt = _enterprise_hunt()
+        result = hunt.list_github_apps()
+        assert result.success is False
+        assert result.errors
+
+
+# ---- list_actions_workflow_runs ----
+
+class TestListActionsWorkflowRuns:
+    def test_repo_level_endpoint_without_workflow_id(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"id": 1}])
+
+        result = hunt.list_actions_workflow_runs("my-repo")
+
+        assert result.success is True
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/repos/test-org/my-repo/actions/runs"
+
+    def test_workflow_scoped_endpoint_with_workflow_id(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"id": 1}])
+
+        hunt.list_actions_workflow_runs("my-repo", workflow_id="ci.yml")
+
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/repos/test-org/my-repo/actions/workflows/ci.yml/runs"
+
+    def test_status_param_passed_when_set(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [])
+
+        hunt.list_actions_workflow_runs("repo", status="in_progress")
+
+        params = svc.get.call_args[1]["params"]
+        assert params["status"] == "in_progress"
+
+    def test_runs_collected(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"id": 1}, {"id": 2}])
+
+        result = hunt.list_actions_workflow_runs("repo")
+
+        assert len(result.details["runs"]) == 2
+        assert result.details["statistics"]["repo"] == "repo"
+
+    def test_max_runs_respected(self):
+        hunt, svc = _make_hunt()
+        runs = [{"id": i} for i in range(100)]
+        svc.get.return_value = FakeResponse(200, runs)
+
+        result = hunt.list_actions_workflow_runs("repo", max_runs=7)
+
+        assert len(result.details["runs"]) == 7
+
+    def test_api_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(404, {"message": "not found"})
+
+        result = hunt.list_actions_workflow_runs("repo")
+
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.side_effect = requests.exceptions.Timeout("timed out")
+
+        result = hunt.list_actions_workflow_runs("repo")
+
+        assert result.success is False
+        assert result.errors
+
+    def test_enterprise_config_records_error(self):
+        hunt = _enterprise_hunt()
+        result = hunt.list_actions_workflow_runs("repo")
+        assert result.success is False
+        assert result.errors
+
+
+# ---- list_org_teams ----
+
+class TestListOrgTeams:
+    def test_correct_endpoint(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"slug": "security"}])
+
+        result = hunt.list_org_teams()
+
+        assert result.success is True
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/orgs/test-org/teams"
+
+    def test_teams_collected(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"slug": "a"}, {"slug": "b"}])
+
+        result = hunt.list_org_teams()
+
+        assert len(result.details["teams"]) == 2
+        assert result.details["statistics"]["total"] == 2
+
+    def test_max_teams_respected(self):
+        hunt, svc = _make_hunt()
+        teams = [{"slug": f"t{i}"} for i in range(100)]
+        svc.get.return_value = FakeResponse(200, teams)
+
+        result = hunt.list_org_teams(max_teams=6)
+
+        assert len(result.details["teams"]) == 6
+
+    def test_api_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(403, {"message": "forbidden"})
+
+        result = hunt.list_org_teams()
+
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.side_effect = requests.exceptions.Timeout("timed out")
+
+        result = hunt.list_org_teams()
+
+        assert result.success is False
+        assert result.errors
+
+    def test_enterprise_config_records_error(self):
+        hunt = _enterprise_hunt()
+        result = hunt.list_org_teams()
+        assert result.success is False
+        assert result.errors
+
+
+# ---- list_team_members ----
+
+class TestListTeamMembers:
+    def test_correct_endpoint(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"login": "alice"}])
+
+        result = hunt.list_team_members("security")
+
+        assert result.success is True
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/orgs/test-org/teams/security/members"
+
+    def test_role_param_passed_when_set(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [])
+
+        hunt.list_team_members("security", role="maintainer")
+
+        params = svc.get.call_args[1]["params"]
+        assert params["role"] == "maintainer"
+
+    def test_members_collected(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"login": "a"}, {"login": "b"}])
+
+        result = hunt.list_team_members("security")
+
+        assert len(result.details["members"]) == 2
+        assert result.details["statistics"]["team"] == "security"
+
+    def test_max_members_respected(self):
+        hunt, svc = _make_hunt()
+        members = [{"login": f"u{i}"} for i in range(100)]
+        svc.get.return_value = FakeResponse(200, members)
+
+        result = hunt.list_team_members("security", max_members=9)
+
+        assert len(result.details["members"]) == 9
+
+    def test_api_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(404, {"message": "not found"})
+
+        result = hunt.list_team_members("security")
+
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.side_effect = requests.exceptions.Timeout("timed out")
+
+        result = hunt.list_team_members("security")
+
+        assert result.success is False
+        assert result.errors
+
+    def test_enterprise_config_records_error(self):
+        hunt = _enterprise_hunt()
+        result = hunt.list_team_members("security")
+        assert result.success is False
+        assert result.errors
+
+
+# ---- list_actions_secrets ----
+
+class TestListActionsSecrets:
+    def test_org_level_endpoint_without_repo(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"name": "API_KEY"}])
+
+        result = hunt.list_actions_secrets()
+
+        assert result.success is True
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/orgs/test-org/actions/secrets"
+
+    def test_repo_level_endpoint_with_repo(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"name": "API_KEY"}])
+
+        hunt.list_actions_secrets("my-repo")
+
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/repos/test-org/my-repo/actions/secrets"
+
+    def test_secrets_collected(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"name": "A"}, {"name": "B"}])
+
+        result = hunt.list_actions_secrets()
+
+        assert len(result.details["secrets"]) == 2
+        assert result.details["statistics"]["total"] == 2
+
+    def test_max_secrets_respected(self):
+        hunt, svc = _make_hunt()
+        secrets = [{"name": f"S{i}"} for i in range(100)]
+        svc.get.return_value = FakeResponse(200, secrets)
+
+        result = hunt.list_actions_secrets(max_secrets=5)
+
+        assert len(result.details["secrets"]) == 5
+
+    def test_api_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(403, {"message": "forbidden"})
+
+        result = hunt.list_actions_secrets()
+
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.side_effect = requests.exceptions.Timeout("timed out")
+
+        result = hunt.list_actions_secrets()
+
+        assert result.success is False
+        assert result.errors
+
+    def test_enterprise_config_records_error(self):
+        hunt = _enterprise_hunt()
+        result = hunt.list_actions_secrets()
+        assert result.success is False
+        assert result.errors
+
+
+# ---- list_repo_environments ----
+
+class TestListRepoEnvironments:
+    def test_correct_endpoint(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"name": "production"}])
+
+        result = hunt.list_repo_environments("my-repo")
+
+        assert result.success is True
+        called_path = svc.get.call_args[0][0]
+        assert called_path == "/repos/test-org/my-repo/environments"
+
+    def test_environments_collected(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(200, [{"name": "staging"}, {"name": "production"}])
+
+        result = hunt.list_repo_environments("repo")
+
+        assert len(result.details["environments"]) == 2
+        assert result.details["statistics"]["repo"] == "repo"
+
+    def test_max_items_respected(self):
+        hunt, svc = _make_hunt()
+        envs = [{"name": f"env{i}"} for i in range(100)]
+        svc.get.return_value = FakeResponse(200, envs)
+
+        result = hunt.list_repo_environments("repo", max_items=2)
+
+        assert len(result.details["environments"]) == 2
+
+    def test_api_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.return_value = FakeResponse(404, {"message": "not found"})
+
+        result = hunt.list_repo_environments("repo")
+
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        hunt, svc = _make_hunt()
+        svc.get.side_effect = requests.exceptions.Timeout("timed out")
+
+        result = hunt.list_repo_environments("repo")
+
+        assert result.success is False
+        assert result.errors
+
+    def test_enterprise_config_records_error(self):
+        hunt = _enterprise_hunt()
+        result = hunt.list_repo_environments("repo")
+        assert result.success is False
+        assert result.errors

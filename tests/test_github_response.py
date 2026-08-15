@@ -43,6 +43,22 @@ def _enterprise_response() -> GitHubIRResponse:
     return GitHubIRResponse(svc, cfg)
 
 
+# ---- _error_body ----
+
+class TestErrorBody:
+    def test_non_json_body_falls_back_to_text(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = MagicMock(spec=GitHubServiceRegistry)
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.json.side_effect = ValueError("not json")
+        resp.text = "<html>Internal Server Error</html>"
+        svc.put.return_value = resp
+        result = GitHubIRResponse(svc, cfg).block_org_member("x")
+        assert result.success is False
+        assert "Internal Server Error" in result.errors[0]
+
+
 # ---- block_org_member ----
 
 class TestBlockOrgMember:
@@ -116,6 +132,14 @@ class TestRemoveRepoCollaborator:
         result = GitHubIRResponse(svc, cfg).remove_repo_collaborator("repo", "member-user")
         assert result.success is False
 
+    def test_network_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services()
+        svc.delete.side_effect = requests.exceptions.ConnectionError("boom")
+        result = GitHubIRResponse(svc, cfg).remove_repo_collaborator("repo", "user")
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
     def test_enterprise_config_raises(self):
         with pytest.raises(RuntimeError):
             _enterprise_response().remove_repo_collaborator("repo", "user")
@@ -145,6 +169,14 @@ class TestRevokeDeployKey:
         result = GitHubIRResponse(svc, cfg).revoke_deploy_key("repo", 1)
         assert result.success is False
 
+    def test_network_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services()
+        svc.delete.side_effect = requests.exceptions.ConnectionError("boom")
+        result = GitHubIRResponse(svc, cfg).revoke_deploy_key("repo", 1)
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
 
 # ---- delete_org_webhook ----
 
@@ -163,6 +195,14 @@ class TestDeleteOrgWebhook:
         result = GitHubIRResponse(svc, cfg).delete_org_webhook(99)
         assert result.success is False
 
+    def test_network_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services()
+        svc.delete.side_effect = requests.exceptions.ConnectionError("boom")
+        result = GitHubIRResponse(svc, cfg).delete_org_webhook(42)
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
 
 # ---- delete_repo_webhook ----
 
@@ -179,6 +219,169 @@ class TestDeleteRepoWebhook:
         svc = _make_services(status=403)
         result = GitHubIRResponse(svc, cfg).delete_repo_webhook("repo", 7)
         assert result.success is False
+
+    def test_network_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services()
+        svc.delete.side_effect = requests.exceptions.ConnectionError("boom")
+        result = GitHubIRResponse(svc, cfg).delete_repo_webhook("repo", 7)
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
+
+# ---- remove_user_from_team ----
+
+class TestRemoveUserFromTeam:
+    def test_success_204(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=204)
+        result = GitHubIRResponse(svc, cfg).remove_user_from_team("security", "bob")
+        assert result.success is True
+        assert result.details["removed"] is True
+        svc.delete.assert_called_once_with("/orgs/test-org/teams/security/memberships/bob")
+
+    def test_http_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=404)
+        result = GitHubIRResponse(svc, cfg).remove_user_from_team("security", "bob")
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services()
+        svc.delete.side_effect = requests.exceptions.ConnectionError("boom")
+        result = GitHubIRResponse(svc, cfg).remove_user_from_team("security", "bob")
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
+    def test_enterprise_config_raises(self):
+        with pytest.raises(RuntimeError):
+            _enterprise_response().remove_user_from_team("security", "bob")
+
+
+# ---- disable_actions_workflow ----
+
+class TestDisableActionsWorkflow:
+    def test_success_204(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=204)
+        result = GitHubIRResponse(svc, cfg).disable_actions_workflow("repo", "12345")
+        assert result.success is True
+        assert result.details["disabled"] is True
+        svc.put.assert_called_once_with("/repos/test-org/repo/actions/workflows/12345/disable")
+
+    def test_http_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=404)
+        result = GitHubIRResponse(svc, cfg).disable_actions_workflow("repo", "12345")
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services()
+        svc.put.side_effect = requests.exceptions.ConnectionError("boom")
+        result = GitHubIRResponse(svc, cfg).disable_actions_workflow("repo", "12345")
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
+    def test_enterprise_config_raises(self):
+        with pytest.raises(RuntimeError):
+            _enterprise_response().disable_actions_workflow("repo", "12345")
+
+
+# ---- disable_actions_for_repo ----
+
+class TestDisableActionsForRepo:
+    def test_success_204(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=204)
+        result = GitHubIRResponse(svc, cfg).disable_actions_for_repo("repo")
+        assert result.success is True
+        assert result.details["disabled"] is True
+        svc.put.assert_called_once_with(
+            "/repos/test-org/repo/actions/permissions", json={"enabled": False}
+        )
+
+    def test_http_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=403)
+        result = GitHubIRResponse(svc, cfg).disable_actions_for_repo("repo")
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services()
+        svc.put.side_effect = requests.exceptions.ConnectionError("boom")
+        result = GitHubIRResponse(svc, cfg).disable_actions_for_repo("repo")
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
+    def test_enterprise_config_raises(self):
+        with pytest.raises(RuntimeError):
+            _enterprise_response().disable_actions_for_repo("repo")
+
+
+# ---- revoke_github_app_installation ----
+
+class TestRevokeGithubAppInstallation:
+    def test_success_204(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=204)
+        result = GitHubIRResponse(svc, cfg).revoke_github_app_installation(555)
+        assert result.success is True
+        assert result.details["revoked"] is True
+        svc.delete.assert_called_once_with("/orgs/test-org/installations/555")
+
+    def test_http_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=404)
+        result = GitHubIRResponse(svc, cfg).revoke_github_app_installation(555)
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services()
+        svc.delete.side_effect = requests.exceptions.ConnectionError("boom")
+        result = GitHubIRResponse(svc, cfg).revoke_github_app_installation(555)
+        assert result.success is False
+        assert "boom" in result.errors[0]
+
+    def test_enterprise_config_raises(self):
+        with pytest.raises(RuntimeError):
+            _enterprise_response().revoke_github_app_installation(555)
+
+
+# ---- set_repo_visibility_private ----
+
+class TestSetRepoVisibilityPrivate:
+    def test_success_200_stores_repo_payload(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=200, json_data={"name": "my-repo", "private": True})
+        result = GitHubIRResponse(svc, cfg).set_repo_visibility_private("my-repo")
+        assert result.success is True
+        assert result.details["private"] is True
+        assert result.details["repo"]["name"] == "my-repo"
+        svc.patch.assert_called_once_with(
+            "/repos/test-org/my-repo", json={"private": True, "visibility": "private"}
+        )
+
+    def test_http_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services(status=404)
+        result = GitHubIRResponse(svc, cfg).set_repo_visibility_private("gone")
+        assert result.success is False
+
+    def test_network_error_recorded(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        svc = _make_services()
+        svc.patch.side_effect = requests.exceptions.Timeout("timed out")
+        result = GitHubIRResponse(svc, cfg).set_repo_visibility_private("repo")
+        assert result.success is False
+        assert "timed out" in result.errors[0]
+
+    def test_enterprise_config_raises(self):
+        with pytest.raises(RuntimeError):
+            _enterprise_response().set_repo_visibility_private("repo")
 
 
 # ---- archive_repository ----

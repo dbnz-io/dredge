@@ -250,6 +250,13 @@ class TestCaptureSsmSessionHistory:
         result = AwsIRForensics(services, DredgeConfig()).capture_ssm_session_history()
         assert len(result.details["sessions"]) == 2
 
+    def test_owner_filter_applied(self):
+        services = make_services()
+        services.ssm.describe_sessions.return_value = {"Sessions": [], "NextToken": None}
+        AwsIRForensics(services, DredgeConfig()).capture_ssm_session_history(owner="arn:aws:iam::123:user/alice")
+        call_kwargs = services.ssm.describe_sessions.call_args[1]
+        assert {"key": "Owner", "value": "arn:aws:iam::123:user/alice"} in call_kwargs["Filters"]
+
     def test_api_error_records_failure(self):
         services = make_services()
         services.ssm.describe_sessions.side_effect = make_client_error()
@@ -306,8 +313,295 @@ class TestGetCloudtrailStatus:
         assert result.success is True  # non-fatal per-trail error
         assert "status_error" in result.details["trails"][0]
 
+    def test_get_event_selectors_error_captured(self):
+        services = make_services()
+        ct = self._make_ct()
+        ct.get_event_selectors.side_effect = make_client_error()
+        services.cloudtrail = ct
+        result = AwsIRForensics(services, DredgeConfig()).get_cloudtrail_status()
+        assert result.success is True  # non-fatal per-trail error
+        assert "event_selectors_error" in result.details["trails"][0]
+
     def test_describe_trails_error_records_fatal(self):
         services = make_services()
         services.cloudtrail.describe_trails.side_effect = make_client_error()
         result = AwsIRForensics(services, DredgeConfig()).get_cloudtrail_status()
+        assert result.success is False
+
+
+# =====================================================================
+# Coverage completion pass: functions with no test class before this
+# =====================================================================
+
+
+def _make_user_resp(user_name="alice"):
+    return {"User": {"UserName": user_name, "UserId": "AID123", "Arn": f"arn:aws:iam::123:user/{user_name}"}}
+
+
+class TestGetIamUserDetail:
+    def test_happy_path_all_sections(self):
+        services = make_services()
+        services.iam.get_user.return_value = _make_user_resp()
+        services.iam.list_mfa_devices.return_value = {"MFADevices": [{"SerialNumber": "arn:aws:iam::123:mfa/alice"}]}
+        services.iam.list_access_keys.return_value = {
+            "AccessKeyMetadata": [{"AccessKeyId": "AKIA1", "Status": "Active"}]
+        }
+        services.iam.list_groups_for_user.return_value = {"Groups": [{"GroupName": "admins"}]}
+
+        result = AwsIRForensics(services, DredgeConfig()).get_iam_user_detail("alice")
+        assert result.success is True
+        assert result.details["user"]["user_name"] == "alice"
+        assert result.details["mfa_devices"][0]["serial"] == "arn:aws:iam::123:mfa/alice"
+        assert result.details["access_keys"][0]["access_key_id"] == "AKIA1"
+        assert result.details["groups"] == ["admins"]
+
+    def test_get_user_fatal_error_returns_early(self):
+        services = make_services()
+        services.iam.get_user.side_effect = make_client_error()
+        result = AwsIRForensics(services, DredgeConfig()).get_iam_user_detail("alice")
+        assert result.success is False
+        assert "user" not in result.details
+        services.iam.list_mfa_devices.assert_not_called()
+
+    def test_mfa_error_non_fatal(self):
+        services = make_services()
+        services.iam.get_user.return_value = _make_user_resp()
+        services.iam.list_mfa_devices.side_effect = make_client_error()
+        services.iam.list_access_keys.return_value = {"AccessKeyMetadata": []}
+        services.iam.list_groups_for_user.return_value = {"Groups": []}
+        result = AwsIRForensics(services, DredgeConfig()).get_iam_user_detail("alice")
+        assert result.success is True
+        assert "mfa_error" in result.details
+
+    def test_access_keys_error_non_fatal(self):
+        services = make_services()
+        services.iam.get_user.return_value = _make_user_resp()
+        services.iam.list_mfa_devices.return_value = {"MFADevices": []}
+        services.iam.list_access_keys.side_effect = make_client_error()
+        services.iam.list_groups_for_user.return_value = {"Groups": []}
+        result = AwsIRForensics(services, DredgeConfig()).get_iam_user_detail("alice")
+        assert result.success is True
+        assert "access_keys_error" in result.details
+
+    def test_groups_error_non_fatal(self):
+        services = make_services()
+        services.iam.get_user.return_value = _make_user_resp()
+        services.iam.list_mfa_devices.return_value = {"MFADevices": []}
+        services.iam.list_access_keys.return_value = {"AccessKeyMetadata": []}
+        services.iam.list_groups_for_user.side_effect = make_client_error()
+        result = AwsIRForensics(services, DredgeConfig()).get_iam_user_detail("alice")
+        assert result.success is True
+        assert "groups_error" in result.details
+
+
+class TestGetS3BucketPolicy:
+    def test_happy_path_all_sections_present(self):
+        services = make_services()
+        services.s3.get_bucket_policy.return_value = {"Policy": '{"Statement": []}'}
+        services.s3.get_bucket_acl.return_value = {"Owner": {"ID": "o1"}, "Grants": [{"Permission": "READ"}]}
+        services.s3.get_public_access_block.return_value = {
+            "PublicAccessBlockConfiguration": {"BlockPublicAcls": True}
+        }
+        result = AwsIRForensics(services, DredgeConfig()).get_s3_bucket_policy("my-bucket")
+        assert result.success is True
+        assert result.details["policy"] == '{"Statement": []}'
+        assert result.details["acl"]["owner"] == {"ID": "o1"}
+        assert result.details["public_access_block"] == {"BlockPublicAcls": True}
+
+    def test_no_such_bucket_policy_gives_none(self):
+        services = make_services()
+        services.s3.get_bucket_policy.side_effect = make_client_error(code="NoSuchBucketPolicy")
+        services.s3.get_bucket_acl.return_value = {"Owner": {}, "Grants": []}
+        services.s3.get_public_access_block.return_value = {"PublicAccessBlockConfiguration": {}}
+        result = AwsIRForensics(services, DredgeConfig()).get_s3_bucket_policy("my-bucket")
+        assert result.success is True
+        assert result.details["policy"] is None
+        assert "policy_error" not in result.details
+
+    def test_generic_policy_error_recorded(self):
+        services = make_services()
+        services.s3.get_bucket_policy.side_effect = make_client_error(code="AccessDenied")
+        services.s3.get_bucket_acl.return_value = {"Owner": {}, "Grants": []}
+        services.s3.get_public_access_block.return_value = {"PublicAccessBlockConfiguration": {}}
+        result = AwsIRForensics(services, DredgeConfig()).get_s3_bucket_policy("my-bucket")
+        assert result.success is True
+        assert "policy_error" in result.details
+
+    def test_acl_error_recorded(self):
+        services = make_services()
+        services.s3.get_bucket_policy.side_effect = make_client_error(code="NoSuchBucketPolicy")
+        services.s3.get_bucket_acl.side_effect = make_client_error()
+        services.s3.get_public_access_block.return_value = {"PublicAccessBlockConfiguration": {}}
+        result = AwsIRForensics(services, DredgeConfig()).get_s3_bucket_policy("my-bucket")
+        assert result.success is True
+        assert "acl_error" in result.details
+
+    def test_no_such_public_access_block_gives_none(self):
+        services = make_services()
+        services.s3.get_bucket_policy.side_effect = make_client_error(code="NoSuchBucketPolicy")
+        services.s3.get_bucket_acl.return_value = {"Owner": {}, "Grants": []}
+        services.s3.get_public_access_block.side_effect = make_client_error(
+            code="NoSuchPublicAccessBlockConfiguration"
+        )
+        result = AwsIRForensics(services, DredgeConfig()).get_s3_bucket_policy("my-bucket")
+        assert result.success is True
+        assert result.details["public_access_block"] is None
+        assert "public_access_block_error" not in result.details
+
+    def test_generic_public_access_block_error_recorded(self):
+        services = make_services()
+        services.s3.get_bucket_policy.side_effect = make_client_error(code="NoSuchBucketPolicy")
+        services.s3.get_bucket_acl.return_value = {"Owner": {}, "Grants": []}
+        services.s3.get_public_access_block.side_effect = make_client_error(code="AccessDenied")
+        result = AwsIRForensics(services, DredgeConfig()).get_s3_bucket_policy("my-bucket")
+        assert result.success is True
+        assert "public_access_block_error" in result.details
+
+
+class TestGetEc2UserData:
+    def test_happy_path_decodes_base64(self):
+        import base64
+        services = make_services()
+        encoded = base64.b64encode(b"#!/bin/bash\necho hi").decode()
+        services.ec2.describe_instance_attribute.return_value = {"UserData": {"Value": encoded}}
+        result = AwsIRForensics(services, DredgeConfig()).get_ec2_user_data("i-123")
+        assert result.success is True
+        assert result.details["user_data_decoded"] == "#!/bin/bash\necho hi"
+
+    def test_no_user_data_returns_none(self):
+        services = make_services()
+        services.ec2.describe_instance_attribute.return_value = {"UserData": {}}
+        result = AwsIRForensics(services, DredgeConfig()).get_ec2_user_data("i-123")
+        assert result.success is True
+        assert result.details["user_data_base64"] is None
+        assert result.details["user_data_decoded"] is None
+
+    def test_malformed_base64_decoded_is_none(self):
+        services = make_services()
+        services.ec2.describe_instance_attribute.return_value = {"UserData": {"Value": "not-valid-base64!!"}}
+        result = AwsIRForensics(services, DredgeConfig()).get_ec2_user_data("i-123")
+        assert result.success is True
+        assert result.details["user_data_decoded"] is None
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.ec2.describe_instance_attribute.side_effect = make_client_error()
+        result = AwsIRForensics(services, DredgeConfig()).get_ec2_user_data("i-123")
+        assert result.success is False
+
+
+class TestListRecentlyActiveRoles:
+    def _make_role(self, name, last_used_date=None, region="us-east-1"):
+        role = {"RoleName": name, "Arn": f"arn:aws:iam::123:role/{name}"}
+        if last_used_date is not None:
+            role["RoleLastUsed"] = {"LastUsedDate": last_used_date, "Region": region}
+        return role
+
+    def test_role_used_inside_window_included(self):
+        from datetime import datetime, timezone
+        services = make_services()
+        recent = datetime.now(timezone.utc)
+        services.iam.get_paginator.return_value.paginate.return_value = [
+            {"Roles": [self._make_role("recent-role", last_used_date=recent)]}
+        ]
+        result = AwsIRForensics(services, DredgeConfig()).list_recently_active_roles(hours=24)
+        assert result.success is True
+        assert result.details["roles"][0]["role_name"] == "recent-role"
+        assert result.details["statistics"]["active_in_window"] == 1
+
+    def test_role_used_outside_window_excluded(self):
+        from datetime import datetime, timezone, timedelta
+        services = make_services()
+        stale = datetime.now(timezone.utc) - timedelta(hours=48)
+        services.iam.get_paginator.return_value.paginate.return_value = [
+            {"Roles": [self._make_role("stale-role", last_used_date=stale)]}
+        ]
+        result = AwsIRForensics(services, DredgeConfig()).list_recently_active_roles(hours=24)
+        assert result.details["roles"] == []
+        assert result.details["statistics"]["roles_scanned"] == 1
+
+    def test_role_never_used_excluded(self):
+        services = make_services()
+        services.iam.get_paginator.return_value.paginate.return_value = [
+            {"Roles": [self._make_role("never-used-role")]}
+        ]
+        result = AwsIRForensics(services, DredgeConfig()).list_recently_active_roles()
+        assert result.details["roles"] == []
+
+    def test_max_roles_cutoff(self):
+        from datetime import datetime, timezone
+        services = make_services()
+        recent = datetime.now(timezone.utc)
+        roles = [self._make_role(f"role-{i}", last_used_date=recent) for i in range(5)]
+        services.iam.get_paginator.return_value.paginate.return_value = [{"Roles": roles}]
+        result = AwsIRForensics(services, DredgeConfig()).list_recently_active_roles(max_roles=2)
+        assert result.details["statistics"]["roles_scanned"] == 2
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.iam.get_paginator.return_value.paginate.side_effect = make_client_error()
+        result = AwsIRForensics(services, DredgeConfig()).list_recently_active_roles()
+        assert result.success is False
+        assert result.details["roles"] == []
+
+
+class TestGetRdsParameterGroup:
+    def test_happy_path(self):
+        services = make_services()
+        services.rds.get_paginator.return_value.paginate.return_value = [
+            {"Parameters": [{"ParameterName": "log_bin", "ParameterValue": "OFF", "Source": "engine-default"}]}
+        ]
+        result = AwsIRForensics(services, DredgeConfig()).get_rds_parameter_group("my-pg")
+        assert result.success is True
+        assert result.details["parameters"][0]["name"] == "log_bin"
+        assert result.details["group_name"] == "my-pg"
+        assert result.details["statistics"]["total_parameters"] == 1
+        services.rds.get_paginator.assert_called_once_with("describe_db_parameters")
+
+    def test_max_params_cutoff(self):
+        services = make_services()
+        params = [{"ParameterName": f"p{i}", "ParameterValue": "x"} for i in range(10)]
+        services.rds.get_paginator.return_value.paginate.return_value = [{"Parameters": params}]
+        result = AwsIRForensics(services, DredgeConfig()).get_rds_parameter_group("my-pg", max_params=3)
+        assert len(result.details["parameters"]) == 3
+
+    def test_api_error_returns_early(self):
+        services = make_services()
+        services.rds.get_paginator.return_value.paginate.side_effect = make_client_error()
+        result = AwsIRForensics(services, DredgeConfig()).get_rds_parameter_group("my-pg")
+        assert result.success is False
+        assert "parameters" not in result.details
+
+
+class TestCaptureGuarddutyFindingDetail:
+    def test_no_finding_ids_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError):
+            AwsIRForensics(services, DredgeConfig()).capture_guardduty_finding_detail("detector-1")
+
+    def test_happy_path(self):
+        services = make_services()
+        services.guardduty.get_findings.return_value = {
+            "Findings": [{"Id": "f-1", "Severity": 8.0}]
+        }
+        result = AwsIRForensics(services, DredgeConfig()).capture_guardduty_finding_detail("detector-1", "f-1")
+        assert result.success is True
+        assert result.details["findings"][0]["Id"] == "f-1"
+        assert result.details["statistics"]["total"] == 1
+        services.guardduty.get_findings.assert_called_once_with(
+            DetectorId="detector-1", FindingIds=["f-1"]
+        )
+
+    def test_multiple_finding_ids(self):
+        services = make_services()
+        services.guardduty.get_findings.return_value = {"Findings": []}
+        AwsIRForensics(services, DredgeConfig()).capture_guardduty_finding_detail("detector-1", "f-1", "f-2")
+        services.guardduty.get_findings.assert_called_once_with(
+            DetectorId="detector-1", FindingIds=["f-1", "f-2"]
+        )
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.guardduty.get_findings.side_effect = make_client_error()
+        result = AwsIRForensics(services, DredgeConfig()).capture_guardduty_finding_detail("detector-1", "f-1")
         assert result.success is False

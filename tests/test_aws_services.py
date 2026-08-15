@@ -2,6 +2,7 @@ import os
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
 from unittest.mock import MagicMock
+import pytest
 from dredge.aws_ir.services import AwsServiceRegistry
 
 
@@ -54,3 +55,37 @@ class TestAwsServiceRegistry:
         reg, session = make_registry()
         _ = reg.cloudtrail
         session.client.assert_called_with("cloudtrail")
+
+
+_REMAINING_PROPS = [
+    ("kms", "kms"),
+    ("guardduty", "guardduty"),
+    ("logs", "logs"),
+    ("tagging", "resourcegroupstaggingapi"),
+    ("rds", "rds"),
+    ("ecs", "ecs"),
+    ("secretsmanager", "secretsmanager"),
+    ("events", "events"),
+    ("ssm", "ssm"),
+    ("securityhub", "securityhub"),
+    ("accessanalyzer", "accessanalyzer"),
+    ("awsconfig", "config"),
+    ("sts", "sts"),
+    ("ecr", "ecr"),
+]
+
+
+class TestAwsServiceRegistryRemainingClients:
+    @pytest.mark.parametrize("prop_name,boto3_client_name", _REMAINING_PROPS)
+    def test_lazy_loaded(self, prop_name, boto3_client_name):
+        reg, session = make_registry()
+        _ = getattr(reg, prop_name)
+        session.client.assert_called_with(boto3_client_name)
+
+    @pytest.mark.parametrize("prop_name,boto3_client_name", _REMAINING_PROPS)
+    def test_cached_on_second_access(self, prop_name, boto3_client_name):
+        reg, session = make_registry()
+        c1 = getattr(reg, prop_name)
+        c2 = getattr(reg, prop_name)
+        assert c1 is c2
+        session.client.assert_called_once()

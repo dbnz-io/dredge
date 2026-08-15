@@ -656,3 +656,522 @@ class TestGetIamCredentialReport:
         services.iam.generate_credential_report.side_effect = make_client_error()
         result = AwsIRHunt(services, DredgeConfig()).get_iam_credential_report()
         assert result.success is False
+
+
+def _make_paginator(pages):
+    p = MagicMock()
+    p.paginate.return_value = pages
+    return p
+
+
+class TestHuntExposedS3Buckets:
+    def test_happy_path_no_exposure(self):
+        s3 = MagicMock()
+        s3.list_buckets.return_value = {"Buckets": [{"Name": "safe-bucket"}]}
+        s3.get_public_access_block.return_value = {
+            "PublicAccessBlockConfiguration": {
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": True,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True,
+            }
+        }
+        services = make_services()
+        services.s3 = s3
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_exposed_s3_buckets()
+        assert result.success is True
+        assert result.details["exposed_buckets"] == []
+        assert result.details["buckets"][0]["exposed"] is False
+
+    def test_incomplete_public_access_block_flagged(self):
+        s3 = MagicMock()
+        s3.list_buckets.return_value = {"Buckets": [{"Name": "leaky-bucket"}]}
+        s3.get_public_access_block.return_value = {
+            "PublicAccessBlockConfiguration": {
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": False,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True,
+            }
+        }
+        services = make_services()
+        services.s3 = s3
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_exposed_s3_buckets()
+        assert result.details["exposed_buckets"] == ["leaky-bucket"]
+        assert result.details["buckets"][0]["reason"] == "public_access_block_incomplete"
+
+    def test_no_such_public_access_block_configuration_flagged(self):
+        s3 = MagicMock()
+        s3.list_buckets.return_value = {"Buckets": [{"Name": "no-pab-bucket"}]}
+        s3.get_public_access_block.side_effect = make_client_error(
+            code="NoSuchPublicAccessBlockConfiguration"
+        )
+        services = make_services()
+        services.s3 = s3
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_exposed_s3_buckets()
+        assert result.details["exposed_buckets"] == ["no-pab-bucket"]
+        assert result.details["buckets"][0]["reason"] == "no_public_access_block"
+
+    def test_other_bucket_error_recorded_not_fatal(self):
+        s3 = MagicMock()
+        s3.list_buckets.return_value = {"Buckets": [{"Name": "other-bucket"}]}
+        s3.get_public_access_block.side_effect = make_client_error(code="AccessDenied")
+        services = make_services()
+        services.s3 = s3
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_exposed_s3_buckets()
+        assert result.success is True
+        assert result.details["exposed_buckets"] == []
+        assert "check_error" in result.details["buckets"][0]
+
+    def test_list_buckets_fatal_error(self):
+        s3 = MagicMock()
+        s3.list_buckets.side_effect = make_client_error()
+        services = make_services()
+        services.s3 = s3
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_exposed_s3_buckets()
+        assert result.success is False
+        assert result.errors
+
+
+def _make_iam_admin(
+    *,
+    users=None,
+    user_attached=None,
+    user_inline=None,
+    user_policy_docs=None,
+    roles=None,
+    role_attached=None,
+    role_inline=None,
+    role_policy_docs=None,
+):
+    iam = MagicMock()
+    _paginators = {
+        "list_users": _make_paginator(
+            [{"Users": [{"UserName": u} for u in (users or [])]}]
+        ),
+        "list_attached_user_policies": _make_paginator(
+            [{"AttachedPolicies": [{"PolicyArn": a} for a in (user_attached or [])]}]
+        ),
+        "list_user_policies": _make_paginator(
+            [{"PolicyNames": user_inline or []}]
+        ),
+        "list_roles": _make_paginator(
+            [{"Roles": [{"RoleName": r} for r in (roles or [])]}]
+        ),
+        "list_attached_role_policies": _make_paginator(
+            [{"AttachedPolicies": [{"PolicyArn": a} for a in (role_attached or [])]}]
+        ),
+        "list_role_policies": _make_paginator(
+            [{"PolicyNames": role_inline or []}]
+        ),
+    }
+    iam.get_paginator.side_effect = lambda op: _paginators.get(op, _make_paginator([{}]))
+    iam.get_user_policy.side_effect = lambda UserName, PolicyName: (user_policy_docs or {}).get(
+        PolicyName, {"PolicyDocument": {"Statement": []}}
+    )
+    iam.get_role_policy.side_effect = lambda RoleName, PolicyName: (role_policy_docs or {}).get(
+        PolicyName, {"PolicyDocument": {"Statement": []}}
+    )
+    return iam
+
+
+class TestListIamAdminPrincipals:
+    def test_no_admins(self):
+        services = make_services()
+        services.iam = _make_iam_admin(users=["alice"], roles=["role-a"])
+
+        result = AwsIRHunt(services, DredgeConfig()).list_iam_admin_principals()
+        assert result.success is True
+        assert result.details["admin_users"] == []
+        assert result.details["admin_roles"] == []
+
+    def test_user_admin_via_managed_policy(self):
+        services = make_services()
+        services.iam = _make_iam_admin(
+            users=["alice"],
+            user_attached=["arn:aws:iam::aws:policy/AdministratorAccess"],
+        )
+
+        result = AwsIRHunt(services, DredgeConfig()).list_iam_admin_principals()
+        assert result.details["admin_users"] == ["alice"]
+
+    def test_user_admin_via_wildcard_inline_policy(self):
+        services = make_services()
+        services.iam = _make_iam_admin(
+            users=["bob"],
+            user_inline=["danger"],
+            user_policy_docs={
+                "danger": {"PolicyDocument": {"Statement": [{"Effect": "Allow", "Action": "*"}]}}
+            },
+        )
+
+        result = AwsIRHunt(services, DredgeConfig()).list_iam_admin_principals()
+        assert result.details["admin_users"] == ["bob"]
+
+    def test_role_admin_via_managed_policy(self):
+        services = make_services()
+        services.iam = _make_iam_admin(
+            roles=["role-admin"],
+            role_attached=["arn:aws:iam::aws:policy/AdministratorAccess"],
+        )
+
+        result = AwsIRHunt(services, DredgeConfig()).list_iam_admin_principals()
+        assert result.details["admin_roles"] == ["role-admin"]
+
+    def test_role_admin_via_wildcard_inline_policy(self):
+        services = make_services()
+        services.iam = _make_iam_admin(
+            roles=["role-danger"],
+            role_inline=["danger"],
+            role_policy_docs={
+                "danger": {"PolicyDocument": {"Statement": [{"Effect": "Allow", "Action": ["*"]}]}}
+            },
+        )
+
+        result = AwsIRHunt(services, DredgeConfig()).list_iam_admin_principals()
+        assert result.details["admin_roles"] == ["role-danger"]
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        iam = _make_iam_admin()
+        iam.get_paginator.side_effect = make_client_error()
+        services.iam = iam
+
+        result = AwsIRHunt(services, DredgeConfig()).list_iam_admin_principals()
+        assert result.success is False
+        assert result.errors
+
+
+class TestHuntUnusualLoginLocations:
+    def test_happy_path(self):
+        ct = MagicMock()
+        ct.lookup_events.return_value = {"Events": [make_event()], "NextToken": None}
+        services = make_services()
+        services.cloudtrail = ct
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_unusual_login_locations()
+        assert result.success is True
+        assert result.details["statistics"]["total_events"] == 1
+        ct.lookup_events.assert_called_once()
+        assert ct.lookup_events.call_args[1]["LookupAttributes"] == [
+            {"AttributeKey": "EventName", "AttributeValue": "ConsoleLogin"}
+        ]
+
+    def test_start_end_time_passed_through(self):
+        ct = MagicMock()
+        ct.lookup_events.return_value = {"Events": [], "NextToken": None}
+        services = make_services()
+        services.cloudtrail = ct
+
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        AwsIRHunt(services, DredgeConfig()).hunt_unusual_login_locations(start_time=start, end_time=end)
+        call_kwargs = ct.lookup_events.call_args[1]
+        assert call_kwargs["StartTime"] == start
+        assert call_kwargs["EndTime"] == end
+
+    def test_paginates_until_max_events(self):
+        ct = MagicMock()
+        ct.lookup_events.side_effect = [
+            {"Events": [make_event(), make_event()], "NextToken": "tok"},
+            {"Events": [make_event()], "NextToken": None},
+        ]
+        services = make_services()
+        services.cloudtrail = ct
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_unusual_login_locations(max_events=3)
+        assert result.details["statistics"]["total_events"] == 3
+        assert ct.lookup_events.call_count == 2
+
+    def test_stops_on_empty_batch_even_with_next_token(self):
+        ct = MagicMock()
+        ct.lookup_events.return_value = {"Events": [], "NextToken": "tok"}
+        services = make_services()
+        services.cloudtrail = ct
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_unusual_login_locations(max_events=100)
+        assert result.success is True
+        assert ct.lookup_events.call_count == 1
+        assert result.details["statistics"]["total_events"] == 0
+
+    def test_client_error_records_failure(self):
+        ct = MagicMock()
+        ct.lookup_events.side_effect = make_client_error()
+        services = make_services()
+        services.cloudtrail = ct
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_unusual_login_locations()
+        assert result.success is False
+        assert result.errors
+
+
+class TestListPublicSnapshots:
+    def test_happy_path(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator([
+            {"Snapshots": [{
+                "SnapshotId": "snap-1",
+                "VolumeId": "vol-1",
+                "OwnerId": "123456789012",
+                "StartTime": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                "VolumeSize": 8,
+                "Description": "test",
+                "Encrypted": False,
+                "Tags": [],
+            }]}
+        ])
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_public_snapshots()
+        assert result.success is True
+        assert result.details["snapshots"][0]["snapshot_id"] == "snap-1"
+        assert result.details["snapshots"][0]["start_time"] is not None
+        call_kwargs = ec2.get_paginator.return_value.paginate.call_args[1]
+        assert call_kwargs["RestorableByUserIds"] == ["all"]
+        assert "OwnerIds" not in call_kwargs
+
+    def test_owner_id_filters(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator([{"Snapshots": []}])
+        services = make_services()
+        services.ec2 = ec2
+
+        AwsIRHunt(services, DredgeConfig()).list_public_snapshots(owner_id="123456789012")
+        call_kwargs = ec2.get_paginator.return_value.paginate.call_args[1]
+        assert call_kwargs["OwnerIds"] == ["123456789012"]
+
+    def test_missing_start_time_handled(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator([
+            {"Snapshots": [{"SnapshotId": "snap-2", "VolumeId": "vol-2", "OwnerId": "o"}]}
+        ])
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_public_snapshots()
+        assert result.details["snapshots"][0]["start_time"] is None
+
+    def test_api_error_records_failure(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value.paginate.side_effect = make_client_error()
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_public_snapshots()
+        assert result.success is False
+        assert result.errors
+
+
+class TestHuntLambdaEnvSecrets:
+    def test_happy_path_flags_suspect_vars(self):
+        lambda_ = MagicMock()
+        lambda_.get_paginator.return_value = _make_paginator([
+            {"Functions": [{
+                "FunctionName": "fn-1",
+                "Runtime": "python3.13",
+                "Environment": {"Variables": {"DB_PASSWORD": "x", "REGION": "us-east-1"}},
+            }]}
+        ])
+        services = make_services()
+        services.lambda_ = lambda_
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_lambda_env_secrets()
+        assert result.success is True
+        assert result.details["flagged"][0]["function"] == "fn-1"
+        assert result.details["flagged"][0]["flagged_vars"] == ["DB_PASSWORD"]
+
+    def test_no_suspect_vars_not_flagged(self):
+        lambda_ = MagicMock()
+        lambda_.get_paginator.return_value = _make_paginator([
+            {"Functions": [{
+                "FunctionName": "fn-2",
+                "Runtime": "python3.13",
+                "Environment": {"Variables": {"REGION": "us-east-1"}},
+            }]}
+        ])
+        services = make_services()
+        services.lambda_ = lambda_
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_lambda_env_secrets()
+        assert result.details["flagged"] == []
+
+    def test_custom_patterns_extend_defaults(self):
+        lambda_ = MagicMock()
+        lambda_.get_paginator.return_value = _make_paginator([
+            {"Functions": [{
+                "FunctionName": "fn-3",
+                "Runtime": "python3.13",
+                "Environment": {"Variables": {"CUSTOM_FLAG": "x"}},
+            }]}
+        ])
+        services = make_services()
+        services.lambda_ = lambda_
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_lambda_env_secrets(patterns=["CUSTOM_FLAG"])
+        assert result.details["flagged"][0]["flagged_vars"] == ["CUSTOM_FLAG"]
+
+    def test_max_functions_cutoff(self):
+        lambda_ = MagicMock()
+        lambda_.get_paginator.return_value = _make_paginator([
+            {"Functions": [
+                {"FunctionName": f"fn-{i}", "Environment": {"Variables": {}}} for i in range(5)
+            ]}
+        ])
+        services = make_services()
+        services.lambda_ = lambda_
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_lambda_env_secrets(max_functions=2)
+        assert result.details["statistics"]["functions_scanned"] == 2
+
+    def test_api_error_records_failure(self):
+        lambda_ = MagicMock()
+        lambda_.get_paginator.return_value.paginate.side_effect = make_client_error()
+        services = make_services()
+        services.lambda_ = lambda_
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_lambda_env_secrets()
+        assert result.success is False
+        assert result.errors
+
+
+class TestListOpenSecurityGroups:
+    def test_open_ipv4_cidr_flagged(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator([
+            {"SecurityGroups": [{
+                "GroupId": "sg-1",
+                "GroupName": "open-sg",
+                "VpcId": "vpc-1",
+                "Description": "test",
+                "IpPermissions": [{
+                    "IpProtocol": "tcp",
+                    "FromPort": 22,
+                    "ToPort": 22,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                    "Ipv6Ranges": [],
+                }],
+            }]}
+        ])
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_open_security_groups()
+        assert result.success is True
+        assert result.details["open_groups"][0]["group_id"] == "sg-1"
+        assert result.details["open_groups"][0]["open_rules"][0]["open_cidrs"] == ["0.0.0.0/0"]
+
+    def test_open_ipv6_cidr_flagged(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator([
+            {"SecurityGroups": [{
+                "GroupId": "sg-2",
+                "GroupName": "open-sg-v6",
+                "IpPermissions": [{
+                    "IpProtocol": "tcp",
+                    "FromPort": 443,
+                    "ToPort": 443,
+                    "IpRanges": [],
+                    "Ipv6Ranges": [{"CidrIpv6": "::/0"}],
+                }],
+            }]}
+        ])
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_open_security_groups()
+        assert result.details["open_groups"][0]["open_rules"][0]["open_cidrs"] == ["::/0"]
+
+    def test_non_public_cidr_not_flagged(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator([
+            {"SecurityGroups": [{
+                "GroupId": "sg-3",
+                "GroupName": "closed-sg",
+                "IpPermissions": [{
+                    "IpProtocol": "tcp",
+                    "FromPort": 22,
+                    "ToPort": 22,
+                    "IpRanges": [{"CidrIp": "10.0.0.0/8"}],
+                    "Ipv6Ranges": [],
+                }],
+            }]}
+        ])
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_open_security_groups()
+        assert result.details["open_groups"] == []
+
+    def test_ports_filter_excludes_non_matching_rules(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator([
+            {"SecurityGroups": [{
+                "GroupId": "sg-4",
+                "GroupName": "sg",
+                "IpPermissions": [{
+                    "IpProtocol": "tcp",
+                    "FromPort": 8080,
+                    "ToPort": 8080,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                    "Ipv6Ranges": [],
+                }],
+            }]}
+        ])
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_open_security_groups(ports=[22])
+        assert result.details["open_groups"] == []
+
+    def test_ports_filter_includes_matching_rule(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator([
+            {"SecurityGroups": [{
+                "GroupId": "sg-5",
+                "GroupName": "sg",
+                "IpPermissions": [{
+                    "IpProtocol": "tcp",
+                    "FromPort": 22,
+                    "ToPort": 22,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                    "Ipv6Ranges": [],
+                }],
+            }]}
+        ])
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_open_security_groups(ports=[22])
+        assert result.details["open_groups"] != []
+
+    def test_max_groups_cutoff(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator([
+            {"SecurityGroups": [
+                {"GroupId": f"sg-{i}", "GroupName": "sg", "IpPermissions": [{
+                    "IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}], "Ipv6Ranges": [],
+                }]} for i in range(5)
+            ]}
+        ])
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_open_security_groups(max_groups=2)
+        assert result.details["statistics"]["groups_scanned"] == 2
+
+    def test_api_error_records_failure(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value.paginate.side_effect = make_client_error()
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRHunt(services, DredgeConfig()).list_open_security_groups()
+        assert result.success is False
+        assert result.errors
