@@ -1,3 +1,4 @@
+import json
 import os
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
@@ -197,6 +198,30 @@ class TestDisableUser:
         assert result.success is False
         assert any("login profile" in e for e in result.errors)
 
+    def test_captures_inline_policy_documents_for_restore(self):
+        iam = _make_iam(inline_policies=["inline1"])
+        iam.get_user_policy.return_value = {"PolicyDocument": {"Version": "2012-10-17", "Statement": []}}
+        services = make_services()
+        services.iam = iam
+
+        result = AwsIRResponse(services, DredgeConfig()).disable_user("alice")
+
+        assert result.success is True
+        assert result.details["inline_policies"] == {"inline1": {"Version": "2012-10-17", "Statement": []}}
+        iam.get_user_policy.assert_called_once_with(UserName="alice", PolicyName="inline1")
+
+    def test_inline_policy_capture_error_is_non_fatal(self):
+        iam = _make_iam(inline_policies=["inline1"])
+        iam.get_user_policy.side_effect = make_client_error()
+        services = make_services()
+        services.iam = iam
+
+        result = AwsIRResponse(services, DredgeConfig()).disable_user("alice")
+
+        assert result.success is True
+        assert "inline_policies" not in result.details
+        iam.delete_user_policy.assert_called_once_with(UserName="alice", PolicyName="inline1")
+
 
 class TestDeleteUser:
     def test_calls_disable_then_deletes(self):
@@ -284,6 +309,39 @@ class TestDisableRole:
         result = AwsIRResponse(services, DredgeConfig()).disable_role("my-role")
         assert result.success is False
         assert any("Fatal error" in e for e in result.errors)
+
+    def test_captures_inline_policy_documents_for_restore(self):
+        iam = _make_iam(role_inline_policies=["inline1"])
+        iam.get_role_policy.return_value = {"PolicyDocument": {"Version": "2012-10-17", "Statement": []}}
+        services = make_services()
+        services.iam = iam
+
+        result = AwsIRResponse(services, DredgeConfig()).disable_role("my-role")
+
+        assert result.success is True
+        assert result.details["inline_policies"] == {"inline1": {"Version": "2012-10-17", "Statement": []}}
+        iam.get_role_policy.assert_called_once_with(RoleName="my-role", PolicyName="inline1")
+
+    def test_inline_policy_capture_error_is_non_fatal(self):
+        iam = _make_iam(role_inline_policies=["inline1"])
+        iam.get_role_policy.side_effect = make_client_error()
+        services = make_services()
+        services.iam = iam
+
+        result = AwsIRResponse(services, DredgeConfig()).disable_role("my-role")
+
+        assert result.success is True
+        assert "inline_policies" not in result.details
+        iam.delete_role_policy.assert_called_once_with(RoleName="my-role", PolicyName="inline1")
+
+    def test_does_not_capture_trust_policy(self):
+        iam = _make_iam()
+        services = make_services()
+        services.iam = iam
+
+        result = AwsIRResponse(services, DredgeConfig()).disable_role("my-role")
+        assert "rollback_state" not in result.details
+        iam.get_role.assert_not_called()
 
 
 class TestBlockS3PublicAccess:
@@ -529,6 +587,47 @@ class TestIsolateEc2Instances:
         # Should not propagate the revoke error
         result = AwsIRResponse(services, DredgeConfig()).isolate_ec2_instances(["i-001"], vpc_id="vpc-x")
         assert result.details["isolation_security_group_id"] == "sg-new"
+
+    def test_rollback_state_captures_original_security_groups(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.return_value = _make_paginator(
+            [
+                {
+                    "Reservations": [
+                        {
+                            "Instances": [
+                                {
+                                    "InstanceId": "i-001",
+                                    "SecurityGroups": [{"GroupId": "sg-orig-1"}, {"GroupId": "sg-orig-2"}],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        )
+        ec2.describe_security_groups.return_value = {"SecurityGroups": [{"GroupId": "sg-iso"}]}
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRResponse(services, DredgeConfig()).isolate_ec2_instances(["i-001"], vpc_id="vpc-x")
+
+        assert result.success is True
+        assert result.details["rollback_state"] == {"instance_security_groups": {"i-001": ["sg-orig-1", "sg-orig-2"]}}
+        ec2.get_paginator.assert_any_call("describe_instances")
+
+    def test_rollback_capture_failure_is_non_fatal(self):
+        ec2 = MagicMock()
+        ec2.get_paginator.side_effect = make_client_error(code="AccessDenied")
+        ec2.describe_security_groups.return_value = {"SecurityGroups": [{"GroupId": "sg-iso"}]}
+        services = make_services()
+        services.ec2 = ec2
+
+        result = AwsIRResponse(services, DredgeConfig()).isolate_ec2_instances(["i-001"], vpc_id="vpc-x")
+
+        assert result.success is True
+        assert "rollback_state" not in result.details
+        ec2.modify_instance_attribute.assert_called_once()
 
 
 class TestDeleteMfaDevices:
@@ -1356,6 +1455,47 @@ class TestQuarantineS3Bucket:
         resources = policy_doc["Statement"][0]["Resource"]
         assert any("sensitive-bucket" in r for r in resources)
 
+    def test_rollback_state_captures_prior_pab_and_policy(self):
+        services = make_services()
+        services.s3.get_public_access_block.return_value = {
+            "PublicAccessBlockConfiguration": {"BlockPublicAcls": False}
+        }
+        services.s3.get_bucket_policy.return_value = {"Policy": '{"Version":"2012-10-17","Statement":[]}'}
+        result = AwsIRResponse(services, DredgeConfig()).quarantine_s3_bucket(
+            "my-bucket", account_id="123456789012"
+        )
+        assert result.success is True
+        rollback_state = result.details["rollback_state"]
+        assert rollback_state["public_access_block_configuration"] == {"BlockPublicAcls": False}
+        assert rollback_state["bucket_policy"] == '{"Version":"2012-10-17","Statement":[]}'
+
+    def test_rollback_state_none_when_nothing_existed_before(self):
+        services = make_services()
+        services.s3.get_public_access_block.side_effect = make_client_error(
+            code="NoSuchPublicAccessBlockConfiguration"
+        )
+        services.s3.get_bucket_policy.side_effect = make_client_error(code="NoSuchBucketPolicy")
+        result = AwsIRResponse(services, DredgeConfig()).quarantine_s3_bucket(
+            "my-bucket", account_id="123456789012"
+        )
+        assert result.success is True
+        assert result.details["rollback_state"] == {
+            "public_access_block_configuration": None,
+            "bucket_policy": None,
+        }
+
+    def test_rollback_capture_failure_is_non_fatal(self):
+        services = make_services()
+        services.s3.get_public_access_block.side_effect = make_client_error(code="AccessDenied")
+        services.s3.get_bucket_policy.side_effect = make_client_error(code="AccessDenied")
+        result = AwsIRResponse(services, DredgeConfig()).quarantine_s3_bucket(
+            "my-bucket", account_id="123456789012"
+        )
+        assert result.success is True
+        assert "rollback_state" not in result.details
+        services.s3.put_public_access_block.assert_called_once()
+        services.s3.put_bucket_policy.assert_called_once()
+
 
 # =====================================================================
 # Coverage completion pass: functions with no test class before this
@@ -1827,3 +1967,196 @@ class TestRestoreSecretsManagerSecret:
         services.secretsmanager.restore_secret.side_effect = make_client_error()
         result = AwsIRResponse(services, DredgeConfig()).restore_secrets_manager_secret("my-secret")
         assert result.success is False
+
+
+class TestRestoreUser:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_user(
+            "alice", access_keys_disabled=["K1"]
+        )
+        assert result.details.get("dry_run") is True
+        services.iam.update_access_key.assert_not_called()
+
+    def test_happy_path_restores_everything(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_user(
+            "alice",
+            access_keys_disabled=["K1"],
+            groups_removed=["admins"],
+            managed_policies_detached=["arn:aws:iam::policy/P1"],
+            inline_policies={"inline1": {"Version": "2012-10-17", "Statement": []}},
+        )
+        assert result.success is True
+        services.iam.update_access_key.assert_called_once_with(UserName="alice", AccessKeyId="K1", Status="Active")
+        services.iam.add_user_to_group.assert_called_once_with(GroupName="admins", UserName="alice")
+        services.iam.attach_user_policy.assert_called_once_with(UserName="alice", PolicyArn="arn:aws:iam::policy/P1")
+        put_kwargs = services.iam.put_user_policy.call_args[1]
+        assert put_kwargs["UserName"] == "alice"
+        assert put_kwargs["PolicyName"] == "inline1"
+        assert json.loads(put_kwargs["PolicyDocument"]) == {"Version": "2012-10-17", "Statement": []}
+
+    def test_no_arguments_is_a_success_noop(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_user("alice")
+        assert result.success is True
+        services.iam.update_access_key.assert_not_called()
+        services.iam.add_user_to_group.assert_not_called()
+        services.iam.attach_user_policy.assert_not_called()
+        services.iam.put_user_policy.assert_not_called()
+
+    def test_key_enable_error_recorded(self):
+        services = make_services()
+        services.iam.update_access_key.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_user("alice", access_keys_disabled=["K1"])
+        assert result.success is False
+        assert any("K1" in e for e in result.errors)
+
+    def test_group_add_error_recorded(self):
+        services = make_services()
+        services.iam.add_user_to_group.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_user("alice", groups_removed=["admins"])
+        assert result.success is False
+
+    def test_policy_reattach_error_recorded(self):
+        services = make_services()
+        services.iam.attach_user_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_user(
+            "alice", managed_policies_detached=["arn:p"]
+        )
+        assert result.success is False
+
+    def test_inline_policy_restore_error_recorded(self):
+        services = make_services()
+        services.iam.put_user_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_user(
+            "alice", inline_policies={"inline1": {"Statement": []}}
+        )
+        assert result.success is False
+
+
+class TestRestoreRole:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_role(
+            "my-role", managed_policies_detached=["arn:p"]
+        )
+        assert result.details.get("dry_run") is True
+        services.iam.attach_role_policy.assert_not_called()
+
+    def test_happy_path_restores_policies(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_role(
+            "my-role",
+            managed_policies_detached=["arn:aws:iam::policy/P1"],
+            inline_policies={"inline1": {"Version": "2012-10-17", "Statement": []}},
+        )
+        assert result.success is True
+        services.iam.attach_role_policy.assert_called_once_with(
+            RoleName="my-role", PolicyArn="arn:aws:iam::policy/P1"
+        )
+        put_kwargs = services.iam.put_role_policy.call_args[1]
+        assert put_kwargs["RoleName"] == "my-role"
+        assert put_kwargs["PolicyName"] == "inline1"
+        assert json.loads(put_kwargs["PolicyDocument"]) == {"Version": "2012-10-17", "Statement": []}
+
+    def test_does_not_touch_trust_policy(self):
+        services = make_services()
+        AwsIRResponse(services, DredgeConfig()).restore_role("my-role")
+        services.iam.update_assume_role_policy.assert_not_called()
+
+    def test_policy_reattach_error_recorded(self):
+        services = make_services()
+        services.iam.attach_role_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_role(
+            "my-role", managed_policies_detached=["arn:p"]
+        )
+        assert result.success is False
+
+    def test_inline_policy_restore_error_recorded(self):
+        services = make_services()
+        services.iam.put_role_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_role(
+            "my-role", inline_policies={"inline1": {"Statement": []}}
+        )
+        assert result.success is False
+
+
+class TestRestoreS3BucketQuarantine:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_s3_bucket_quarantine(
+            "my-bucket", public_access_block_configuration={"BlockPublicAcls": True}, bucket_policy="{}"
+        )
+        assert result.details.get("dry_run") is True
+        services.s3.put_public_access_block.assert_not_called()
+
+    def test_restores_prior_pab_and_policy(self):
+        services = make_services()
+        config = {"BlockPublicAcls": False}
+        policy = '{"Version":"2012-10-17","Statement":[]}'
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_bucket_quarantine(
+            "my-bucket", public_access_block_configuration=config, bucket_policy=policy
+        )
+        assert result.success is True
+        services.s3.put_public_access_block.assert_called_once_with(
+            Bucket="my-bucket", PublicAccessBlockConfiguration=config
+        )
+        services.s3.put_bucket_policy.assert_called_once_with(Bucket="my-bucket", Policy=policy)
+
+    def test_deletes_pab_and_policy_when_none_existed_before(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_bucket_quarantine(
+            "my-bucket", public_access_block_configuration=None, bucket_policy=None
+        )
+        assert result.success is True
+        services.s3.delete_public_access_block.assert_called_once_with(Bucket="my-bucket")
+        services.s3.delete_bucket_policy.assert_called_once_with(Bucket="my-bucket")
+
+    def test_pab_error_does_not_block_policy_restore(self):
+        services = make_services()
+        services.s3.put_public_access_block.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_bucket_quarantine(
+            "my-bucket", public_access_block_configuration={"BlockPublicAcls": True}, bucket_policy="{}"
+        )
+        assert result.success is False
+        assert result.details["bucket_policy_restored"] is True
+
+    def test_policy_error_recorded(self):
+        services = make_services()
+        services.s3.put_bucket_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_s3_bucket_quarantine(
+            "my-bucket", public_access_block_configuration={"BlockPublicAcls": True}, bucket_policy="{}"
+        )
+        assert result.success is False
+        assert result.details["public_access_block_restored"] is True
+
+
+class TestRestoreEc2InstanceSecurityGroups:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_ec2_instance_security_groups(
+            {"i-001": ["sg-orig"]}
+        )
+        assert result.details.get("dry_run") is True
+        services.ec2.modify_instance_attribute.assert_not_called()
+
+    def test_restores_each_instance(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_ec2_instance_security_groups(
+            {"i-001": ["sg-orig-1", "sg-orig-2"], "i-002": ["sg-orig-3"]}
+        )
+        assert result.success is True
+        assert set(result.details["instances_restored"]) == {"i-001", "i-002"}
+        services.ec2.modify_instance_attribute.assert_any_call(InstanceId="i-001", Groups=["sg-orig-1", "sg-orig-2"])
+        services.ec2.modify_instance_attribute.assert_any_call(InstanceId="i-002", Groups=["sg-orig-3"])
+
+    def test_per_instance_error_does_not_block_others(self):
+        services = make_services()
+        services.ec2.modify_instance_attribute.side_effect = [make_client_error(), None]
+        result = AwsIRResponse(services, DredgeConfig()).restore_ec2_instance_security_groups(
+            {"i-001": ["sg-orig-1"], "i-002": ["sg-orig-2"]}
+        )
+        assert result.success is False
+        assert result.details["instances_restored"] == ["i-002"]
+        assert any("i-001" in e for e in result.errors)

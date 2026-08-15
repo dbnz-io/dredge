@@ -176,12 +176,26 @@ class AwsIRResponse:
 
             result.details["managed_policies_detached"] = attached_arns
 
-            # 5) Delete inline policies (paginated)
+            # 5) Delete inline policies (paginated). Capture each policy's
+            # document before deleting it -- best-effort, a capture failure
+            # never blocks the actual delete below -- so restore_user can
+            # put them back verbatim rather than this being a genuine,
+            # unrecoverable deletion like the account-level actions are.
             inline_names = [
                 name
                 for page in iam.get_paginator("list_user_policies").paginate(UserName=user_name)
                 for name in page.get("PolicyNames", [])
             ]
+            inline_policies: Dict[str, str] = {}
+            for policy_name in inline_names:
+                try:
+                    doc = iam.get_user_policy(UserName=user_name, PolicyName=policy_name)
+                    inline_policies[policy_name] = doc["PolicyDocument"]
+                except botocore.exceptions.ClientError as exc:
+                    _log.warning(event("aws_ir_response", "disable_user.inline_policy_capture_error", user=user_name, policy=policy_name, error=str(exc)))
+            if inline_policies:
+                result.details["inline_policies"] = inline_policies
+
             for policy_name in inline_names:
                 try:
                     iam.delete_user_policy(UserName=user_name, PolicyName=policy_name)
@@ -239,12 +253,25 @@ class AwsIRResponse:
                     _log.warning(event("aws_ir_response", "disable_role.policy_error", role=role_name, policy=arn, error=str(exc)))
             result.details["managed_policies_detached"] = attached_arns
 
-            # Delete inline policies (paginated)
+            # Delete inline policies (paginated). Capture each policy's
+            # document before deleting it -- best-effort, never blocks the
+            # actual delete below -- so restore_role can put them back
+            # verbatim.
             inline_names = [
                 name
                 for page in iam.get_paginator("list_role_policies").paginate(RoleName=role_name)
                 for name in page.get("PolicyNames", [])
             ]
+            inline_policies: Dict[str, str] = {}
+            for policy_name in inline_names:
+                try:
+                    doc = iam.get_role_policy(RoleName=role_name, PolicyName=policy_name)
+                    inline_policies[policy_name] = doc["PolicyDocument"]
+                except botocore.exceptions.ClientError as exc:
+                    _log.warning(event("aws_ir_response", "disable_role.inline_policy_capture_error", role=role_name, policy=policy_name, error=str(exc)))
+            if inline_policies:
+                result.details["inline_policies"] = inline_policies
+
             for policy_name in inline_names:
                 try:
                     iam.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
@@ -253,7 +280,12 @@ class AwsIRResponse:
                     _log.warning(event("aws_ir_response", "disable_role.inline_policy_error", role=role_name, policy=policy_name, error=str(exc)))
             result.details["inline_policies_deleted"] = inline_names
 
-            # Clear trust relationship
+            # Clear trust relationship. Deliberately not captured/restorable
+            # -- doing so needs iam:UpdateAssumeRolePolicy, an account-wide
+            # trust-policy-rewrite primitive OpencdrIrRole does not hold
+            # (see the IamRoles comment in serverless.yml). Accepted gap:
+            # this one piece of disable_role stays a manual fix if rolled
+            # back, everything else restore_role covers.
             iam.update_assume_role_policy(
                 RoleName=role_name,
                 PolicyDocument='{"Version":"2012-10-17","Statement":[]}',
@@ -363,6 +395,24 @@ class AwsIRResponse:
 
         _log.debug(event("aws_ir_response", "isolate_ec2_instances.start", target=result.target))
         ec2 = self._services.ec2
+
+        # Capture each instance's original security groups before mutating
+        # (best-effort -- never blocks the actual isolation below). This is
+        # the one piece describe_instances below (auto-detect path) already
+        # fetches for free; the explicit-vpc_id path needs its own batched
+        # call since it otherwise never describes the instances at all.
+        instance_security_groups: Dict[str, List[str]] = {}
+        try:
+            for page in ec2.get_paginator("describe_instances").paginate(InstanceIds=instance_ids):
+                for reservation in page.get("Reservations", []):
+                    for inst in reservation.get("Instances", []):
+                        instance_security_groups[inst["InstanceId"]] = [
+                            g["GroupId"] for g in inst.get("SecurityGroups", [])
+                        ]
+        except botocore.exceptions.ClientError as exc:
+            _log.warning(event("aws_ir_response", "isolate_ec2_instances.rollback_capture_error", target=result.target, error=str(exc)))
+        if instance_security_groups:
+            result.details["rollback_state"] = {"instance_security_groups": instance_security_groups}
 
         try:
             # Build VPC -> [instance_ids] map.
@@ -1553,6 +1603,33 @@ class AwsIRResponse:
 
         s3 = self._services.s3
 
+        # Capture prior state for rollback before mutating (best-effort --
+        # never blocks the actual quarantine below). Both PAB config and
+        # bucket policy are things this action overwrites without ever
+        # having read first; NoSuchPublicAccessBlockConfiguration/
+        # NoSuchBucketPolicy mean "nothing existed before", a real, valid
+        # prior state distinct from a capture failure (which leaves
+        # rollback_state absent entirely).
+        rollback_state: Dict = {}
+        try:
+            prior_pab = s3.get_public_access_block(Bucket=bucket_name)
+            rollback_state["public_access_block_configuration"] = prior_pab["PublicAccessBlockConfiguration"]
+        except botocore.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "NoSuchPublicAccessBlockConfiguration":
+                rollback_state["public_access_block_configuration"] = None
+            else:
+                _log.warning(event("aws_ir_response", "quarantine_s3_bucket.rollback_capture_error", bucket=bucket_name, error=str(exc)))
+        try:
+            prior_policy = s3.get_bucket_policy(Bucket=bucket_name)
+            rollback_state["bucket_policy"] = prior_policy["Policy"]
+        except botocore.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "NoSuchBucketPolicy":
+                rollback_state["bucket_policy"] = None
+            else:
+                _log.warning(event("aws_ir_response", "quarantine_s3_bucket.rollback_capture_error", bucket=bucket_name, error=str(exc)))
+        if rollback_state:
+            result.details["rollback_state"] = rollback_state
+
         try:
             s3.put_public_access_block(
                 Bucket=bucket_name,
@@ -2152,5 +2229,221 @@ class AwsIRResponse:
         except botocore.exceptions.ClientError as exc:
             result.add_error(str(exc))
             _log.warning(event("aws_ir_response", "restore_secrets_manager_secret.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def restore_user(
+        self,
+        user_name: str,
+        *,
+        access_keys_disabled: Optional[List[str]] = None,
+        groups_removed: Optional[List[str]] = None,
+        managed_policies_detached: Optional[List[str]] = None,
+        inline_policies: Optional[Dict[str, Dict]] = None,
+    ) -> OperationResult:
+        """
+        Undo for disable_user: re-enable access keys, re-add group
+        memberships, reattach managed policies, and restore inline policy
+        documents -- all captured by disable_user's own result.details.
+        The deleted login profile is NOT restored: AWS gives no way to
+        recover the original password, so recreating one would mean
+        setting a brand-new credential, not undoing the disable -- left as
+        a manual step if a login profile is genuinely needed back.
+        """
+        result = OperationResult(
+            operation="restore_user",
+            target=f"user={user_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_user.dry_run", target=result.target))
+            return result
+
+        iam = self._services.iam
+
+        for key_id in access_keys_disabled or []:
+            try:
+                iam.update_access_key(UserName=user_name, AccessKeyId=key_id, Status="Active")
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to re-enable key {key_id}: {exc}")
+                _log.warning(event("aws_ir_response", "restore_user.key_error", user=user_name, key=key_id, error=str(exc)))
+        result.details["access_keys_enabled"] = list(access_keys_disabled or [])
+
+        for group_name in groups_removed or []:
+            try:
+                iam.add_user_to_group(GroupName=group_name, UserName=user_name)
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to re-add to group {group_name}: {exc}")
+                _log.warning(event("aws_ir_response", "restore_user.group_error", user=user_name, group=group_name, error=str(exc)))
+        result.details["groups_restored"] = list(groups_removed or [])
+
+        for arn in managed_policies_detached or []:
+            try:
+                iam.attach_user_policy(UserName=user_name, PolicyArn=arn)
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to reattach policy {arn}: {exc}")
+                _log.warning(event("aws_ir_response", "restore_user.policy_error", user=user_name, policy=arn, error=str(exc)))
+        result.details["managed_policies_reattached"] = list(managed_policies_detached or [])
+
+        for policy_name, policy_document in (inline_policies or {}).items():
+            try:
+                iam.put_user_policy(
+                    UserName=user_name,
+                    PolicyName=policy_name,
+                    PolicyDocument=json.dumps(policy_document) if isinstance(policy_document, dict) else policy_document,
+                )
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to restore inline policy {policy_name}: {exc}")
+                _log.warning(event("aws_ir_response", "restore_user.inline_policy_error", user=user_name, policy=policy_name, error=str(exc)))
+        result.details["inline_policies_restored"] = list((inline_policies or {}).keys())
+
+        if result.success:
+            _log.info(event("aws_ir_response", "restore_user.success", target=result.target))
+
+        return result
+
+    def restore_role(
+        self,
+        role_name: str,
+        *,
+        managed_policies_detached: Optional[List[str]] = None,
+        inline_policies: Optional[Dict[str, Dict]] = None,
+    ) -> OperationResult:
+        """
+        Undo for disable_role: reattach managed policies and restore
+        inline policy documents, both captured by disable_role's own
+        result.details. Does NOT restore the trust policy -- disable_role
+        never captures it (see disable_role's own comment on why): that
+        piece stays a manual fix if a role is rolled back.
+        """
+        result = OperationResult(
+            operation="restore_role",
+            target=f"role={role_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_role.dry_run", target=result.target))
+            return result
+
+        iam = self._services.iam
+
+        for arn in managed_policies_detached or []:
+            try:
+                iam.attach_role_policy(RoleName=role_name, PolicyArn=arn)
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to reattach policy {arn}: {exc}")
+                _log.warning(event("aws_ir_response", "restore_role.policy_error", role=role_name, policy=arn, error=str(exc)))
+        result.details["managed_policies_reattached"] = list(managed_policies_detached or [])
+
+        for policy_name, policy_document in (inline_policies or {}).items():
+            try:
+                iam.put_role_policy(
+                    RoleName=role_name,
+                    PolicyName=policy_name,
+                    PolicyDocument=json.dumps(policy_document) if isinstance(policy_document, dict) else policy_document,
+                )
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to restore inline policy {policy_name}: {exc}")
+                _log.warning(event("aws_ir_response", "restore_role.inline_policy_error", role=role_name, policy=policy_name, error=str(exc)))
+        result.details["inline_policies_restored"] = list((inline_policies or {}).keys())
+
+        if result.success:
+            _log.info(event("aws_ir_response", "restore_role.success", target=result.target))
+
+        return result
+
+    def restore_s3_bucket_quarantine(
+        self,
+        bucket_name: str,
+        *,
+        public_access_block_configuration: Optional[Dict] = None,
+        bucket_policy: Optional[str] = None,
+    ) -> OperationResult:
+        """
+        Undo for quarantine_s3_bucket. Both arguments come from that
+        action's own rollback_state -- None for either means nothing
+        existed before, so restoring means deleting the override, not
+        putting back an empty one.
+        """
+        result = OperationResult(
+            operation="restore_s3_bucket_quarantine",
+            target=f"bucket={bucket_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_s3_bucket_quarantine.dry_run", target=result.target))
+            return result
+
+        s3 = self._services.s3
+
+        try:
+            if public_access_block_configuration is None:
+                s3.delete_public_access_block(Bucket=bucket_name)
+            else:
+                s3.put_public_access_block(
+                    Bucket=bucket_name,
+                    PublicAccessBlockConfiguration=public_access_block_configuration,
+                )
+            result.details["public_access_block_restored"] = True
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(f"Failed to restore bucket PublicAccessBlock: {exc}")
+            _log.warning(event("aws_ir_response", "restore_s3_bucket_quarantine.access_block_error", bucket=bucket_name, error=str(exc)))
+
+        try:
+            if bucket_policy is None:
+                s3.delete_bucket_policy(Bucket=bucket_name)
+            else:
+                s3.put_bucket_policy(Bucket=bucket_name, Policy=bucket_policy)
+            result.details["bucket_policy_restored"] = True
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(f"Failed to restore bucket policy: {exc}")
+            _log.warning(event("aws_ir_response", "restore_s3_bucket_quarantine.policy_error", bucket=bucket_name, error=str(exc)))
+
+        if result.success:
+            _log.info(event("aws_ir_response", "restore_s3_bucket_quarantine.success", target=result.target))
+
+        return result
+
+    def restore_ec2_instance_security_groups(
+        self, instance_security_groups: Dict[str, List[str]]
+    ) -> OperationResult:
+        """
+        Undo for isolate_ec2_instances: reassign each instance's original
+        security groups, captured by isolate_ec2_instances' own
+        rollback_state before it replaced them with the isolation SG.
+        Does not delete the isolation SG itself -- an empty, unused SG
+        left behind is harmless, and other instances or an in-flight
+        isolation may still reference it.
+        """
+        result = OperationResult(
+            operation="restore_ec2_instance_security_groups",
+            target=",".join(instance_security_groups.keys()),
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_ec2_instance_security_groups.dry_run", target=result.target))
+            return result
+
+        ec2 = self._services.ec2
+        restored: List[str] = []
+
+        for instance_id, group_ids in instance_security_groups.items():
+            try:
+                ec2.modify_instance_attribute(InstanceId=instance_id, Groups=group_ids)
+                restored.append(instance_id)
+                _log.info(event("aws_ir_response", "restore_ec2_instance_security_groups.instance_restored", instance=instance_id))
+            except botocore.exceptions.ClientError as exc:
+                result.add_error(f"Failed to restore security groups for {instance_id}: {exc}")
+                _log.warning(event("aws_ir_response", "restore_ec2_instance_security_groups.instance_error", instance=instance_id, error=str(exc)))
+
+        result.details["instances_restored"] = restored
 
         return result
