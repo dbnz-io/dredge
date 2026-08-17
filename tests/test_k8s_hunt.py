@@ -172,6 +172,14 @@ class TestListRoleBindingsForSubject:
         assert result.success is False
 
 
+class TestSubjectsMatchHelper:
+    def test_none_subjects_returns_false(self):
+        assert K8sIRHunt._subjects_match(None, "User", "alice") is False
+
+    def test_empty_subjects_returns_false(self):
+        assert K8sIRHunt._subjects_match([], "User", "alice") is False
+
+
 class TestListPodsByServiceAccount:
     def test_happy_path(self):
         services = make_services()
@@ -250,3 +258,12 @@ class TestListPrivilegedPods:
         services.core_v1.list_pod_for_all_namespaces.side_effect = make_api_exception()
         result = K8sIRHunt(services, DredgeConfig()).list_privileged_pods()
         assert result.success is False
+
+    def test_stops_mid_page_at_max_pods(self):
+        services = make_services()
+        page = obj(items=[_pod_spec(), _pod_spec()], metadata=obj(_continue=None))
+        services.core_v1.list_pod_for_all_namespaces.return_value = page
+
+        result = K8sIRHunt(services, DredgeConfig()).list_privileged_pods(max_pods=1)
+
+        assert result.details["statistics"]["pods_scanned"] == 1

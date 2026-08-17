@@ -1266,6 +1266,73 @@ class AwsIRResponse:
         return result
 
     # --------------------
+    # RDS: Snapshot public access
+    # --------------------
+
+    def revoke_rds_snapshot_public_access(
+        self,
+        snapshot_id: str,
+        *,
+        snapshot_type: str = "instance",
+    ) -> OperationResult:
+        """
+        Remove "all" (public) from a DB/cluster snapshot's restore
+        permissions -- undoes ModifyDBSnapshotAttribute-style public
+        exposure without touching any other explicit account IDs already
+        granted restore access.
+
+        snapshot_type: "instance" (DescribeDBSnapshotAttributes /
+        ModifyDBSnapshotAttribute) or "cluster" (the DBCluster* equivalents).
+        """
+        if snapshot_type not in ("instance", "cluster"):
+            raise ValueError('snapshot_type must be "instance" or "cluster"')
+
+        result = OperationResult(
+            operation="revoke_rds_snapshot_public_access",
+            target=f"{snapshot_type}_snapshot={snapshot_id}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "revoke_rds_snapshot_public_access.dry_run", target=result.target))
+            return result
+
+        rds = self._services.rds
+        describe = rds.describe_db_snapshot_attributes if snapshot_type == "instance" else rds.describe_db_cluster_snapshot_attributes
+        modify = rds.modify_db_snapshot_attribute if snapshot_type == "instance" else rds.modify_db_cluster_snapshot_attribute
+        id_kwarg = "DBSnapshotIdentifier" if snapshot_type == "instance" else "DBClusterSnapshotIdentifier"
+        result_key = "DBSnapshotAttributesResult" if snapshot_type == "instance" else "DBClusterSnapshotAttributesResult"
+        attrs_key = "DBSnapshotAttributes" if snapshot_type == "instance" else "DBClusterSnapshotAttributes"
+
+        # Capture the exact prior restore-attribute value list before
+        # mutating (best-effort -- never blocks the revoke below), so a
+        # false-positive containment can be undone without also dropping
+        # any other explicit account IDs that were legitimately granted
+        # restore access alongside "all".
+        try:
+            prior = describe(**{id_kwarg: snapshot_id})
+            restore_attr = next(
+                (a for a in prior[result_key][attrs_key] if a["AttributeName"] == "restore"),
+                None,
+            )
+            result.details["rollback_state"] = {
+                "restore_values": restore_attr["AttributeValues"] if restore_attr else [],
+            }
+        except botocore.exceptions.ClientError as exc:
+            _log.warning(event("aws_ir_response", "revoke_rds_snapshot_public_access.rollback_capture_error", target=result.target, error=str(exc)))
+
+        try:
+            modify(**{id_kwarg: snapshot_id}, AttributeName="restore", ValuesToRemove=["all"])
+            result.details["public_access_revoked"] = True
+            _log.info(event("aws_ir_response", "revoke_rds_snapshot_public_access.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "revoke_rds_snapshot_public_access.error", target=result.target, error=str(exc)))
+
+        return result
+
+    # --------------------
     # ECS: Containment
     # --------------------
 
@@ -1775,6 +1842,66 @@ class AwsIRResponse:
         return result
 
     # --------------------
+    # IAM: Delete inline policy
+    # --------------------
+
+    def delete_inline_policy(
+        self,
+        *,
+        user_name: Optional[str] = None,
+        role_name: Optional[str] = None,
+        policy_name: str,
+    ) -> OperationResult:
+        """
+        Remove a single inline policy from a user or role -- surgical,
+        unlike put_deny_all_inline_policy's full-lockout approach. Useful
+        for a specific offending policy (e.g. an over-broad wildcard grant)
+        without touching the principal's other permissions.
+
+        Exactly one of user_name or role_name must be provided.
+        """
+        if not user_name and not role_name:
+            raise ValueError("Provide exactly one of user_name or role_name")
+        if user_name and role_name:
+            raise ValueError("Provide exactly one of user_name or role_name")
+
+        target = f"user={user_name}" if user_name else f"role={role_name}"
+        result = OperationResult(
+            operation="delete_inline_policy",
+            target=f"{target},policy={policy_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "delete_inline_policy.dry_run", target=result.target))
+            return result
+
+        iam = self._services.iam
+        get_policy = iam.get_user_policy if user_name else iam.get_role_policy
+        delete_policy = iam.delete_user_policy if user_name else iam.delete_role_policy
+        principal_kwarg = {"UserName": user_name} if user_name else {"RoleName": role_name}
+
+        # Capture the policy document for rollback before deleting
+        # (best-effort -- never blocks the delete below). botocore
+        # auto-decodes IAM's URL-encoded PolicyDocument into a plain dict.
+        try:
+            prior = get_policy(PolicyName=policy_name, **principal_kwarg)
+            result.details["rollback_state"] = {"policy_document": prior["PolicyDocument"]}
+        except botocore.exceptions.ClientError as exc:
+            _log.warning(event("aws_ir_response", "delete_inline_policy.rollback_capture_error", target=result.target, error=str(exc)))
+
+        try:
+            delete_policy(PolicyName=policy_name, **principal_kwarg)
+            result.details["policy_deleted"] = policy_name
+            _log.info(event("aws_ir_response", "delete_inline_policy.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "delete_inline_policy.error", target=result.target, error=str(exc)))
+
+        return result
+
+    # --------------------
     # IAM: Revoke active role sessions
     # --------------------
 
@@ -1919,6 +2046,128 @@ class AwsIRResponse:
         except botocore.exceptions.ClientError as exc:
             result.add_error(str(exc))
             _log.warning(event("aws_ir_response", "delete_ecr_image.error", target=result.target, error=str(exc)))
+
+        return result
+
+    # --------------------
+    # Security tooling: re-enable tampered controls
+    #
+    # These are themselves the fix, not a containment action with a
+    # separate undo -- there is no sensible "rollback" for "an attacker's
+    # visibility-blinding was reversed" that would mean disabling the
+    # control again, so none of the four are in ROLLBACK_UNDO_MODULE-style
+    # undo territory. Each API is naturally idempotent (calling it when
+    # already enabled/logging/recording is a no-op success), EXCEPT
+    # Security Hub, which raises ResourceConflictException instead --
+    # caught and treated the same as the other three's native idempotency.
+    # --------------------
+
+    def enable_cloudtrail_logging(self, trail_name: str) -> OperationResult:
+        """Re-enable logging on a CloudTrail trail (undoes StopLogging)."""
+        result = OperationResult(
+            operation="enable_cloudtrail_logging",
+            target=f"trail={trail_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "enable_cloudtrail_logging.dry_run", target=result.target))
+            return result
+
+        try:
+            self._services.cloudtrail.start_logging(Name=trail_name)
+            result.details["logging_enabled"] = True
+            _log.info(event("aws_ir_response", "enable_cloudtrail_logging.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "enable_cloudtrail_logging.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def enable_guardduty_detector(self, detector_id: str) -> OperationResult:
+        """Re-enable a GuardDuty detector (undoes UpdateDetector Enable=False)."""
+        result = OperationResult(
+            operation="enable_guardduty_detector",
+            target=f"detector={detector_id}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "enable_guardduty_detector.dry_run", target=result.target))
+            return result
+
+        try:
+            self._services.guardduty.update_detector(DetectorId=detector_id, Enable=True)
+            result.details["detector_enabled"] = True
+            _log.info(event("aws_ir_response", "enable_guardduty_detector.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "enable_guardduty_detector.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def start_config_recorder(self, recorder_name: str) -> OperationResult:
+        """
+        Re-start an AWS Config configuration recorder (undoes
+        StopConfigurationRecorder). Requires a delivery channel to already
+        exist -- if none does, this fails with NoAvailableDeliveryChannelException,
+        surfaced as a normal error rather than swallowed, since that's a
+        real prerequisite gap, not "already in the desired state".
+        """
+        result = OperationResult(
+            operation="start_config_recorder",
+            target=f"recorder={recorder_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "start_config_recorder.dry_run", target=result.target))
+            return result
+
+        try:
+            self._services.awsconfig.start_configuration_recorder(ConfigurationRecorderName=recorder_name)
+            result.details["recorder_started"] = True
+            _log.info(event("aws_ir_response", "start_config_recorder.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "start_config_recorder.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def enable_security_hub(self) -> OperationResult:
+        """
+        Re-enable Security Hub for this account/region (undoes
+        DisableSecurityHub). Unlike the other three re-enable actions,
+        AWS makes this one non-idempotent -- calling it while already
+        enabled raises ResourceConflictException, treated here as success
+        rather than an error, matching every other action's "already in
+        the desired end state" handling elsewhere in this file.
+        """
+        result = OperationResult(
+            operation="enable_security_hub",
+            target="securityhub",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "enable_security_hub.dry_run", target=result.target))
+            return result
+
+        try:
+            self._services.securityhub.enable_security_hub()
+            result.details["enabled"] = True
+            _log.info(event("aws_ir_response", "enable_security_hub.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ResourceConflictException":
+                result.details["already_enabled"] = True
+                _log.info(event("aws_ir_response", "enable_security_hub.already_enabled", target=result.target))
+            else:
+                result.add_error(str(exc))
+                _log.warning(event("aws_ir_response", "enable_security_hub.error", target=result.target, error=str(exc)))
 
         return result
 
@@ -2445,5 +2694,100 @@ class AwsIRResponse:
                 _log.warning(event("aws_ir_response", "restore_ec2_instance_security_groups.instance_error", instance=instance_id, error=str(exc)))
 
         result.details["instances_restored"] = restored
+
+        return result
+
+    def restore_rds_snapshot_public_access(
+        self,
+        snapshot_id: str,
+        *,
+        snapshot_type: str = "instance",
+        restore_values: List[str],
+    ) -> OperationResult:
+        """
+        Undo for revoke_rds_snapshot_public_access: re-add the exact
+        restore-attribute values (typically ["all"], but preserves
+        whatever the prior list actually was) captured by that action's
+        own rollback_state.
+        """
+        if snapshot_type not in ("instance", "cluster"):
+            raise ValueError('snapshot_type must be "instance" or "cluster"')
+
+        result = OperationResult(
+            operation="restore_rds_snapshot_public_access",
+            target=f"{snapshot_type}_snapshot={snapshot_id}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_rds_snapshot_public_access.dry_run", target=result.target))
+            return result
+
+        if not restore_values:
+            result.details["restore_values_restored"] = []
+            _log.info(event("aws_ir_response", "restore_rds_snapshot_public_access.nothing_to_restore", target=result.target))
+            return result
+
+        rds = self._services.rds
+        modify = rds.modify_db_snapshot_attribute if snapshot_type == "instance" else rds.modify_db_cluster_snapshot_attribute
+        id_kwarg = "DBSnapshotIdentifier" if snapshot_type == "instance" else "DBClusterSnapshotIdentifier"
+
+        try:
+            modify(**{id_kwarg: snapshot_id}, AttributeName="restore", ValuesToAdd=restore_values)
+            result.details["restore_values_restored"] = restore_values
+            _log.info(event("aws_ir_response", "restore_rds_snapshot_public_access.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "restore_rds_snapshot_public_access.error", target=result.target, error=str(exc)))
+
+        return result
+
+    def restore_inline_policy(
+        self,
+        *,
+        user_name: Optional[str] = None,
+        role_name: Optional[str] = None,
+        policy_name: str,
+        policy_document: Dict,
+    ) -> OperationResult:
+        """
+        Undo for delete_inline_policy: re-apply the policy document
+        captured by that action's own rollback_state.
+
+        Exactly one of user_name or role_name must be provided.
+        """
+        if not user_name and not role_name:
+            raise ValueError("Provide exactly one of user_name or role_name")
+        if user_name and role_name:
+            raise ValueError("Provide exactly one of user_name or role_name")
+
+        target = f"user={user_name}" if user_name else f"role={role_name}"
+        result = OperationResult(
+            operation="restore_inline_policy",
+            target=f"{target},policy={policy_name}",
+            success=True,
+        )
+
+        if self._config.dry_run:
+            result.details["dry_run"] = True
+            _log.info(event("aws_ir_response", "restore_inline_policy.dry_run", target=result.target))
+            return result
+
+        iam = self._services.iam
+        put_policy = iam.put_user_policy if user_name else iam.put_role_policy
+        principal_kwarg = {"UserName": user_name} if user_name else {"RoleName": role_name}
+
+        try:
+            put_policy(
+                PolicyName=policy_name,
+                PolicyDocument=json.dumps(policy_document) if isinstance(policy_document, dict) else policy_document,
+                **principal_kwarg,
+            )
+            result.details["policy_restored"] = policy_name
+            _log.info(event("aws_ir_response", "restore_inline_policy.success", target=result.target))
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(str(exc))
+            _log.warning(event("aws_ir_response", "restore_inline_policy.error", target=result.target, error=str(exc)))
 
         return result

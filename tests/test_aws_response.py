@@ -1154,6 +1154,77 @@ class TestIsolateRdsInstance:
         assert result.success is False
 
 
+class TestRevokeRdsSnapshotPublicAccess:
+    def test_dry_run(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).revoke_rds_snapshot_public_access("snap-1")
+        assert result.details.get("dry_run") is True
+        services.rds.modify_db_snapshot_attribute.assert_not_called()
+
+    def test_invalid_snapshot_type_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError, match="snapshot_type"):
+            AwsIRResponse(services, DredgeConfig()).revoke_rds_snapshot_public_access("snap-1", snapshot_type="bogus")
+        services.rds.modify_db_snapshot_attribute.assert_not_called()
+
+    def test_instance_snapshot_happy_path_captures_rollback_state(self):
+        services = make_services()
+        services.rds.describe_db_snapshot_attributes.return_value = {
+            "DBSnapshotAttributesResult": {
+                "DBSnapshotAttributes": [{"AttributeName": "restore", "AttributeValues": ["all", "999999999999"]}]
+            }
+        }
+        result = AwsIRResponse(services, DredgeConfig()).revoke_rds_snapshot_public_access("snap-1")
+        assert result.success is True
+        assert result.details["public_access_revoked"] is True
+        assert result.details["rollback_state"]["restore_values"] == ["all", "999999999999"]
+        services.rds.modify_db_snapshot_attribute.assert_called_once_with(
+            DBSnapshotIdentifier="snap-1", AttributeName="restore", ValuesToRemove=["all"]
+        )
+        services.rds.modify_db_cluster_snapshot_attribute.assert_not_called()
+
+    def test_cluster_snapshot_uses_cluster_apis(self):
+        services = make_services()
+        services.rds.describe_db_cluster_snapshot_attributes.return_value = {
+            "DBClusterSnapshotAttributesResult": {
+                "DBClusterSnapshotAttributes": [{"AttributeName": "restore", "AttributeValues": ["all"]}]
+            }
+        }
+        result = AwsIRResponse(services, DredgeConfig()).revoke_rds_snapshot_public_access(
+            "csnap-1", snapshot_type="cluster"
+        )
+        assert result.success is True
+        services.rds.modify_db_cluster_snapshot_attribute.assert_called_once_with(
+            DBClusterSnapshotIdentifier="csnap-1", AttributeName="restore", ValuesToRemove=["all"]
+        )
+        services.rds.modify_db_snapshot_attribute.assert_not_called()
+
+    def test_no_restore_attribute_captures_empty_list(self):
+        services = make_services()
+        services.rds.describe_db_snapshot_attributes.return_value = {
+            "DBSnapshotAttributesResult": {"DBSnapshotAttributes": []}
+        }
+        result = AwsIRResponse(services, DredgeConfig()).revoke_rds_snapshot_public_access("snap-1")
+        assert result.details["rollback_state"]["restore_values"] == []
+
+    def test_capture_failure_does_not_block_revoke(self):
+        services = make_services()
+        services.rds.describe_db_snapshot_attributes.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).revoke_rds_snapshot_public_access("snap-1")
+        assert result.success is True
+        assert "rollback_state" not in result.details
+        services.rds.modify_db_snapshot_attribute.assert_called_once()
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.rds.describe_db_snapshot_attributes.return_value = {
+            "DBSnapshotAttributesResult": {"DBSnapshotAttributes": []}
+        }
+        services.rds.modify_db_snapshot_attribute.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).revoke_rds_snapshot_public_access("snap-1")
+        assert result.success is False
+
+
 class TestStopEcsService:
     def test_dry_run(self):
         services = make_services()
@@ -1578,6 +1649,63 @@ class TestPutDenyAllInlinePolicy:
         assert result.success is False
 
 
+class TestDeleteInlinePolicy:
+    def test_no_principal_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError):
+            AwsIRResponse(services, DredgeConfig()).delete_inline_policy(policy_name="p")
+
+    def test_both_principals_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError):
+            AwsIRResponse(services, DredgeConfig()).delete_inline_policy(user_name="u", role_name="r", policy_name="p")
+
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).delete_inline_policy(
+            user_name="alice", policy_name="WildcardPolicy"
+        )
+        assert result.details.get("dry_run") is True
+        services.iam.get_user_policy.assert_not_called()
+        services.iam.delete_user_policy.assert_not_called()
+
+    def test_happy_path_user_captures_rollback_state(self):
+        services = make_services()
+        services.iam.get_user_policy.return_value = {
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}
+        }
+        result = AwsIRResponse(services, DredgeConfig()).delete_inline_policy(user_name="alice", policy_name="WildcardPolicy")
+        assert result.success is True
+        assert result.details["policy_deleted"] == "WildcardPolicy"
+        assert result.details["rollback_state"]["policy_document"]["Statement"][0]["Action"] == "*"
+        services.iam.get_user_policy.assert_called_once_with(PolicyName="WildcardPolicy", UserName="alice")
+        services.iam.delete_user_policy.assert_called_once_with(PolicyName="WildcardPolicy", UserName="alice")
+        services.iam.delete_role_policy.assert_not_called()
+
+    def test_happy_path_role(self):
+        services = make_services()
+        services.iam.get_role_policy.return_value = {"PolicyDocument": {}}
+        result = AwsIRResponse(services, DredgeConfig()).delete_inline_policy(role_name="my-role", policy_name="p")
+        assert result.success is True
+        services.iam.delete_role_policy.assert_called_once_with(PolicyName="p", RoleName="my-role")
+        services.iam.delete_user_policy.assert_not_called()
+
+    def test_capture_failure_does_not_block_delete(self):
+        services = make_services()
+        services.iam.get_user_policy.side_effect = make_client_error(code="NoSuchEntity")
+        result = AwsIRResponse(services, DredgeConfig()).delete_inline_policy(user_name="alice", policy_name="p")
+        assert result.success is True
+        assert "rollback_state" not in result.details
+        services.iam.delete_user_policy.assert_called_once()
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.iam.get_user_policy.return_value = {"PolicyDocument": {}}
+        services.iam.delete_user_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).delete_inline_policy(user_name="alice", policy_name="p")
+        assert result.success is False
+
+
 class TestRevokeIamRoleSessions:
     def test_dry_run_skips_api(self):
         services = make_services()
@@ -1676,6 +1804,100 @@ class TestDeleteEcrImage:
         services.ecr.batch_delete_image.side_effect = make_client_error()
         result = AwsIRResponse(services, DredgeConfig()).delete_ecr_image("my-repo", "sha256:abc")
         assert result.success is False
+
+
+class TestEnableCloudtrailLogging:
+    def test_dry_run(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).enable_cloudtrail_logging("my-trail")
+        assert result.details.get("dry_run") is True
+        services.cloudtrail.start_logging.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).enable_cloudtrail_logging("my-trail")
+        assert result.success is True
+        assert result.details["logging_enabled"] is True
+        services.cloudtrail.start_logging.assert_called_once_with(Name="my-trail")
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.cloudtrail.start_logging.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).enable_cloudtrail_logging("my-trail")
+        assert result.success is False
+
+
+class TestEnableGuarddutyDetector:
+    def test_dry_run(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).enable_guardduty_detector("det-1")
+        assert result.details.get("dry_run") is True
+        services.guardduty.update_detector.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).enable_guardduty_detector("det-1")
+        assert result.success is True
+        assert result.details["detector_enabled"] is True
+        services.guardduty.update_detector.assert_called_once_with(DetectorId="det-1", Enable=True)
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.guardduty.update_detector.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).enable_guardduty_detector("det-1")
+        assert result.success is False
+
+
+class TestStartConfigRecorder:
+    def test_dry_run(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).start_config_recorder("default")
+        assert result.details.get("dry_run") is True
+        services.awsconfig.start_configuration_recorder.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).start_config_recorder("default")
+        assert result.success is True
+        assert result.details["recorder_started"] is True
+        services.awsconfig.start_configuration_recorder.assert_called_once_with(ConfigurationRecorderName="default")
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.awsconfig.start_configuration_recorder.side_effect = make_client_error(
+            code="NoAvailableDeliveryChannelException"
+        )
+        result = AwsIRResponse(services, DredgeConfig()).start_config_recorder("default")
+        assert result.success is False
+
+
+class TestEnableSecurityHub:
+    def test_dry_run(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).enable_security_hub()
+        assert result.details.get("dry_run") is True
+        services.securityhub.enable_security_hub.assert_not_called()
+
+    def test_happy_path(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).enable_security_hub()
+        assert result.success is True
+        assert result.details["enabled"] is True
+
+    def test_already_enabled_is_treated_as_success(self):
+        services = make_services()
+        services.securityhub.enable_security_hub.side_effect = make_client_error(code="ResourceConflictException")
+        result = AwsIRResponse(services, DredgeConfig()).enable_security_hub()
+        assert result.success is True
+        assert result.details["already_enabled"] is True
+        assert not result.errors
+
+    def test_other_api_error_records_failure(self):
+        services = make_services()
+        services.securityhub.enable_security_hub.side_effect = make_client_error(code="AccessDenied")
+        result = AwsIRResponse(services, DredgeConfig()).enable_security_hub()
+        assert result.success is False
+        assert "already_enabled" not in result.details
 
 
 class TestAuthorizeSecurityGroupRules:
@@ -2160,3 +2382,113 @@ class TestRestoreEc2InstanceSecurityGroups:
         assert result.success is False
         assert result.details["instances_restored"] == ["i-002"]
         assert any("i-001" in e for e in result.errors)
+
+
+class TestRestoreRdsSnapshotPublicAccess:
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_rds_snapshot_public_access(
+            "snap-1", restore_values=["all"]
+        )
+        assert result.details.get("dry_run") is True
+        services.rds.modify_db_snapshot_attribute.assert_not_called()
+
+    def test_invalid_snapshot_type_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError, match="snapshot_type"):
+            AwsIRResponse(services, DredgeConfig()).restore_rds_snapshot_public_access(
+                "snap-1", snapshot_type="bogus", restore_values=["all"]
+            )
+
+    def test_instance_happy_path(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_rds_snapshot_public_access(
+            "snap-1", restore_values=["all", "999999999999"]
+        )
+        assert result.success is True
+        assert result.details["restore_values_restored"] == ["all", "999999999999"]
+        services.rds.modify_db_snapshot_attribute.assert_called_once_with(
+            DBSnapshotIdentifier="snap-1", AttributeName="restore", ValuesToAdd=["all", "999999999999"]
+        )
+
+    def test_cluster_uses_cluster_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_rds_snapshot_public_access(
+            "csnap-1", snapshot_type="cluster", restore_values=["all"]
+        )
+        assert result.success is True
+        services.rds.modify_db_cluster_snapshot_attribute.assert_called_once_with(
+            DBClusterSnapshotIdentifier="csnap-1", AttributeName="restore", ValuesToAdd=["all"]
+        )
+        services.rds.modify_db_snapshot_attribute.assert_not_called()
+
+    def test_empty_restore_values_is_a_noop(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_rds_snapshot_public_access(
+            "snap-1", restore_values=[]
+        )
+        assert result.success is True
+        assert result.details["restore_values_restored"] == []
+        services.rds.modify_db_snapshot_attribute.assert_not_called()
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.rds.modify_db_snapshot_attribute.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_rds_snapshot_public_access(
+            "snap-1", restore_values=["all"]
+        )
+        assert result.success is False
+
+
+class TestRestoreInlinePolicy:
+    def test_no_principal_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError):
+            AwsIRResponse(services, DredgeConfig()).restore_inline_policy(policy_name="p", policy_document={})
+
+    def test_both_principals_raises(self):
+        services = make_services()
+        with pytest.raises(ValueError):
+            AwsIRResponse(services, DredgeConfig()).restore_inline_policy(
+                user_name="u", role_name="r", policy_name="p", policy_document={}
+            )
+
+    def test_dry_run_skips_api(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig(dry_run=True)).restore_inline_policy(
+            user_name="alice", policy_name="p", policy_document={}
+        )
+        assert result.details.get("dry_run") is True
+        services.iam.put_user_policy.assert_not_called()
+
+    def test_happy_path_user(self):
+        import json as _json
+        services = make_services()
+        doc = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]}
+        result = AwsIRResponse(services, DredgeConfig()).restore_inline_policy(
+            user_name="alice", policy_name="OriginalPolicy", policy_document=doc
+        )
+        assert result.success is True
+        assert result.details["policy_restored"] == "OriginalPolicy"
+        call_kwargs = services.iam.put_user_policy.call_args[1]
+        assert call_kwargs["UserName"] == "alice"
+        assert call_kwargs["PolicyName"] == "OriginalPolicy"
+        assert _json.loads(call_kwargs["PolicyDocument"]) == doc
+        services.iam.put_role_policy.assert_not_called()
+
+    def test_happy_path_role(self):
+        services = make_services()
+        result = AwsIRResponse(services, DredgeConfig()).restore_inline_policy(
+            role_name="my-role", policy_name="p", policy_document={}
+        )
+        assert result.success is True
+        services.iam.put_role_policy.assert_called_once()
+        services.iam.put_user_policy.assert_not_called()
+
+    def test_api_error_records_failure(self):
+        services = make_services()
+        services.iam.put_user_policy.side_effect = make_client_error()
+        result = AwsIRResponse(services, DredgeConfig()).restore_inline_policy(
+            user_name="alice", policy_name="p", policy_document={}
+        )
+        assert result.success is False

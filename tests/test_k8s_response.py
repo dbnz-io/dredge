@@ -82,6 +82,15 @@ class TestRevokeClusterRoleBinding:
         result = K8sIRResponse(services, DredgeConfig()).revoke_cluster_role_binding("crb")
         assert result.success is False
 
+    def test_rollback_capture_error_does_not_block_delete(self):
+        services = make_services()
+        services.rbac_v1.read_cluster_role_binding.side_effect = make_api_exception(404, "Not Found")
+
+        result = K8sIRResponse(services, DredgeConfig()).revoke_cluster_role_binding("crb")
+
+        assert result.success is True
+        assert "rollback_state" not in result.details
+
 
 def _sa_token_secret(name, sa_name, namespace="ns"):
     return obj(
@@ -114,6 +123,7 @@ class TestDisableServiceAccount:
         ])
         services.rbac_v1.list_cluster_role_binding.return_value = obj(items=[
             obj(metadata=obj(name="crb-match"), subjects=[obj(kind="ServiceAccount", name="sa", namespace="ns")], role_ref=obj(name="r")),
+            obj(metadata=obj(name="crb-nomatch"), subjects=[obj(kind="ServiceAccount", name="other-sa", namespace="ns")], role_ref=obj(name="r")),
         ])
 
         result = K8sIRResponse(services, DredgeConfig()).disable_service_account("ns", "sa")
@@ -139,6 +149,34 @@ class TestDisableServiceAccount:
 
         assert result.success is False
         assert result.details["token_secrets_deleted"] == []
+
+    def test_role_binding_delete_error_recorded(self):
+        services = make_services()
+        services.core_v1.list_namespaced_secret.return_value = obj(items=[])
+        services.rbac_v1.list_namespaced_role_binding.return_value = obj(items=[
+            _role_binding("rb-match", [obj(kind="ServiceAccount", name="sa", namespace=None)]),
+        ])
+        services.rbac_v1.delete_namespaced_role_binding.side_effect = make_api_exception()
+        services.rbac_v1.list_cluster_role_binding.return_value = obj(items=[])
+
+        result = K8sIRResponse(services, DredgeConfig()).disable_service_account("ns", "sa")
+
+        assert result.success is False
+        assert result.details["role_bindings_removed"] == []
+
+    def test_cluster_role_binding_delete_error_recorded(self):
+        services = make_services()
+        services.core_v1.list_namespaced_secret.return_value = obj(items=[])
+        services.rbac_v1.list_namespaced_role_binding.return_value = obj(items=[])
+        services.rbac_v1.list_cluster_role_binding.return_value = obj(items=[
+            obj(metadata=obj(name="crb-match"), subjects=[obj(kind="ServiceAccount", name="sa", namespace="ns")], role_ref=obj(name="r")),
+        ])
+        services.rbac_v1.delete_cluster_role_binding.side_effect = make_api_exception()
+
+        result = K8sIRResponse(services, DredgeConfig()).disable_service_account("ns", "sa")
+
+        assert result.success is False
+        assert result.details["cluster_role_bindings_removed"] == []
 
     def test_fatal_error_during_listing(self):
         services = make_services()
@@ -174,6 +212,18 @@ class TestDeleteServiceAccount:
 
         assert result.success is False
         services.core_v1.delete_namespaced_service_account.assert_not_called()
+
+    def test_delete_error_after_clean_disable(self):
+        services = make_services()
+        services.core_v1.list_namespaced_secret.return_value = obj(items=[])
+        services.rbac_v1.list_namespaced_role_binding.return_value = obj(items=[])
+        services.rbac_v1.list_cluster_role_binding.return_value = obj(items=[])
+        services.core_v1.delete_namespaced_service_account.side_effect = make_api_exception()
+
+        result = K8sIRResponse(services, DredgeConfig()).delete_service_account("ns", "sa")
+
+        assert result.success is False
+        assert "service_account_deleted" not in result.details
 
 
 class TestDeletePod:
@@ -222,6 +272,15 @@ class TestScaleDeployment:
         result = K8sIRResponse(services, DredgeConfig()).scale_deployment("ns", "d", 0)
         assert result.success is False
 
+    def test_rollback_capture_error_does_not_block_patch(self):
+        services = make_services()
+        services.apps_v1.read_namespaced_deployment_scale.side_effect = make_api_exception()
+
+        result = K8sIRResponse(services, DredgeConfig()).scale_deployment("ns", "d", 0)
+
+        assert result.success is True
+        assert "rollback_state" not in result.details
+
 
 class TestCordonNode:
     def test_dry_run(self):
@@ -246,6 +305,15 @@ class TestCordonNode:
         services.core_v1.patch_node.side_effect = make_api_exception()
         result = K8sIRResponse(services, DredgeConfig()).cordon_node("n")
         assert result.success is False
+
+    def test_rollback_capture_error_does_not_block_patch(self):
+        services = make_services()
+        services.core_v1.read_node.side_effect = make_api_exception()
+
+        result = K8sIRResponse(services, DredgeConfig()).cordon_node("n")
+
+        assert result.success is True
+        assert "rollback_state" not in result.details
 
 
 def _pod(name, namespace="ns", owner_kind=None):
@@ -339,6 +407,15 @@ class TestDeleteNode:
         result = K8sIRResponse(services, DredgeConfig()).delete_node("n")
         assert result.success is False
 
+    def test_rollback_capture_error_does_not_block_delete(self):
+        services = make_services()
+        services.core_v1.read_node.side_effect = make_api_exception()
+
+        result = K8sIRResponse(services, DredgeConfig()).delete_node("n")
+
+        assert result.success is True
+        assert "rollback_state" not in result.details
+
 
 class TestQuarantinePod:
     def test_dry_run(self):
@@ -378,6 +455,15 @@ class TestQuarantinePod:
 
         assert result.success is False
         assert result.details["label_added"] == {"dredge.io/quarantine": "p"}
+
+    def test_rollback_capture_error_does_not_block_label(self):
+        services = make_services()
+        services.core_v1.read_namespaced_pod.side_effect = make_api_exception()
+
+        result = K8sIRResponse(services, DredgeConfig()).quarantine_pod("ns", "p")
+
+        assert result.success is True
+        assert "rollback_state" not in result.details
 
 
 class TestQuarantineNamespace:
@@ -440,6 +526,15 @@ class TestDeleteSecret:
         result = K8sIRResponse(services, DredgeConfig()).delete_secret("ns", "s")
         assert result.success is False
 
+    def test_rollback_capture_error_does_not_block_delete(self):
+        services = make_services()
+        services.core_v1.read_namespaced_secret.side_effect = make_api_exception()
+
+        result = K8sIRResponse(services, DredgeConfig()).delete_secret("ns", "s")
+
+        assert result.success is True
+        assert "rollback_state" not in result.details
+
 
 class TestLabelResource:
     def test_dry_run(self):
@@ -482,3 +577,27 @@ class TestLabelResource:
         services.core_v1.patch_namespaced_pod.side_effect = make_api_exception()
         result = K8sIRResponse(services, DredgeConfig()).label_resource("pod", "ns", "p", {"a": "b"})
         assert result.success is False
+
+
+class TestSubjectsReferenceSaHelper:
+    def test_none_subjects_returns_false(self):
+        assert K8sIRResponse._subjects_reference_sa(None, "ns", "sa") is False
+
+    def test_empty_subjects_returns_false(self):
+        assert K8sIRResponse._subjects_reference_sa([], "ns", "sa") is False
+
+    def test_non_service_account_kind_skipped(self):
+        subjects = [obj(kind="User", name="sa", namespace="ns")]
+        assert K8sIRResponse._subjects_reference_sa(subjects, "ns", "sa") is False
+
+    def test_namespace_mismatch_skipped(self):
+        subjects = [obj(kind="ServiceAccount", name="sa", namespace="other-ns")]
+        assert K8sIRResponse._subjects_reference_sa(subjects, "ns", "sa") is False
+
+    def test_matches_when_namespace_omitted_defaults_to_binding_namespace(self):
+        subjects = [obj(kind="ServiceAccount", name="sa", namespace=None)]
+        assert K8sIRResponse._subjects_reference_sa(subjects, "ns", "sa") is True
+
+    def test_matches_when_namespace_explicit_and_equal(self):
+        subjects = [obj(kind="ServiceAccount", name="sa", namespace="ns")]
+        assert K8sIRResponse._subjects_reference_sa(subjects, "ns", "sa") is True
