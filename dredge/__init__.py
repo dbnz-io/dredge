@@ -8,6 +8,7 @@ from .auth import AwsAuthConfig, AwsSessionFactory
 from .aws_ir import AwsIRNamespace
 from .github_ir import GitHubIRNamespace
 from .gcp_ir import GcpIRNamespace
+from .k8s_ir import K8sIRNamespace
 
 class Dredge:
     def __init__(
@@ -18,6 +19,7 @@ class Dredge:
         config: Optional[DredgeConfig] = None,
         github_config: Optional["GitHubIRConfig"] = None,  # type: ignore[name-defined]
         gcp_config: Optional["GcpIRConfig"] = None,
+        k8s_config: Optional["K8sAuthConfig"] = None,  # type: ignore[name-defined]
     ) -> None:
         self.config = config or DredgeConfig(
             region_name=(auth.region_name if auth else None)
@@ -44,3 +46,10 @@ class Dredge:
             self.github_ir = None
             
         self.gcp_ir = GcpIRNamespace(gcp_config) if gcp_config else None
+
+        # Kubernetes IR namespace (optional; only if config is provided)
+        self.k8s_ir: Optional[K8sIRNamespace]
+        if k8s_config is not None:
+            self.k8s_ir = K8sIRNamespace(k8s_config, self.config)
+        else:
+            self.k8s_ir = None

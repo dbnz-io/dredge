@@ -9,6 +9,7 @@ from dredge import Dredge
 from dredge.auth import AwsAuthConfig
 from dredge.config import DredgeConfig
 from dredge.github_ir.config import GitHubIRConfig
+from dredge.k8s_ir.config import K8sAuthConfig
 
 
 def make_session():
@@ -21,6 +22,22 @@ class TestDredgeInit:
         assert d.aws_ir is not None
         assert d.github_ir is None
         assert d.gcp_ir is None
+        assert d.k8s_ir is None
+
+    def test_with_k8s_config_sets_k8s_ir(self):
+        cfg = K8sAuthConfig(token="tok", api_server="https://cluster.example.com")
+        d = Dredge(session=make_session(), k8s_config=cfg)
+        assert d.k8s_ir is not None
+
+    def test_without_k8s_config_k8s_ir_is_none(self):
+        d = Dredge(session=make_session())
+        assert d.k8s_ir is None
+
+    def test_k8s_ir_receives_dredge_dry_run_config(self):
+        cfg = K8sAuthConfig(token="tok", api_server="https://cluster.example.com")
+        d = Dredge(session=make_session(), config=DredgeConfig(dry_run=True), k8s_config=cfg)
+        result = d.k8s_ir.response.delete_pod("ns", "p")
+        assert result.details.get("dry_run") is True
 
     def test_session_and_auth_both_set_raises(self):
         with pytest.raises(ValueError, match="Provide either"):

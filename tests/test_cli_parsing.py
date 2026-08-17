@@ -24,6 +24,8 @@ def test_cli_has_expected_subcommands():
         "aws-disable-user",
         "aws-hunt-cloudtrail",
         "github-hunt-audit",
+        "k8s-delete-pod",
+        "k8s-hunt-events",
     ]:
         assert cmd in subparsers
 

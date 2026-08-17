@@ -14,6 +14,7 @@ from typing import Optional
 from dredge import Dredge, DredgeConfig
 from dredge.auth import AwsAuthConfig
 from dredge.github_ir.config import GitHubIRConfig
+from dredge.k8s_ir.config import K8sAuthConfig
 
 from importlib.metadata import version, PackageNotFoundError
 # ------------- helpers -------------
@@ -126,6 +127,58 @@ def build_github_config_from_args(args: argparse.Namespace) -> Optional[GitHubIR
         enterprise=args.github_enterprise,
         token=args.github_token or None,
     )
+
+
+def build_k8s_config_from_args(args: argparse.Namespace) -> Optional[K8sAuthConfig]:
+    if not any(
+        [
+            args.k8s_token,
+            args.k8s_in_cluster,
+            args.k8s_kubeconfig,
+            args.k8s_context,
+        ]
+    ):
+        return None
+
+    token = args.k8s_token
+    if not token and args.k8s_token_env_var:
+        import os
+        token = os.environ.get(args.k8s_token_env_var)
+
+    return K8sAuthConfig(
+        token=token,
+        api_server=args.k8s_api_server,
+        ca_cert_file=args.k8s_ca_cert,
+        verify_ssl=not args.k8s_insecure_skip_tls_verify,
+        in_cluster=args.k8s_in_cluster,
+        kubeconfig_path=args.k8s_kubeconfig,
+        context=args.k8s_context,
+        namespace=args.k8s_namespace,
+    )
+
+
+def _k8s_dredge(args: argparse.Namespace) -> Dredge:
+    """Build a Dredge instance with Kubernetes config, raising SystemExit if unconfigured."""
+    k8s_cfg = build_k8s_config_from_args(args)
+    if k8s_cfg is None:
+        raise SystemExit(
+            "You must configure Kubernetes auth: --k8s-kubeconfig, --k8s-context, "
+            "--k8s-in-cluster, or --k8s-token"
+        )
+    auth = build_aws_auth_from_args(args)  # optional; might be unused
+    return Dredge(
+        auth=auth,
+        config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
+        k8s_config=k8s_cfg,
+    )
+
+
+def _k8s_namespace(args: argparse.Namespace) -> str:
+    """Resolve the effective namespace: subcommand --namespace, else global --k8s-namespace."""
+    namespace = getattr(args, "namespace", None) or args.k8s_namespace
+    if not namespace:
+        raise SystemExit("You must provide --namespace (or set the global --k8s-namespace)")
+    return namespace
 
 
 # ------------- AWS command handlers -------------
@@ -774,6 +827,191 @@ def handle_github_forensics_repo_webhooks(args: argparse.Namespace) -> None:
     print_result(d.github_ir.forensics.list_repo_webhooks(args.repo), output=getattr(args, "output", "json"))
 
 
+# ------------- Kubernetes response handlers -------------
+
+
+def handle_k8s_revoke_role_binding(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.response.revoke_role_binding(_k8s_namespace(args), args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_revoke_cluster_role_binding(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.response.revoke_cluster_role_binding(args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_disable_service_account(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.response.disable_service_account(_k8s_namespace(args), args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_delete_service_account(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.response.delete_service_account(_k8s_namespace(args), args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_delete_pod(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.response.delete_pod(_k8s_namespace(args), args.name, grace_period_seconds=args.grace_period_seconds),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_scale_deployment(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.response.scale_deployment(_k8s_namespace(args), args.name, args.replicas),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_cordon_node(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.response.cordon_node(args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_drain_node(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.response.drain_node(
+            args.name,
+            grace_period_seconds=args.grace_period_seconds,
+            ignore_daemonsets=args.ignore_daemonsets,
+        ),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_delete_node(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.response.delete_node(args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_quarantine_pod(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.response.quarantine_pod(_k8s_namespace(args), args.name, policy_name=args.policy_name),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_quarantine_namespace(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.response.quarantine_namespace(_k8s_namespace(args), policy_name=args.policy_name),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_delete_secret(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.response.delete_secret(_k8s_namespace(args), args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_label_resource(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    labels = dict(t.split("=", 1) for t in (args.labels_raw or []))
+    namespace = (args.namespace or args.k8s_namespace) if args.kind in ("pod", "deployment") else None
+    print_result(
+        d.k8s_ir.response.label_resource(args.kind, namespace, args.name, labels),
+        output=getattr(args, "output", "json"),
+    )
+
+
+# ------------- Kubernetes forensics handlers -------------
+
+
+def handle_k8s_get_pod_manifest(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.forensics.get_pod_manifest(_k8s_namespace(args), args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_get_pod_logs(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.forensics.get_pod_logs(
+            _k8s_namespace(args), args.name,
+            container=args.container, previous=args.previous, tail_lines=args.tail_lines,
+        ),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_get_pod_events(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.forensics.get_pod_events(_k8s_namespace(args), args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_describe_node(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.forensics.describe_node(args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_capture_workload_manifest(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.forensics.capture_workload_manifest(args.kind, _k8s_namespace(args), args.name),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_list_pods_on_node(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.forensics.list_pods_on_node(args.name), output=getattr(args, "output", "json"))
+
+
+def handle_k8s_exec_pod_command(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.forensics.exec_pod_command(_k8s_namespace(args), args.name, args.command, container=args.container),
+        output=getattr(args, "output", "json"),
+    )
+
+
+# ------------- Kubernetes hunt handlers -------------
+
+
+def handle_k8s_hunt_events(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.hunt.list_events(
+            namespace=args.namespace or args.k8s_namespace,
+            involved_object_kind=args.involved_object_kind,
+            involved_object_name=args.involved_object_name,
+            reason=args.reason,
+            event_type=args.event_type,
+            start_time=parse_iso_datetime(args.start_time),
+            end_time=parse_iso_datetime(args.end_time),
+            max_events=args.max_events,
+        ),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_hunt_role_bindings_for_subject(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.hunt.list_role_bindings_for_subject(
+            kind=args.kind, name=args.name, namespace=args.namespace or args.k8s_namespace,
+        ),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_hunt_pods_by_service_account(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(
+        d.k8s_ir.hunt.list_pods_by_service_account(_k8s_namespace(args), args.service_account),
+        output=getattr(args, "output", "json"),
+    )
+
+
+def handle_k8s_hunt_privileged_pods(args: argparse.Namespace) -> None:
+    d = _k8s_dredge(args)
+    print_result(d.k8s_ir.hunt.list_privileged_pods(max_pods=args.max_pods), output=getattr(args, "output", "json"))
+
+
 # ------------- argparse wiring -------------
 
 
@@ -810,6 +1048,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="GitHub token (otherwise uses env var configured in GitHubIRConfig)",
     )
+
+    # Kubernetes-global options (used when k8s subcommands are run)
+    parser.add_argument("--k8s-kubeconfig", default=None, help="Path to kubeconfig file (default: ~/.kube/config or $KUBECONFIG)")
+    parser.add_argument("--k8s-context", default=None, help="Kubeconfig context to use")
+    parser.add_argument("--k8s-in-cluster", action="store_true", help="Use the in-cluster (mounted) service account token")
+    parser.add_argument("--k8s-token", default=None, help="Explicit bearer/service-account token (no kubeconfig)")
+    parser.add_argument("--k8s-token-env-var", default="K8S_TOKEN", help="Env var to read the token from if --k8s-token is not set")
+    parser.add_argument("--k8s-api-server", default=None, help="API server URL (required with --k8s-token)")
+    parser.add_argument("--k8s-ca-cert", default=None, help="Path to CA cert file (used with --k8s-token)")
+    parser.add_argument("--k8s-insecure-skip-tls-verify", action="store_true", help="Disable TLS verification (used with --k8s-token)")
+    parser.add_argument("--k8s-namespace", default=None, help="Default namespace for namespaced k8s subcommands")
 
     # --version flag
     try:
@@ -1250,6 +1499,171 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", required=True, help="Repository name")
     p.add_argument("--output", choices=["json", "csv"], default="json")
     p.set_defaults(func=handle_github_forensics_repo_webhooks)
+
+    # ---- Kubernetes response ----
+
+    p = subparsers.add_parser("k8s-revoke-role-binding", help="Delete a RoleBinding")
+    p.add_argument("name", help="RoleBinding name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_revoke_role_binding)
+
+    p = subparsers.add_parser("k8s-revoke-cluster-role-binding", help="Delete a ClusterRoleBinding")
+    p.add_argument("name", help="ClusterRoleBinding name")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_revoke_cluster_role_binding)
+
+    p = subparsers.add_parser("k8s-disable-service-account", help="Delete a ServiceAccount's tokens and bindings")
+    p.add_argument("name", help="ServiceAccount name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_disable_service_account)
+
+    p = subparsers.add_parser("k8s-delete-service-account", help="Disable then delete a ServiceAccount")
+    p.add_argument("name", help="ServiceAccount name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_delete_service_account)
+
+    p = subparsers.add_parser("k8s-delete-pod", help="Force-delete a pod")
+    p.add_argument("name", help="Pod name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--grace-period-seconds", type=int, default=0, dest="grace_period_seconds")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_delete_pod)
+
+    p = subparsers.add_parser("k8s-scale-deployment", help="Scale a Deployment (default: to 0)")
+    p.add_argument("name", help="Deployment name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--replicas", type=int, default=0)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_scale_deployment)
+
+    p = subparsers.add_parser("k8s-cordon-node", help="Mark a node unschedulable")
+    p.add_argument("name", help="Node name")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_cordon_node)
+
+    p = subparsers.add_parser("k8s-drain-node", help="Cordon a node and evict its pods")
+    p.add_argument("name", help="Node name")
+    p.add_argument("--grace-period-seconds", type=int, default=30, dest="grace_period_seconds")
+    p.add_argument("--no-ignore-daemonsets", dest="ignore_daemonsets", action="store_false",
+                   help="Also evict DaemonSet-owned pods (they will be immediately rescheduled)")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_drain_node, ignore_daemonsets=True)
+
+    p = subparsers.add_parser("k8s-delete-node", help="Remove a Node object from the cluster (not the underlying VM)")
+    p.add_argument("name", help="Node name")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_delete_node)
+
+    p = subparsers.add_parser("k8s-quarantine-pod", help="Isolate a pod with a deny-all NetworkPolicy")
+    p.add_argument("name", help="Pod name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--policy-name", default="dredge-forensic-isolation", dest="policy_name")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_quarantine_pod)
+
+    p = subparsers.add_parser("k8s-quarantine-namespace", help="Apply a deny-all NetworkPolicy across a namespace")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--policy-name", default="dredge-forensic-isolation", dest="policy_name")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_quarantine_namespace)
+
+    p = subparsers.add_parser("k8s-delete-secret", help="Delete a Secret")
+    p.add_argument("name", help="Secret name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_delete_secret)
+
+    p = subparsers.add_parser("k8s-label-resource", help="Apply labels to a pod/node/namespace/deployment")
+    p.add_argument("kind", choices=["pod", "node", "namespace", "deployment"])
+    p.add_argument("name", help="Resource name")
+    p.add_argument("--namespace", default=None, help="Required for kind=pod|deployment")
+    p.add_argument("--label", dest="labels_raw", action="append", required=True,
+                   help="Label in Key=Value format (repeat for multiple)")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_label_resource)
+
+    # ---- Kubernetes forensics ----
+
+    p = subparsers.add_parser("k8s-get-pod-manifest", help="Capture the full manifest of a pod")
+    p.add_argument("name", help="Pod name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_get_pod_manifest)
+
+    p = subparsers.add_parser("k8s-get-pod-logs", help="Capture container logs from a pod")
+    p.add_argument("name", help="Pod name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--container", default=None)
+    p.add_argument("--previous", action="store_true", help="Get logs from the previous terminated container")
+    p.add_argument("--tail-lines", type=int, default=None, dest="tail_lines")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_get_pod_logs)
+
+    p = subparsers.add_parser("k8s-get-pod-events", help="List Events for a pod")
+    p.add_argument("name", help="Pod name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_get_pod_events)
+
+    p = subparsers.add_parser("k8s-describe-node", help="Capture the full manifest of a node")
+    p.add_argument("name", help="Node name")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_describe_node)
+
+    p = subparsers.add_parser("k8s-capture-workload-manifest", help="Capture a workload controller's manifest")
+    p.add_argument("kind", choices=["deployment", "statefulset", "daemonset"])
+    p.add_argument("name", help="Workload name")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_capture_workload_manifest)
+
+    p = subparsers.add_parser("k8s-list-pods-on-node", help="List pods scheduled to a node")
+    p.add_argument("name", help="Node name")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_list_pods_on_node)
+
+    p = subparsers.add_parser("k8s-exec-pod-command", help="Run a diagnostic command in a pod (best-effort)")
+    p.add_argument("name", help="Pod name")
+    p.add_argument("command", nargs="+", help="Command and arguments to run")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--container", default=None)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_exec_pod_command)
+
+    # ---- Kubernetes hunt ----
+
+    p = subparsers.add_parser("k8s-hunt-events", help="Search Kubernetes Events")
+    p.add_argument("--namespace", default=None, help="Omit for cluster-wide search")
+    p.add_argument("--involved-object-kind", dest="involved_object_kind", default=None)
+    p.add_argument("--involved-object-name", dest="involved_object_name", default=None)
+    p.add_argument("--reason", default=None)
+    p.add_argument("--event-type", dest="event_type", default=None, help="Normal or Warning")
+    p.add_argument("--start-time", default=None, help="ISO 8601 start time")
+    p.add_argument("--end-time", default=None, help="ISO 8601 end time")
+    p.add_argument("--max-events", type=int, default=500, dest="max_events")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_hunt_events)
+
+    p = subparsers.add_parser("k8s-hunt-role-bindings-for-subject", help="Find RoleBindings/ClusterRoleBindings referencing a subject")
+    p.add_argument("--kind", required=True, help='Subject kind: "User", "Group", or "ServiceAccount"')
+    p.add_argument("--name", required=True, help="Subject name")
+    p.add_argument("--namespace", default=None, help="Omit to search cluster-wide")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_hunt_role_bindings_for_subject)
+
+    p = subparsers.add_parser("k8s-hunt-pods-by-service-account", help="List pods running under a ServiceAccount")
+    p.add_argument("--service-account", required=True, dest="service_account")
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_hunt_pods_by_service_account)
+
+    p = subparsers.add_parser("k8s-hunt-privileged-pods", help="Flag pods with elevated host access")
+    p.add_argument("--max-pods", type=int, default=500, dest="max_pods")
+    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.set_defaults(func=handle_k8s_hunt_privileged_pods)
 
     return parser
 

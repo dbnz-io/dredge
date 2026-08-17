@@ -23,7 +23,7 @@ pytest tests/test_aws_hunt.py::TestAwsHunt::test_lookup_by_access_key -q
 
 ## Architecture
 
-Dredge is a cloud incident response (IR) and threat hunting library + CLI for AWS, GitHub, and GCP.
+Dredge is a cloud incident response (IR) and threat hunting library + CLI for AWS, Kubernetes, GitHub, and GCP.
 
 ### Namespace pattern
 
@@ -36,6 +36,11 @@ Dredge
 │   ├── .forensics (AwsIRForensics)  — EC2 snapshot capture
 │   ├── .hunt      (AwsIRHunt)       — CloudTrail LookupEvents with filter logic
 │   └── .services  (AwsServiceRegistry) — lazy boto3 client cache
+├── .k8s_ir   → K8sIRNamespace
+│   ├── .response  (K8sIRResponse)   — revoke RBAC bindings, delete/cordon/drain pods & nodes, NetworkPolicy quarantine
+│   ├── .forensics (K8sIRForensics)  — pod/node manifest & log capture, exec-based diagnostics
+│   ├── .hunt      (K8sIRHunt)       — Kubernetes Events API search, RBAC/exposure hunting
+│   └── .services  (K8sServiceRegistry) — lazy typed API client cache (CoreV1Api, AppsV1Api, etc.)
 ├── .github_ir → GitHubIRNamespace
 │   ├── .hunt      (GitHubIRHunt)    — GitHub org/enterprise audit log search
 │   └── .services  (GitHubServiceRegistry)
@@ -52,6 +57,7 @@ All action methods return `OperationResult` (defined per-namespace in `models.py
 - `AwsAuthConfig` + `AwsSessionFactory` (`dredge/auth.py`): build boto3 sessions with precedence — explicit keys > named profile > default chain. Supports role assumption and MFA.
 - `GitHubIRConfig` (`dredge/github_ir/config.py`): token resolved from explicit value, provider callable, or `GITHUB_TOKEN` env var.
 - `GcpIRConfig` (`dredge/gcp_ir/config.py`): project ID and credentials path.
+- `K8sAuthConfig` + `K8sClientFactory` (`dredge/k8s_ir/config.py`, `dredge/k8s_ir/services.py`): precedence — explicit token/`token_provider` > `in_cluster` > kubeconfig/context ("auth like kubectl") > default (in-cluster, falling back to default kubeconfig). `token_provider` is re-invoked before every API call (no dredge-side caching), matching `GitHubIRConfig.token_provider`.
 
 ### Key implementation details
 
@@ -61,12 +67,16 @@ All action methods return `OperationResult` (defined per-namespace in `models.py
 
 **GCP hunt (`dredge/gcp_ir/hunt.py`):** Constructs a Cloud Logging filter string from `protoPayload` fields. Page size up to 1000. GCP module is partially implemented — treat as in-progress.
 
-**Dry-run:** `DredgeConfig(dry_run=True)` skips actual AWS API mutating calls and returns `success=True` with `details["dry_run"] = True`. Implemented only in `aws_ir/response.py`.
+**Kubernetes hunt (`dredge/k8s_ir/hunt.py`):** v1 uses the built-in Kubernetes `Events` API only — flavor-agnostic (works identically on EKS/GKE/AKS/self-managed), no audit-log plumbing required. Pagination uses the API's `limit`/`_continue` tokens. Cloud-specific audit log retrieval (EKS → CloudWatch, GKE → Cloud Logging) is intentionally out of scope for now; compose with `aws_ir.hunt`/`gcp_ir.hunt` for that.
+
+**Kubernetes response (`dredge/k8s_ir/response.py`):** Response/forensics methods hit the standard Kubernetes API and behave identically regardless of cluster flavor. Destructive node/pod actions (`cordon_node`, `delete_node`, `drain_node`) operate at the K8s API level only — they do not reach into `aws_ir`/`gcp_ir` to stop or snapshot the underlying VM; that composition is left to the caller. `quarantine_pod`/`quarantine_namespace` apply deny-all `NetworkPolicy` objects — enforcement depends on the cluster's CNI supporting `NetworkPolicy` (e.g. Calico, Cilium); some CNIs don't enforce it at all.
+
+**Dry-run:** `DredgeConfig(dry_run=True)` skips actual mutating API calls and returns `success=True` with `details["dry_run"] = True`. Implemented in `aws_ir/response.py` and `k8s_ir/response.py`; not yet in `github_ir`.
 
 ### CLI
 
-`dredge/cli.py` is a standalone argparse CLI with subcommands for all AWS IR actions and GitHub hunt. Global flags set AWS auth (region, profile, explicit keys, role assumption) and dry-run. Output is JSON by default; pass `--output csv` for CSV.
+`dredge/cli.py` is a standalone argparse CLI with subcommands for all AWS IR actions, Kubernetes IR actions, and GitHub hunt/response. Global flags set AWS auth (region, profile, explicit keys, role assumption), Kubernetes auth (kubeconfig, context, in-cluster, or explicit token), and dry-run. Output is JSON by default; pass `--output csv` for CSV.
 
 ### Testing approach
 
-Tests use `pytest` + `pytest-mock`. AWS API calls are mocked via `unittest.mock`; no real cloud credentials are needed. Test files map 1:1 to source modules (e.g., `tests/test_aws_hunt.py` covers `dredge/aws_ir/hunt.py`). The 80% coverage floor is enforced in CI.
+Tests use `pytest` + `pytest-mock`. AWS and Kubernetes API calls are mocked via `unittest.mock` (`MagicMock` services injected directly into the response/forensics/hunt classes); no real cloud credentials or cluster are needed. Test files map 1:1 to source modules (e.g., `tests/test_aws_hunt.py` covers `dredge/aws_ir/hunt.py`, `tests/test_k8s_hunt.py` covers `dredge/k8s_ir/hunt.py`). The 80% coverage floor is enforced in CI.

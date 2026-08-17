@@ -23,6 +23,11 @@ google-auth-httplib2>=0.2.0
 google-api-python-client>=2.117.0
 
 # -----------------------------
+# Kubernetes
+# -----------------------------
+kubernetes>=29.0.0
+
+# -----------------------------
 # Date & Time Handling
 # -----------------------------
 python-dateutil>=2.8.2
