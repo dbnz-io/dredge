@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import boto3
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .config import DredgeConfig
 from .auth import AwsAuthConfig, AwsSessionFactory
 from .aws_ir import AwsIRNamespace
-from .github_ir import GitHubIRNamespace
-from .gcp_ir import GcpIRNamespace
-from .k8s_ir import K8sIRNamespace
+
+# github_ir/gcp_ir/k8s_ir are imported lazily below, inside Dredge.__init__,
+# not here at module top level. Each pulls in a genuinely heavy transitive
+# dependency (github_ir -> PyGithub, gcp_ir -> google-cloud-logging's
+# google-auth/grpc chain, k8s_ir -> the kubernetes client + its own
+# grpc/protobuf stack, ~120MB uncompressed for k8s_ir alone) that a
+# consumer using only dredge.aws_ir shouldn't have to import -- or ship in
+# a size-constrained deployment target like a Lambda package -- just
+# because `import dredge` touched the class definition. TYPE_CHECKING-only
+# imports here keep real type checkers (mypy/pyright) happy without
+# executing at runtime.
+if TYPE_CHECKING:
+    from .github_ir import GitHubIRNamespace
+    from .gcp_ir import GcpIRNamespace
+    from .k8s_ir import K8sIRNamespace
 
 class Dredge:
     def __init__(
@@ -38,18 +50,32 @@ class Dredge:
         # AWS IR namespace
         self.aws_ir = AwsIRNamespace(self._session, self.config)
 
-        # GitHub IR namespace (optional; only if config is provided)
-        self.github_ir: Optional[GitHubIRNamespace]
+        # GitHub IR namespace (optional; only if config is provided) --
+        # imported here, not at module top level, so a consumer that never
+        # passes github_config never imports PyGithub at all.
+        self.github_ir: Optional["GitHubIRNamespace"]
         if github_config is not None:
+            from .github_ir import GitHubIRNamespace
             self.github_ir = GitHubIRNamespace(github_config)
         else:
             self.github_ir = None
-            
-        self.gcp_ir = GcpIRNamespace(gcp_config) if gcp_config else None
 
-        # Kubernetes IR namespace (optional; only if config is provided)
-        self.k8s_ir: Optional[K8sIRNamespace]
+        # GCP IR namespace (optional; only if config is provided) --
+        # imported here, not at module top level, so a consumer that never
+        # passes gcp_config never imports google-cloud-logging/google-auth.
+        self.gcp_ir: Optional["GcpIRNamespace"]
+        if gcp_config:
+            from .gcp_ir import GcpIRNamespace
+            self.gcp_ir = GcpIRNamespace(gcp_config)
+        else:
+            self.gcp_ir = None
+
+        # Kubernetes IR namespace (optional; only if config is provided) --
+        # imported here, not at module top level, so a consumer that never
+        # passes k8s_config never imports the kubernetes client library.
+        self.k8s_ir: Optional["K8sIRNamespace"]
         if k8s_config is not None:
+            from .k8s_ir import K8sIRNamespace
             self.k8s_ir = K8sIRNamespace(k8s_config, self.config)
         else:
             self.k8s_ir = None
