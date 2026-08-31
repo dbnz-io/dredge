@@ -601,6 +601,46 @@ class TestAwsHuntCloudtrailTimeRanges:
         _, kwargs = target.call_args
         assert kwargs["max_events"] == 500
 
+    def test_all_regions_dispatches_to_multi_region(self, monkeypatch, capsys):
+        argv = ["aws", "hunt", "cloudtrail", "--access-key-id", "AKIA", "--all-regions"]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.hunt.lookup_events_multi_region")
+        _, kwargs = target.call_args
+        assert kwargs["regions"] == "all"
+        assert kwargs["max_events_per_region"] == 500
+        assert kwargs["max_workers"] == 12
+
+    def test_explicit_regions_list_dispatches_to_multi_region(self, monkeypatch, capsys):
+        argv = ["aws", "hunt", "cloudtrail", "--user", "x",
+                "--regions", "us-east-1", "--regions", "eu-west-1", "--max-workers", "4"]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.hunt.lookup_events_multi_region")
+        _, kwargs = target.call_args
+        assert kwargs["regions"] == ["us-east-1", "eu-west-1"]
+        assert kwargs["max_workers"] == 4
+
+    def test_regions_comma_separated(self, monkeypatch, capsys):
+        argv = ["aws", "hunt", "cloudtrail", "--user", "x", "--regions", "us-east-1,us-east-2"]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.hunt.lookup_events_multi_region")
+        _, kwargs = target.call_args
+        assert kwargs["regions"] == ["us-east-1", "us-east-2"]
+
+    def test_regions_comma_and_repeated_flag_mix(self, monkeypatch, capsys):
+        argv = ["aws", "hunt", "cloudtrail", "--user", "x",
+                "--regions", "us-east-1, us-east-2", "--regions", "eu-west-1"]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.hunt.lookup_events_multi_region")
+        _, kwargs = target.call_args
+        assert kwargs["regions"] == ["us-east-1", "us-east-2", "eu-west-1"]
+
+    def test_regions_value_all_means_all(self, monkeypatch, capsys):
+        argv = ["aws", "hunt", "cloudtrail", "--user", "x", "--regions", "all"]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.hunt.lookup_events_multi_region")
+        _, kwargs = target.call_args
+        assert kwargs["regions"] == "all"
+
+    def test_no_region_flags_uses_single_region_lookup(self, monkeypatch, capsys):
+        argv = ["aws", "hunt", "cloudtrail", "--user", "x"]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.hunt.lookup_events")
+        target.assert_called_once()
+
     def test_output_csv_selected(self, monkeypatch, capsys):
         mock_dredge_class = MagicMock()
         mock_instance = mock_dredge_class.return_value
@@ -629,6 +669,12 @@ class TestAwsHuntCloudtrailMultiUserCli:
         args, kwargs = target.call_args
         assert args == (["alice", "bob"],)
         assert kwargs["mode"] == "per_user"
+
+    def test_users_comma_separated(self, monkeypatch, capsys):
+        argv = ["aws", "hunt", "cloudtrail-multi-user", "--user", "alice,bob,carol"]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.hunt.hunt_cloudtrail_multi_user")
+        args, kwargs = target.call_args
+        assert args == (["alice", "bob", "carol"],)
 
     def test_users_from_file_combined_with_flag_and_deduped(self, monkeypatch, capsys, tmp_path):
         f = tmp_path / "users.txt"
@@ -711,6 +757,13 @@ class TestAwsHuntUserActivityByIpCli:
         args, kwargs = target.call_args
         assert args == ("alice", ["10.0.0.0/8", "1.2.3.4"])
 
+    def test_allowed_ips_comma_separated(self, monkeypatch, capsys):
+        argv = ["aws", "hunt", "user-activity-by-ip", "--user", "alice",
+                "--allowed-ip", "10.0.0.0/8, 1.2.3.4"]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.hunt.hunt_user_activity_by_ip")
+        args, kwargs = target.call_args
+        assert args == ("alice", ["10.0.0.0/8", "1.2.3.4"])
+
     def test_allowed_ips_from_file(self, monkeypatch, capsys, tmp_path):
         f = tmp_path / "ips.txt"
         f.write_text("# office\n10.0.0.0/8\n")
@@ -740,6 +793,76 @@ class TestAwsHuntUserActivityByIpCli:
         _, kwargs = target.call_args
         assert kwargs["max_events"] == 50
         assert kwargs["event_name"] == "ConsoleLogin"
+
+
+class TestAwsReviewCli:
+    def _run(self, monkeypatch, argv):
+        from dredge.aws_ir.models import OperationResult
+        mock_dredge_class = MagicMock()
+        inst = mock_dredge_class.return_value
+        monkeypatch.setattr(dredge_cli, "Dredge", mock_dredge_class)
+        inst.aws_ir.review.review.return_value = OperationResult(
+            operation="review", target="acct", success=True,
+            details={"findings": [], "summary": {}, "checks": {}, "meta": {}},
+        )
+        args = dredge_cli.build_parser().parse_args(argv)
+        args.func(args)
+        return inst.aws_ir.review.review
+
+    def test_full_is_all_services_tier1(self, monkeypatch, capsys):
+        run = self._run(monkeypatch, ["aws", "review", "full"])
+        _, kwargs = run.call_args
+        assert kwargs["services"] == "all"
+        assert kwargs["tiers"] == (1,)
+
+    def test_full_deep_includes_tier2(self, monkeypatch, capsys):
+        run = self._run(monkeypatch, ["aws", "review", "full", "--deep"])
+        _, kwargs = run.call_args
+        assert kwargs["tiers"] == (1, 2)
+
+    def test_service_target_runs_both_tiers(self, monkeypatch, capsys):
+        run = self._run(monkeypatch, ["aws", "review", "iam"])
+        _, kwargs = run.call_args
+        assert kwargs["services"] == ["iam"]
+        assert kwargs["tiers"] == (1, 2)
+
+    def test_ec2_ip_flag_flattened(self, monkeypatch, capsys):
+        run = self._run(monkeypatch, ["aws", "review", "ec2", "--ip", "1.2.3.4,10.0.0.0/8"])
+        _, kwargs = run.call_args
+        assert kwargs["ips"] == ["1.2.3.4", "10.0.0.0/8"]
+
+    def test_recent_passes_incident_start(self, monkeypatch, capsys):
+        run = self._run(monkeypatch, ["aws", "review", "recent", "--incident-start", "2026-08-29T00:00:00Z"])
+        _, kwargs = run.call_args
+        assert kwargs["incident_start"].isoformat() == "2026-08-29T00:00:00+00:00"
+
+    def test_all_regions_fans_out(self, monkeypatch, capsys):
+        run = self._run(monkeypatch, ["aws", "review", "full", "--all-regions"])
+        _, kwargs = run.call_args
+        assert kwargs["regions"] == "all"
+
+    def test_regions_comma_separated(self, monkeypatch, capsys):
+        run = self._run(monkeypatch, ["aws", "review", "rds", "--regions", "us-east-1,eu-west-1"])
+        _, kwargs = run.call_args
+        assert kwargs["regions"] == ["us-east-1", "eu-west-1"]
+
+    def test_ecs_service_command(self, monkeypatch, capsys):
+        run = self._run(monkeypatch, ["aws", "review", "ecs"])
+        _, kwargs = run.call_args
+        assert kwargs["services"] == ["ecs"]
+        assert kwargs["tiers"] == (1, 2)
+
+    def test_writes_csv_and_html(self, monkeypatch, capsys, tmp_path):
+        csv_p = tmp_path / "r.csv"
+        html_p = tmp_path / "r.html"
+        self._run(monkeypatch, ["aws", "review", "full", "--csv", str(csv_p), "--html", str(html_p)])
+        assert csv_p.exists() and html_p.exists()
+        assert csv_p.read_text().startswith("severity,service,")
+        assert "<!doctype html>" in html_p.read_text()
+
+    def test_no_files_still_prints_summary(self, monkeypatch, capsys):
+        self._run(monkeypatch, ["aws", "review", "full"])
+        assert '"success": true' in capsys.readouterr().out
 
 
 class TestAwsDownloadS3LogsDateFilter:

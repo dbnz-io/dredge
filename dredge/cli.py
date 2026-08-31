@@ -340,16 +340,42 @@ def handle_aws_hunt_cloudtrail(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
 
-    res = dredge.aws_ir.hunt.lookup_events(
-        user_name=args.user,
-        access_key_id=args.access_key_id,
-        event_name=args.event_name,
-        source_ip=args.source_ip,
-        start_time=start,
-        end_time=end,
-        max_events=args.max_events,
-        allow_full_scan=full_scan,
-    )
+    # Multi-region fan-out: --all-regions, or --regions r1 r2 (repeatable; the
+    # value "all" also means every enabled region). Each regional endpoint is
+    # queried concurrently.
+    regions_arg = None
+    if getattr(args, "all_regions", False):
+        regions_arg = "all"
+    elif getattr(args, "regions", None):
+        # Accept comma-separated values and/or a repeated flag (and any mix):
+        # --regions us-east-1,us-east-2  ==  --regions us-east-1 --regions us-east-2
+        regions = _flatten_csv(args.regions)
+        regions_arg = "all" if "all" in regions else regions
+
+    if regions_arg is not None:
+        res = dredge.aws_ir.hunt.lookup_events_multi_region(
+            regions=regions_arg,
+            user_name=args.user,
+            access_key_id=args.access_key_id,
+            event_name=args.event_name,
+            source_ip=args.source_ip,
+            start_time=start,
+            end_time=end,
+            max_events_per_region=args.max_events,
+            allow_full_scan=full_scan,
+            max_workers=args.max_workers,
+        )
+    else:
+        res = dredge.aws_ir.hunt.lookup_events(
+            user_name=args.user,
+            access_key_id=args.access_key_id,
+            event_name=args.event_name,
+            source_ip=args.source_ip,
+            start_time=start,
+            end_time=end,
+            max_events=args.max_events,
+            allow_full_scan=full_scan,
+        )
     print_result(res, output=getattr(args, "output", "json"))
 
 
@@ -362,6 +388,13 @@ def _read_list_file(path: str) -> List[str]:
             for line in f
             if (stripped := line.strip()) and not stripped.startswith("#")
         ]
+
+
+def _flatten_csv(values) -> List[str]:
+    """Flatten a list flag that is both repeatable and comma-separated:
+    ["a,b", "c"] -> ["a", "b", "c"]. Whitespace around items is stripped and
+    empty items dropped, so `--x a, b` and `--x a --x b` are equivalent."""
+    return [part.strip() for v in (values or []) for part in v.split(",") if part.strip()]
 
 
 def _resolve_hunt_time_range(args: argparse.Namespace):
@@ -380,7 +413,7 @@ def handle_aws_hunt_cloudtrail_multi_user(args: argparse.Namespace) -> None:
         config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
     )
 
-    users = list(args.user)
+    users = _flatten_csv(args.user)
     if args.users_file:
         users.extend(_read_list_file(args.users_file))
     # Dedupe while preserving order.
@@ -421,7 +454,7 @@ def handle_aws_hunt_user_activity_by_ip(args: argparse.Namespace) -> None:
         config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
     )
 
-    allowed_ips = list(args.allowed_ip)
+    allowed_ips = _flatten_csv(args.allowed_ip)
     if args.allowed_ips_file:
         allowed_ips.extend(_read_list_file(args.allowed_ips_file))
     allowed_ips = list(dict.fromkeys(allowed_ips))
@@ -439,6 +472,52 @@ def handle_aws_hunt_user_activity_by_ip(args: argparse.Namespace) -> None:
         end_time=end,
         max_events=args.max_events,
     )
+    print_result(res, output=getattr(args, "output", "json"))
+
+
+def handle_aws_review(args: argparse.Namespace) -> None:
+    auth = build_aws_auth_from_args(args)
+    dredge = Dredge(
+        auth=auth,
+        config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
+    )
+    from dredge.aws_ir.review import AwsIRReview
+
+    # `review_service` is set per subcommand: "full" (all services) or a single
+    # service name (which runs its deeper tier-2 checks too).
+    if args.review_service == "full":
+        services = "all"
+        tiers = (1, 2) if getattr(args, "deep", False) else (1,)
+    else:
+        services = [args.review_service]
+        tiers = (1, 2)
+
+    # Region fan-out (regional checks): --all-regions or --regions r1,r2.
+    regions = None
+    if getattr(args, "all_regions", False):
+        regions = "all"
+    elif getattr(args, "regions", None):
+        r = _flatten_csv(args.regions)
+        regions = "all" if "all" in r else r
+
+    res = dredge.aws_ir.review.review(
+        services=services,
+        tiers=tiers,
+        incident_start=parse_iso_datetime(getattr(args, "incident_start", None)),
+        ips=_flatten_csv(getattr(args, "ip", None)) or None,
+        include=_flatten_csv(getattr(args, "include", None)) or None,
+        exclude=_flatten_csv(getattr(args, "exclude", None)) or None,
+        regions=regions,
+        max_workers=getattr(args, "max_workers", 12),
+    )
+
+    if getattr(args, "csv", None):
+        AwsIRReview.to_csv(res, args.csv)
+        print(f"wrote CSV: {args.csv}", file=sys.stderr)
+    if getattr(args, "html", None):
+        AwsIRReview.to_html(res, args.html)
+        print(f"wrote HTML: {args.html}", file=sys.stderr)
+
     print_result(res, output=getattr(args, "output", "json"))
 
 
@@ -812,7 +891,7 @@ def handle_aws_hunt_security_groups_by_ip(args: argparse.Namespace) -> None:
         config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
     )
     res = dredge.aws_ir.hunt.hunt_security_groups_by_ip(
-        args.ip,
+        _flatten_csv(args.ip),
         direction=_SG_DIRECTION_ARG_TO_LIB[args.direction],
         max_groups=args.max_groups,
     )
@@ -1243,8 +1322,9 @@ def handle_k8s_hunt_privileged_pods(args: argparse.Namespace) -> None:
 # bucket slug.
 _PROVIDER_ORDER = ["aws", "k8s", "github", "gcp"]
 _PROVIDER_LABELS = {"aws": "AWS", "k8s": "Kubernetes", "github": "GitHub", "gcp": "GCP"}
-_BUCKET_ORDER = ["hunt", "response", "forensics"]
+_BUCKET_ORDER = ["review", "hunt", "response", "forensics"]
 _BUCKET_LABELS = {
+    "review": "Review (posture)",
     "hunt": "Hunt & Investigate",
     "response": "Response & Remediation",
     "forensics": "Forensics",
@@ -1460,8 +1540,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Subcommands. `subparsers` is a nested registrar, not a raw argparse
-    # subparsers action: each add_parser("aws-hunt-x", ...) below is routed to
-    # `dredge aws hunt x` while still accepting the legacy `aws-hunt-x` form.
+    # subparsers action: each `subparsers.command("aws", "hunt", "x", ...)` below
+    # registers `dredge aws hunt x` in the provider → bucket → command tree.
     subparsers = _NestedRegistrar(parser)
 
     # --- AWS response subcommands ---
@@ -1778,7 +1858,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--ip",
         action="append",
         required=True,
-        help="IP address or CIDR to search for (repeatable, e.g. --ip 1.2.3.4 --ip 10.0.0.0/8)",
+        help="IP address or CIDR to search for. Comma-separated and/or repeatable: "
+        "--ip 1.2.3.4,10.0.0.0/8 or --ip 1.2.3.4 --ip 10.0.0.0/8.",
     )
     p.add_argument(
         "--direction",
@@ -1861,10 +1942,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-events",
         type=int,
         default=500,
-        help="Maximum number of events to return. Pass 0 for unlimited — keeps "
-        "paginating until CloudTrail has no more matching events for the time range.",
+        help="Maximum number of events to return (per region when fanning out). "
+        "Pass 0 for unlimited — keeps paginating until CloudTrail has no more "
+        "matching events for the time range.",
     )
-    p.set_defaults(func=handle_aws_hunt_cloudtrail)
+    p.add_argument(
+        "--all-regions",
+        action="store_true",
+        dest="all_regions",
+        help="Query every region enabled for the account concurrently (LookupEvents "
+        "is a regional API). The global --region still sets the base session region.",
+    )
+    p.add_argument(
+        "--regions",
+        action="append",
+        default=None,
+        help="Query these specific regions concurrently. Comma-separated and/or "
+        "repeatable: --regions us-east-1,us-east-2 or --regions us-east-1 --regions "
+        "eu-west-1 (or a mix). The value 'all' means every enabled region. Distinct "
+        "from the global --region, which sets the base session region.",
+    )
+    p.add_argument(
+        "--max-workers",
+        type=int,
+        default=12,
+        dest="max_workers",
+        help="Max regions queried concurrently when --all-regions/--regions is used",
+    )
     p.add_argument(
         "--output",
         choices=["json", "csv"],
@@ -1890,7 +1994,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--user",
         action="append",
         default=[],
-        help="Username to hunt (repeatable, e.g. --user alice --user bob)",
+        help="Username to hunt. Comma-separated and/or repeatable: --user alice,bob "
+        "or --user alice --user bob.",
     )
     p.add_argument(
         "--users-file",
@@ -1909,7 +2014,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--source-ip",
         default=None,
-        help="Source IP address, applied client-side per user (see aws-hunt-cloudtrail).",
+        help="Source IP address, applied client-side per user (see 'aws hunt cloudtrail').",
     )
     p.add_argument("--start-time", default=None, help="Start time (ISO 8601)")
     p.add_argument("--end-time", default=None, help="End time (ISO 8601)")
@@ -1946,8 +2051,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--allowed-ip",
         action="append",
         default=[],
-        help="IP or CIDR the user is expected to operate from (repeatable, e.g. "
-        "--allowed-ip 1.2.3.4 --allowed-ip 10.0.0.0/8)",
+        help="IP or CIDR the user is expected to operate from. Comma-separated "
+        "and/or repeatable: --allowed-ip 10.0.0.0/8,1.2.3.4 or --allowed-ip "
+        "10.0.0.0/8 --allowed-ip 1.2.3.4.",
     )
     p.add_argument(
         "--allowed-ips-file",
@@ -1969,6 +2075,59 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--week-ago", type=int, help="Return events from N weeks ago until now")
     p.add_argument("--month-ago", type=int, help="Return events from N months ago until now")
     p.set_defaults(func=handle_aws_hunt_user_activity_by_ip)
+
+    # --- AWS security review (posture) ---
+    #
+    # `aws review full` runs headline (tier-1) checks across every service +
+    # organization controls (--deep for tier-2 too). `aws review <service>`
+    # runs one service, including its deeper tier-2 checks.
+
+    def _add_review_common(pp, *, incident=True, ip=True):
+        pp.add_argument("--csv", default=None, help="Write findings to this CSV file")
+        pp.add_argument("--html", default=None, help="Write a self-contained HTML report to this file")
+        pp.add_argument("--include", action="append", default=None,
+                        help="Only run these check ids (comma-separated and/or repeatable)")
+        pp.add_argument("--exclude", action="append", default=None,
+                        help="Skip these check ids (comma-separated and/or repeatable)")
+        pp.add_argument("--all-regions", action="store_true", dest="all_regions",
+                        help="Fan out the regional checks (EC2/RDS/Lambda/ECS/org) across every "
+                        "enabled region concurrently. Global checks (IAM/S3) still run once.")
+        pp.add_argument("--regions", action="append", default=None,
+                        help="Fan out regional checks across these regions (comma-separated and/or "
+                        "repeatable; 'all' means every enabled region).")
+        pp.add_argument("--max-workers", type=int, default=12, dest="max_workers",
+                        help="Concurrency for the multi-region fan-out")
+        pp.add_argument("--output", choices=["json", "csv"], default="json",
+                        help="stdout format for the summary (--csv/--html files are separate)")
+        if incident:
+            pp.add_argument("--incident-start", default=None,
+                            help="Incident start (ISO 8601). Enables the 'resources created since' check.")
+        if ip:
+            pp.add_argument("--ip", action="append", default=None,
+                            help="IP/CIDR to flag security groups referencing it (comma-separated "
+                            "and/or repeatable). Enables the ec2-sg-references-ip check.")
+
+    p = subparsers.command("aws", "review", "full",
+        help="Full security review across every service + org controls (tier-1; add --deep for tier-2)")
+    p.add_argument("--deep", action="store_true",
+                   help="Include tier-2 (deeper) checks in the full review")
+    _add_review_common(p)
+    p.set_defaults(func=handle_aws_review, review_service="full")
+
+    _REVIEW_SERVICE_HELP = {
+        "iam": "Review IAM (admins, console-without-MFA, weak role trust, stale access keys)",
+        "ec2": "Review EC2/network (world-open critical ports, public snapshots, IMDSv1, SGs referencing an IP)",
+        "s3": "Review S3 (public buckets, default encryption)",
+        "rds": "Review RDS (public instances, storage encryption)",
+        "lambda": "Review Lambda (public function URLs)",
+        "ecs": "Review ECS (services with ECS Exec / execute-command enabled)",
+        "org": "Review org/account controls (GuardDuty, CloudTrail, VPC flow logs, Security Hub, Access Analyzer)",
+        "recent": "Review resources created since --incident-start (IAM users/roles, Lambda, S3)",
+    }
+    for _svc, _help in _REVIEW_SERVICE_HELP.items():
+        p = subparsers.command("aws", "review", _svc, help=_help)
+        _add_review_common(p, ip=(_svc == "ec2"))
+        p.set_defaults(func=handle_aws_review, review_service=_svc)
 
     # --- GitHub hunt ---
 
