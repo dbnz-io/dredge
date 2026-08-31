@@ -34,6 +34,11 @@ class GitHubIRConfig:
     # Default audit-log include flag ("web", "git", or "all")
     include: str = "web"
 
+    # When True, response (mutating) actions skip the actual GitHub API call
+    # and return success with details["dry_run"] = True. Usually set globally
+    # via DredgeConfig(dry_run=True), which Dredge propagates here.
+    dry_run: bool = False
+
     def __post_init__(self) -> None:
         if bool(self.org) == bool(self.enterprise):
             raise ValueError("GitHubIRConfig: set exactly one of 'org' or 'enterprise'")

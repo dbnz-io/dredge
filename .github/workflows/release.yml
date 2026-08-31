@@ -1,0 +1,126 @@
+name: Release
+
+# Cut a GitHub Release when a PR that bumps the version lands on main.
+#
+# Trigger is every push to main (i.e. every PR merge), but the heavy steps are
+# guarded on "no tag for the current pyproject version exists yet": a merge
+# that does NOT change project.version is a no-op, while a merge that bumps it
+# (e.g. 0.1.1 -> 0.1.2) builds the dists, generates a CycloneDX SBOM, and
+# publishes a release tagged v<version>. So: bump `version` in pyproject.toml
+# in your PR, and the release happens automatically once it merges.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # create the tag + release
+  id-token: write # PyPI Trusted Publishing (OIDC) -- no stored API token
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Ties the PyPI publish to a GitHub Environment named "pypi". Configure the
+    # PyPI *pending publisher* with this same environment name. You can also add
+    # required-reviewer protection to this environment to gate releases behind a
+    # manual approval.
+    environment: pypi
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0 # need tags to know whether this version was already released
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Resolve version from pyproject.toml
+        id: ver
+        run: |
+          v=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+
+      - name: Has this version already been released?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git rev-parse "refs/tags/${{ steps.ver.outputs.tag }}" >/dev/null 2>&1 \
+            || gh release view "${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ steps.ver.outputs.tag }} already exists — nothing to release."
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- everything below only runs when the version is new ----
+
+      - name: Install and test (release gate)
+        if: steps.check.outputs.release == 'true'
+        run: |
+          pip install -e ".[test]" bandit
+          pytest --cov=dredge --cov-fail-under=80 -q
+          bandit -r dredge -q
+
+      - name: Build sdist + wheel
+        if: steps.check.outputs.release == 'true'
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      - name: Validate distribution metadata (twine check)
+        if: steps.check.outputs.release == 'true'
+        run: python -m twine check dist/*
+
+      - name: Clean-install smoke test (wheel imports + console script runs)
+        if: steps.check.outputs.release == 'true'
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --upgrade pip
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/python -c "import dredge; from dredge import Dredge"
+          /tmp/smoke/bin/dredge --help >/dev/null
+
+      # Publish to PyPI BEFORE the GitHub Release: the Release step creates the
+      # tag that the top-of-job idempotency guard keys on, so keeping it last
+      # means a transient failure can be retried by re-running the workflow.
+      # skip-existing makes the PyPI upload itself idempotent on such a re-run
+      # (a version already on PyPI is immutable and cannot be re-uploaded).
+      # dist/ contains only the wheel + sdist here -- the SBOM is generated
+      # afterwards, into the repo root, so it is never sent to PyPI.
+      - name: Publish to PyPI (Trusted Publishing)
+        if: steps.check.outputs.release == 'true'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          skip-existing: true
+
+      - name: Generate CycloneDX SBOM (runtime dependency tree)
+        if: steps.check.outputs.release == 'true'
+        run: |
+          python -m pip install cyclonedx-bom
+          # Resolve dredge + its *runtime* deps into a clean venv so the SBOM
+          # reflects what an installed user gets, not the CI/test toolchain.
+          python -m venv /tmp/sbomenv
+          /tmp/sbomenv/bin/pip install --upgrade pip
+          /tmp/sbomenv/bin/pip install .
+          python -m cyclonedx_py environment \
+            --of JSON \
+            --pyproject pyproject.toml \
+            -o "dredge-ir-${{ steps.ver.outputs.version }}-sbom.cdx.json" \
+            /tmp/sbomenv/bin/python
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            --target "${{ github.sha }}" \
+            --title "dredge ${{ steps.ver.outputs.version }}" \
+            --generate-notes \
+            dist/* "dredge-ir-${{ steps.ver.outputs.version }}-sbom.cdx.json"

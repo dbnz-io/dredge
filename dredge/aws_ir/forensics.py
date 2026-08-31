@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import gzip
+import os
+import re
+from calendar import monthrange
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import botocore.exceptions
 
@@ -10,6 +16,12 @@ from .services import AwsServiceRegistry
 from .models import OperationResult
 
 _log = get_logger(__name__)
+
+# Sane bound on what counts as a "year" folder (vs. e.g. an account ID or
+# other numeric-looking path segment) when walking a log bucket's hierarchy
+# looking for dated .../YYYY/MM/DD/ folders.
+_YEAR_RE = re.compile(r"^(19|20)\d{2}$")
+_TWO_DIGIT_RE = re.compile(r"^\d{2}$")
 
 
 class AwsIRForensics:
@@ -729,4 +741,285 @@ class AwsIRForensics:
             _log.error(event("aws_ir_forensics", "capture_guardduty_finding_detail.error",
                              target=result.target, error=str(exc)))
 
+        return result
+
+    # --------------------
+    # S3: Flat log download
+    # --------------------
+
+    @staticmethod
+    def _list_common_prefixes(s3, bucket: str, prefix: str) -> List[str]:
+        """One level of a Delimiter='/' listing: the "subfolders" directly
+        under `prefix`, as full prefix strings (each ending in '/')."""
+        prefixes: List[str] = []
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+            for cp in page.get("CommonPrefixes", []):
+                prefixes.append(cp["Prefix"])
+        return prefixes
+
+    def _discover_date_prefixes(
+        self,
+        s3,
+        bucket: str,
+        root_prefix: str,
+        start_date: date,
+        end_date: date,
+        max_workers: int,
+    ) -> List[str]:
+        """
+        Walk the bucket's folder hierarchy under root_prefix looking for
+        CloudTrail/Config-style dated folders (.../YYYY/MM/DD/) and return
+        only the leaf prefixes whose date falls within [start_date, end_date].
+
+        Every non-date folder (org-id/account-id/region/log-type, however
+        many levels deep) is walked unconditionally -- there's no generic
+        way to know where the tree bottoms out otherwise. Once a folder
+        name matches a 4-digit year, pruning kicks in: only years in range
+        are descended into, then only months in range for boundary years,
+        then only days in range for boundary months. That keeps the number
+        of S3 list calls proportional to (accounts x regions x log-types),
+        not to years of accumulated log history -- each level of the walk
+        is also fanned out across max_workers threads, since e.g. the
+        account-id level alone can be hundreds of parallel listings wide in
+        an AWS Organization.
+        """
+        # frontier entries: (prefix, date_state); date_state is None (not
+        # yet inside a date path), ("year", y), or ("month", y, m).
+        frontier: List[Tuple[str, Any]] = [(root_prefix, None)]
+        leaves: List[str] = []
+
+        while frontier:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                children_lists = list(pool.map(
+                    lambda node: self._list_common_prefixes(s3, bucket, node[0]), frontier,
+                ))
+
+            next_frontier: List[Tuple[str, Any]] = []
+            for (node_prefix, date_state), children in zip(frontier, children_lists):
+                for child_prefix in children:
+                    name = child_prefix[len(node_prefix):].rstrip("/")
+
+                    if date_state is None:
+                        if _YEAR_RE.match(name):
+                            if start_date.year <= int(name) <= end_date.year:
+                                next_frontier.append((child_prefix, ("year", int(name))))
+                            # else: a year folder outside the window -- prune.
+                        else:
+                            next_frontier.append((child_prefix, None))
+                        continue
+
+                    if date_state[0] == "year":
+                        _, y = date_state
+                        if not (_TWO_DIGIT_RE.match(name) and 1 <= int(name) <= 12):
+                            continue
+                        m = int(name)
+                        month_start = date(y, m, 1)
+                        month_end = date(y, m, monthrange(y, m)[1])
+                        if month_end < start_date or month_start > end_date:
+                            continue
+                        next_frontier.append((child_prefix, ("month", y, m)))
+                        continue
+
+                    # date_state[0] == "month"
+                    _, y, m = date_state
+                    if not (_TWO_DIGIT_RE.match(name) and 1 <= int(name) <= 31):
+                        continue
+                    try:
+                        day_date = date(y, m, int(name))
+                    except ValueError:
+                        continue
+                    if start_date <= day_date <= end_date:
+                        leaves.append(child_prefix)
+
+            frontier = next_frontier
+
+        return sorted(leaves)
+
+    def download_s3_logs(
+        self,
+        bucket: str,
+        *,
+        prefix: Optional[str] = None,
+        destination: str,
+        suffixes: Sequence[str] = (".json", ".json.gz"),
+        decompress_gzip: bool = True,
+        max_objects: Optional[int] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        days_ago: Optional[int] = None,
+        max_workers: int = 8,
+    ) -> OperationResult:
+        """
+        Download log objects from an S3 bucket/prefix into a single flat local
+        directory, instead of mirroring the bucket's key structure the way
+        `aws s3 cp --recursive` does.
+
+        Each file is named after its full S3 key with "/" replaced by "_", so
+        objects from different "folders" (e.g. different regions/dates in a
+        CloudTrail bucket) never collide. ".gz" objects are gunzipped by
+        default so the local files are plain JSON.
+
+        Date filtering (start_time/end_time/days_ago):
+            For an organization/Control Tower CloudTrail bucket, keys are
+            laid out as
+            ``[<prefix>/][o-xxxxxxxxxx/]<account-id>/CloudTrail/<region>/<year>/<month>/<day>/*``
+            -- listing the whole bucket (or running one download per region)
+            to pull the last couple of days across every account doesn't
+            scale. Passing start_time (or days_ago, a shortcut for "N days
+            ago until now") switches to a two-phase approach instead:
+              1. Walk the folder hierarchy under `prefix` with Delimiter="/"
+                 (cheap -- no object bodies) to discover every account/
+                 region/log-type folder, pruning branches by year/month/day
+                 as soon as a dated folder is reached, so years of unrelated
+                 history are never listed no matter how many accounts or
+                 regions exist.
+              2. Only the day folders inside [start_time, end_time] get a
+                 real object listing + download.
+            end_time defaults to now when start_time/days_ago is given.
+            `prefix` should point at or above the account-id level for this
+            to work -- if it already points inside a dated folder, use the
+            plain (non-date-filtered) form instead.
+
+        Args:
+            bucket: S3 bucket name.
+            prefix: Only download keys under this prefix.
+            destination: Local directory to write files into (created if missing).
+            suffixes: Only download keys ending in one of these (case-insensitive).
+                Pass an empty sequence to download every object under the prefix.
+            decompress_gzip: Gunzip ".gz" objects and drop the ".gz" suffix locally.
+            max_objects: Stop after downloading this many objects.
+            start_time: Only consider log objects dated on/after this day
+                (see "Date filtering" above). Mutually exclusive with days_ago.
+            end_time: Only consider log objects dated on/before this day.
+                Defaults to now when start_time/days_ago is given.
+            days_ago: Shortcut for start_time = now - timedelta(days=days_ago).
+            max_workers: Concurrency for the folder-discovery phase when date
+                filtering is active (ignored otherwise).
+
+        Raises:
+            ValueError: Both start_time and days_ago are given.
+
+        Returns:
+            OperationResult with:
+              - details["downloaded"]: count of files written
+              - details["local_files"]: list of local file paths written
+              - details["skipped"]: count of keys that didn't match `suffixes`
+              - details["failed"]: {key: error} for objects that failed to download
+              - details["scanned_prefixes"]: leaf date prefixes that were
+                listed (date-filtered calls only)
+        """
+        if start_time is not None and days_ago is not None:
+            raise ValueError("start_time and days_ago are mutually exclusive")
+
+        if days_ago is not None:
+            start_time = datetime.now(timezone.utc) - timedelta(days=days_ago)
+
+        date_filtered = start_time is not None
+        if date_filtered and end_time is None:
+            end_time = datetime.now(timezone.utc)
+
+        target = f"bucket={bucket}" + (f",prefix={prefix}" if prefix else "")
+        if date_filtered:
+            target += f",start_time={start_time.isoformat()},end_time={end_time.isoformat()}"
+        result = OperationResult(operation="download_s3_logs", target=target, success=True)
+
+        os.makedirs(destination, exist_ok=True)
+
+        s3 = self._services.s3
+        lower_suffixes = tuple(s.lower() for s in suffixes)
+
+        local_files: List[str] = []
+        failed: Dict[str, str] = {}
+        seen_names: Dict[str, int] = {}
+        skipped_holder = [0]
+
+        def _dedupe(name: str) -> str:
+            if name not in seen_names:
+                seen_names[name] = 0
+                return name
+            seen_names[name] += 1
+            if "." in name:
+                stem, ext = name.rsplit(".", 1)
+                return f"{stem}__{seen_names[name]}.{ext}"
+            return f"{name}__{seen_names[name]}"
+
+        def _download_matching_under_prefix(list_prefix: Optional[str]) -> bool:
+            """Downloads matching objects under one prefix (Contents listing,
+            no delimiter). Returns True once max_objects has been reached."""
+            list_kwargs: Dict[str, Any] = {"Bucket": bucket}
+            if list_prefix:
+                list_kwargs["Prefix"] = list_prefix
+
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(**list_kwargs):
+                for obj in page.get("Contents", []):
+                    if max_objects is not None and len(local_files) >= max_objects:
+                        return True
+
+                    key = obj["Key"]
+                    if key.endswith("/"):
+                        continue
+                    if lower_suffixes and not key.lower().endswith(lower_suffixes):
+                        skipped_holder[0] += 1
+                        continue
+
+                    try:
+                        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                    except botocore.exceptions.ClientError as exc:
+                        failed[key] = str(exc)
+                        _log.warning(event("aws_ir_forensics", "download_s3_logs.object_error",
+                                            target=result.target, key=key, error=str(exc)))
+                        continue
+
+                    local_name = key.replace("/", "_")
+                    if decompress_gzip and local_name.lower().endswith(".gz"):
+                        try:
+                            body = gzip.decompress(body)
+                            local_name = local_name[: -len(".gz")]
+                        except OSError as exc:
+                            failed[key] = f"gzip decompress failed: {exc}"
+                            continue
+
+                    local_name = _dedupe(local_name)
+                    local_path = os.path.join(destination, local_name)
+                    with open(local_path, "wb") as fh:
+                        fh.write(body)
+                    local_files.append(local_path)
+
+                if max_objects is not None and len(local_files) >= max_objects:
+                    return True
+            return False
+
+        try:
+            if date_filtered:
+                root_prefix = prefix or ""
+                if root_prefix and not root_prefix.endswith("/"):
+                    root_prefix += "/"
+                leaf_prefixes = self._discover_date_prefixes(
+                    s3, bucket, root_prefix, start_time.date(), end_time.date(), max_workers,
+                )
+                result.details["scanned_prefixes"] = leaf_prefixes
+                for leaf_prefix in leaf_prefixes:
+                    if _download_matching_under_prefix(leaf_prefix):
+                        break
+            else:
+                _download_matching_under_prefix(prefix)
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(f"Failed to list objects in s3://{bucket}: {exc}")
+            _log.error(event("aws_ir_forensics", "download_s3_logs.list_error",
+                             target=result.target, error=str(exc)))
+            return result
+
+        skipped = skipped_holder[0]
+        result.details["destination"] = destination
+        result.details["downloaded"] = len(local_files)
+        result.details["local_files"] = local_files
+        result.details["skipped"] = skipped
+        if failed:
+            result.details["failed"] = failed
+            result.add_error(f"Failed to download {len(failed)} object(s)")
+
+        _log.info(event("aws_ir_forensics", "download_s3_logs.complete", target=result.target,
+                        downloaded=len(local_files), skipped=skipped, failed=len(failed)))
         return result
