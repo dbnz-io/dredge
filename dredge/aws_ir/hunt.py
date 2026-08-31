@@ -389,8 +389,61 @@ class AwsIRHunt:
 
         _log.debug(event("aws_ir_hunt", "lookup_events.start", target=result.target, max_events=max_events))
 
-        cloudtrail = self._services.cloudtrail
+        events, total_api_calls, next_token, lookup_attributes, error = self._paginate_lookup_events(
+            self._services.cloudtrail,
+            user_name=user_name,
+            access_key_id=access_key_id,
+            event_name=event_name,
+            source_ip=source_ip,
+            start_time=start_time,
+            end_time=end_time,
+            max_events=max_events,
+            page_size=page_size,
+            throttle_max_retries=throttle_max_retries,
+            throttle_base_delay=throttle_base_delay,
+        )
+        if error:
+            result.add_error(f"Failed to lookup CloudTrail events: {error}")
+            _log.error(event("aws_ir_hunt", "lookup_events.api_error", target=result.target, error=error))
 
+        result.details["events"] = events
+        result.details["statistics"] = {
+            "total_events_returned": len(events),
+            "api_calls": total_api_calls,
+            "lookup_attributes": lookup_attributes,
+            "truncated": max_events is not None and bool(next_token) and len(events) >= max_events,
+            "time_range": {
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+            },
+        }
+
+        _log.info(event("aws_ir_hunt", "lookup_events.complete", target=result.target, total_events=len(events), api_calls=total_api_calls))
+
+        return result
+
+    def _paginate_lookup_events(
+        self,
+        cloudtrail,
+        *,
+        user_name: Optional[str],
+        access_key_id: Optional[str],
+        event_name: Optional[str],
+        source_ip: Optional[str],
+        start_time: datetime,
+        end_time: datetime,
+        max_events: Optional[int],
+        page_size: int,
+        throttle_max_retries: int,
+        throttle_base_delay: float,
+    ) -> Tuple[List[Dict[str, Any]], int, Optional[str], List[Dict[str, str]], Optional[str]]:
+        """Paginate LookupEvents on one CloudTrail client (one region).
+
+        Shared by lookup_events (single region) and lookup_events_multi_region.
+        Returns (events, api_calls, next_token, lookup_attributes, error) —
+        `error` is a message string if an API call failed (any events gathered
+        before the failure are still returned), else None.
+        """
         lookup_attributes = self._build_lookup_attributes(
             user_name=user_name,
             access_key_id=access_key_id,
@@ -410,7 +463,6 @@ class AwsIRHunt:
         total_api_calls = 0
         next_token: Optional[str] = None
 
-        # Main pagination loop
         while True:
             if max_events is not None and len(events) >= max_events:
                 break
@@ -434,9 +486,7 @@ class AwsIRHunt:
                 )
                 total_api_calls += 1
             except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
-                result.add_error(f"Failed to lookup CloudTrail events: {exc}")
-                _log.error(event("aws_ir_hunt", "lookup_events.api_error", target=result.target, error=str(exc)))
-                break
+                return events, total_api_calls, next_token, lookup_attributes, str(exc)
 
             raw_events = resp.get("Events", [])
             for raw_event in raw_events:
@@ -467,19 +517,135 @@ class AwsIRHunt:
             if not next_token:
                 break
 
-        result.details["events"] = events
+        return events, total_api_calls, next_token, lookup_attributes, None
+
+    def lookup_events_multi_region(
+        self,
+        *,
+        regions=None,
+        user_name: Optional[str] = None,
+        access_key_id: Optional[str] = None,
+        event_name: Optional[str] = None,
+        source_ip: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        max_events_per_region: Optional[int] = 500,
+        page_size: int = 50,
+        throttle_max_retries: int = 5,
+        throttle_base_delay: float = 0.5,
+        allow_full_scan: bool = False,
+        max_workers: int = 12,
+    ) -> OperationResult:
+        """
+        Run LookupEvents concurrently across multiple regions.
+
+        CloudTrail LookupEvents is a regional API — each region's endpoint only
+        returns events recorded in that region. This fans out one paginated
+        lookup per region across a thread pool (so every regional endpoint is
+        queried at the same time) and merges the results into one time-sorted
+        list. Every normalized event already carries its `aws_region`, and the
+        per-region breakdown (counts, errors) is in details["by_region"].
+
+        Args:
+            regions: list of region names, or the string "all" (default) to
+                query every region enabled for the account (resolved via EC2
+                DescribeRegions, falling back to botocore's static list).
+            user_name/access_key_id/event_name/source_ip/start_time/end_time/
+                page_size/throttle_*/allow_full_scan: same as lookup_events,
+                applied identically in every region.
+            max_events_per_region: cap applied per region (not overall).
+            max_workers: max regions queried concurrently.
+
+        Returns:
+            OperationResult with:
+              - details["events"]: merged, time-sorted events across regions
+              - details["by_region"]: {region: {count, api_calls, truncated,
+                error?}}
+              - details["statistics"]: regions_queried/succeeded/failed, totals
+        """
+        if source_ip and not any([user_name, access_key_id, event_name]) and not allow_full_scan:
+            raise ValueError(
+                "source_ip cannot be the sole filter for CloudTrail lookup_events. "
+                "Provide at least one of user_name/access_key_id/event_name, or pass "
+                "allow_full_scan=True to opt into a full client-side scan per region."
+            )
+
+        if regions is None or regions == "all":
+            regions = self._services.resolve_enabled_regions()
+        regions = list(dict.fromkeys(regions))  # dedupe, preserve order
+        if not regions:
+            raise ValueError("no regions to query")
+
+        if max_events_per_region is not None and max_events_per_region <= 0:
+            max_events_per_region = None
+
+        now = datetime.now(timezone.utc)
+        if start_time is None:
+            start_time = now - timedelta(hours=24)
+        if end_time is None:
+            end_time = now
+
+        result = OperationResult(
+            operation="lookup_events_multi_region",
+            target=self._build_target_string(
+                user_name=user_name,
+                access_key_id=access_key_id,
+                event_name=event_name,
+                source_ip=source_ip,
+                start_time=start_time,
+                end_time=end_time,
+            ) + f",regions={len(regions)}",
+            success=True,
+        )
+
+        def _hunt_region(region: str):
+            events, api_calls, next_token, _attrs, error = self._paginate_lookup_events(
+                self._services.cloudtrail_for_region(region),
+                user_name=user_name,
+                access_key_id=access_key_id,
+                event_name=event_name,
+                source_ip=source_ip,
+                start_time=start_time,
+                end_time=end_time,
+                max_events=max_events_per_region,
+                page_size=page_size,
+                throttle_max_retries=throttle_max_retries,
+                throttle_base_delay=throttle_base_delay,
+            )
+            truncated = max_events_per_region is not None and bool(next_token) and len(events) >= max_events_per_region
+            return region, events, api_calls, truncated, error
+
+        all_events: List[Dict[str, Any]] = []
+        by_region: Dict[str, Dict[str, Any]] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for region, events, api_calls, truncated, error in pool.map(_hunt_region, regions):
+                by_region[region] = {
+                    "count": len(events),
+                    "api_calls": api_calls,
+                    "truncated": truncated,
+                }
+                if error:
+                    by_region[region]["error"] = error
+                    result.add_error(f"{region}: {error}")
+                all_events.extend(events)
+
+        all_events.sort(key=lambda e: e.get("event_time") or "")
+
+        result.details["events"] = all_events
+        result.details["by_region"] = by_region
         result.details["statistics"] = {
-            "total_events_returned": len(events),
-            "api_calls": total_api_calls,
-            "lookup_attributes": lookup_attributes,
-            "truncated": max_events is not None and bool(next_token) and len(events) >= max_events,
-            "time_range": {
-                "start_time": start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-            },
+            "regions_queried": len(regions),
+            "regions_succeeded": sum(1 for r in by_region.values() if "error" not in r),
+            "regions_failed": sum(1 for r in by_region.values() if "error" in r),
+            "total_events": len(all_events),
+            "time_range": {"start_time": start_time.isoformat(), "end_time": end_time.isoformat()},
         }
 
-        _log.info(event("aws_ir_hunt", "lookup_events.complete", target=result.target, total_events=len(events), api_calls=total_api_calls))
+        _log.info(event(
+            "aws_ir_hunt", "lookup_events_multi_region.complete", target=result.target,
+            regions=len(regions), total_events=len(all_events),
+        ))
 
         return result
 

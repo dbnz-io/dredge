@@ -379,6 +379,83 @@ def _make_finding(finding_id="f-001", severity=5.0, ftype="UnauthorizedAccess:EC
     }
 
 
+class TestLookupEventsMultiRegion:
+    def _regional_services(self, events_by_region):
+        services = make_services()
+        clients = {}
+        for region, evs in events_by_region.items():
+            c = MagicMock()
+            c.lookup_events.return_value = {"Events": evs, "NextToken": None}
+            clients[region] = c
+        services.cloudtrail_for_region.side_effect = lambda r: clients[r]
+        services.resolve_enabled_regions.return_value = sorted(events_by_region)
+        return services
+
+    def test_all_regions_resolves_and_merges_time_sorted(self):
+        e_new = make_event(username="newer"); e_new["EventTime"] = datetime(2024, 6, 1, tzinfo=timezone.utc)
+        e_old = make_event(username="older"); e_old["EventTime"] = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        services = self._regional_services({"us-east-1": [e_new], "eu-west-1": [e_old]})
+
+        res = AwsIRHunt(services, DredgeConfig()).lookup_events_multi_region(user_name="x")
+
+        assert res.success is True
+        services.resolve_enabled_regions.assert_called_once()
+        assert res.details["statistics"]["regions_queried"] == 2
+        assert res.details["statistics"]["total_events"] == 2
+        # merged across regions and sorted by event_time ascending
+        assert [e["username"] for e in res.details["events"]] == ["older", "newer"]
+        assert set(res.details["by_region"]) == {"us-east-1", "eu-west-1"}
+
+    def test_explicit_region_list_does_not_resolve_all(self):
+        services = self._regional_services(
+            {"us-east-1": [make_event()], "eu-west-1": [make_event()], "ap-south-1": [make_event()]}
+        )
+        res = AwsIRHunt(services, DredgeConfig()).lookup_events_multi_region(
+            regions=["us-east-1", "eu-west-1"], user_name="x",
+        )
+        assert res.details["statistics"]["regions_queried"] == 2
+        services.resolve_enabled_regions.assert_not_called()
+
+    def test_per_region_error_recorded_others_still_return(self):
+        c_good = MagicMock(); c_good.lookup_events.return_value = {"Events": [make_event()], "NextToken": None}
+        c_bad = MagicMock(); c_bad.lookup_events.side_effect = make_client_error()
+        services = make_services()
+        services.cloudtrail_for_region.side_effect = lambda r: {"us-east-1": c_good, "bad-1": c_bad}[r]
+
+        res = AwsIRHunt(services, DredgeConfig()).lookup_events_multi_region(
+            regions=["us-east-1", "bad-1"], user_name="x",
+        )
+
+        assert res.success is False
+        assert "error" in res.details["by_region"]["bad-1"]
+        assert "error" not in res.details["by_region"]["us-east-1"]
+        assert res.details["statistics"]["regions_failed"] == 1
+        assert res.details["statistics"]["regions_succeeded"] == 1
+        # the healthy region's event is still returned
+        assert len(res.details["events"]) == 1
+
+    def test_regions_are_deduped(self):
+        c = MagicMock(); c.lookup_events.return_value = {"Events": [], "NextToken": None}
+        services = make_services()
+        services.cloudtrail_for_region.side_effect = lambda r: c
+        res = AwsIRHunt(services, DredgeConfig()).lookup_events_multi_region(
+            regions=["us-east-1", "us-east-1"], user_name="x",
+        )
+        assert res.details["statistics"]["regions_queried"] == 1
+
+    def test_source_ip_sole_filter_raises(self):
+        with pytest.raises(ValueError):
+            AwsIRHunt(make_services(), DredgeConfig()).lookup_events_multi_region(
+                regions=["us-east-1"], source_ip="1.2.3.4",
+            )
+
+    def test_no_enabled_regions_raises(self):
+        services = make_services()
+        services.resolve_enabled_regions.return_value = []
+        with pytest.raises(ValueError):
+            AwsIRHunt(services, DredgeConfig()).lookup_events_multi_region(regions="all", user_name="x")
+
+
 class TestHuntCloudtrailMultiUser:
     def test_per_user_mode_groups_results_by_user_without_merging(self):
         cloudtrail = MagicMock()

@@ -1,14 +1,14 @@
 <div align="center">
  <p>
   <h1>
-    Dredge - 1.0.0
+    Dredge - 1.1.0
   </h1>
  </p>
 </div>
 
 <div align="center">
 
-![CI](https://github.com/dbnz-io/dredge/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/dbnz-io/dredge/actions/workflows/release.yml/badge.svg)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 ![Coverage](https://img.shields.io/badge/coverage-%E2%89%A580%25-brightgreen)
 
@@ -16,526 +16,221 @@
 
 <div align="center">
   <h3>
-   ⚡ Log collection, analysis, and rapid response in the cloud... pa' la hinchada⚡
+   ⚡ Cloud log collection, threat hunting, and rapid response... pa' la hinchada ⚡
   </h3>
 </div>
 
 ---
 
-### TL;DR
+Dredge is a cloud incident-response and threat-hunting toolkit — a Python library
+**and** a CLI — for **AWS, Kubernetes, GitHub, and GCP**. It's built for moving
+fast when you don't have all the plumbing ready at 3AM: collect logs, hunt
+through them, and contain — from one tool.
 
-- Python library + CLI for cloud incident response and threat hunting.
-- **AWS**: containment, forensics, and hunting across IAM, EC2, RDS, ECS, S3, Lambda, KMS, GuardDuty, Security Hub, CloudTrail, and more.
-- **Kubernetes**: containment, forensics, and hunting across RBAC, pods, nodes, NetworkPolicy, and Secrets — works against any cluster (EKS, GKE, AKS, or self-managed) via standard kubeconfig or service-account auth.
-- **GitHub**: org/enterprise audit log hunting **and** containment (block/remove members, revoke deploy keys, delete webhooks, archive/lock down repos).
-- **GCP**: Cloud Logging hunting (in progress).
-- 1,100+ tests, ~98% coverage, 80% floor enforced in CI.
+> ⭐ **Hunt CloudTrail across every AWS region at once.** `LookupEvents` is a
+> regional API, so a normal search only sees one region. Dredge fans out to all
+> your enabled regions **concurrently** and merges the results into one
+> time-sorted timeline — one command, no scripting, no per-region loops.
+> [Jump to it ↓](#hunt-cloudtrail-across-every-region-at-once)
 
----
+- **AWS** — a **security review** (per-service + org-wide posture, CSV + HTML),
+  hunt (CloudTrail live + offline **+ all-region fan-out**, GuardDuty, Security
+  Hub, Config…), containment (IAM, EC2, RDS, ECS, S3, Lambda, KMS…), forensics
+  (S3 log collection, snapshots, flow logs).
+- **Kubernetes** — hunt, containment (RBAC, pods, nodes, NetworkPolicy), and
+  forensics against any cluster (EKS/GKE/AKS/self-managed).
+- **GitHub** — org/enterprise audit-log hunting **and** containment.
+- **GCP** — Cloud Logging hunting (in progress).
 
-<div align="justify">
-<p>
-Dredge is designed for rapid cloud IR — especially when you don't have all the plumbing ready at 3AM. It exposes a clean, composable Python API you can import into your own tooling and a CLI for direct use from the terminal.
-</p>
-</div>
-
----
-
-## Current Features
-
-### Response (AWS) — Containment
-
-| Action | Method |
-|---|---|
-| Disable / delete IAM access key | `response.disable_access_key` / `delete_access_key` |
-| Disable / delete IAM user | `response.disable_user` / `delete_user` |
-| Disable IAM role (detach policies, clear trust) | `response.disable_role` |
-| Delete MFA devices for a user | `response.delete_mfa_devices` |
-| Revoke active IAM sessions (deny policy) | `response.revoke_active_sessions` |
-| Detach a single managed policy from user/role | `response.detach_iam_policy` |
-| Block S3 public access (account-level) | `response.block_s3_public_access` |
-| Block S3 public access (bucket-level) | `response.block_s3_bucket_public_access` |
-| Block S3 object public access | `response.block_s3_object_public_access` |
-| Quarantine S3 bucket (block public + deny-all external) | `response.quarantine_s3_bucket` |
-| Network-isolate EC2 instances (forensic SG) | `response.isolate_ec2_instances` |
-| Stop EC2 instances | `response.stop_ec2_instances` |
-| Terminate EC2 instances (optional EBS snapshot) | `response.terminate_ec2_instances` |
-| Block CIDRs via NACL deny rules | `response.block_nacl_cidrs` |
-| Revoke specific security group rules | `response.deauthorize_security_group_rules` |
-| Isolate RDS instance (empty SG, disable public access) | `response.isolate_rds_instance` |
-| Scale ECS service to 0 | `response.stop_ecs_service` |
-| Force-stop ECS task | `response.stop_ecs_task` |
-| Schedule Secrets Manager secret for deletion | `response.disable_secrets_manager_secret` |
-| Disable EventBridge rule | `response.disable_eventbridge_rule` |
-| Terminate active SSM sessions on an instance | `response.terminate_ssm_sessions` |
-| Throttle Lambda function to zero concurrency | `response.disable_lambda_function` |
-| Disable KMS key | `response.disable_kms_key` |
-| Schedule KMS key deletion | `response.schedule_kms_key_deletion` |
-| Tag AWS resources by ARN | `response.tag_resources` |
-
-### Forensics (AWS)
-
-| Action | Method |
-|---|---|
-| Snapshot EBS volume | `forensics.get_ebs_snapshot` |
-| Snapshot all volumes on an EC2 instance | `forensics.snapshot_instance_volumes` |
-| Capture Lambda environment variables | `forensics.get_lambda_environment` |
-| Enable VPC flow logs (CloudWatch or S3) | `forensics.enable_vpc_flow_logs` |
-| Retrieve completed SSM session history | `forensics.capture_ssm_session_history` |
-| Check CloudTrail trail status and event selectors | `forensics.get_cloudtrail_status` |
-
-### Hunt / Detection (AWS)
-
-| Action | Method |
-|---|---|
-| CloudTrail LookupEvents (user, key, event, IP) | `hunt.lookup_events` |
-| GuardDuty findings (severity, type, time filters) | `hunt.list_guardduty_findings` |
-| Security Hub findings (severity, workflow, product) | `hunt.hunt_security_hub_findings` |
-| IAM Access Analyzer findings | `hunt.hunt_access_analyzer_findings` |
-| AWS Config resource configuration history | `hunt.hunt_config_resource_history` |
-| CloudWatch Logs Insights query | `hunt.hunt_cloudwatch_logs` |
-| IAM credential report (all users, keys, MFA, last used) | `hunt.get_iam_credential_report` |
-
-### Hunt (GitHub)
-
-- Org or Enterprise audit log search by `actor`, `action`, `repo`, `source_ip`, time range.
-- Handles pagination and rate limiting.
-
-### Response (Kubernetes) — Containment
-
-| Action | Method |
-|---|---|
-| Delete a RoleBinding / ClusterRoleBinding | `response.revoke_role_binding` / `revoke_cluster_role_binding` |
-| Disable a ServiceAccount (delete tokens + bindings) | `response.disable_service_account` |
-| Fully delete a ServiceAccount | `response.delete_service_account` |
-| Force-delete a pod | `response.delete_pod` |
-| Scale a Deployment (e.g. to 0) | `response.scale_deployment` |
-| Cordon a node | `response.cordon_node` |
-| Cordon + evict all pods on a node | `response.drain_node` |
-| Remove a Node object from the cluster | `response.delete_node` |
-| Isolate a pod with a deny-all NetworkPolicy | `response.quarantine_pod` |
-| Isolate an entire namespace with a deny-all NetworkPolicy | `response.quarantine_namespace` |
-| Delete a Secret | `response.delete_secret` |
-| Apply labels to a pod/node/namespace/deployment | `response.label_resource` |
-
-### Forensics (Kubernetes)
-
-| Action | Method |
-|---|---|
-| Capture a pod's full manifest | `forensics.get_pod_manifest` |
-| Capture container logs | `forensics.get_pod_logs` |
-| Capture Events for a pod | `forensics.get_pod_events` |
-| Capture a node's full manifest | `forensics.describe_node` |
-| Capture a workload controller's manifest (Deployment/StatefulSet/DaemonSet) | `forensics.capture_workload_manifest` |
-| List pods scheduled to a node | `forensics.list_pods_on_node` |
-| Run a diagnostic command in a pod (best-effort) | `forensics.exec_pod_command` |
-
-### Hunt (Kubernetes)
-
-| Action | Method |
-|---|---|
-| Search Kubernetes Events (namespace, involved object, reason, time range) | `hunt.list_events` |
-| Find RoleBindings/ClusterRoleBindings referencing a subject | `hunt.list_role_bindings_for_subject` |
-| List pods running under a ServiceAccount | `hunt.list_pods_by_service_account` |
-| Flag pods with elevated host access (privileged, hostNetwork/PID/IPC) | `hunt.list_privileged_pods` |
-
-v1 hunting uses the built-in Kubernetes Events API only — flavor-agnostic, no audit-log plumbing required. Cloud-specific audit log retrieval (EKS → CloudWatch, GKE → Cloud Logging) is on the roadmap, composing with the existing `aws_ir`/`gcp_ir` hunt modules.
+📚 **Full documentation is in [`docs/`](docs/README.md).**
 
 ---
 
-## Installation
+## Install
 
 ```bash
 pip install dredge-ir
 ```
 
-The distribution is named **`dredge-ir`** (the bare `dredge` name is taken on
-PyPI by an unrelated package), but the import package and CLI are just
-`dredge` — `import dredge` and `dredge ...` work as shown throughout this
-README.
-
-Dependencies are declared entirely in `pyproject.toml` — there is no separate
-`requirements.txt`.
-
-From source (for development — adds the test toolchain, then run the suite):
-
-```bash
-git clone https://github.com/dbnz-io/dredge.git
-cd dredge
-pip install -e ".[test]"
-pytest -q
-```
+The distribution is `dredge-ir` (the bare `dredge` name is taken on PyPI); the
+command and import package are both `dredge`. Python 3.10+. See
+[docs/installation.md](docs/installation.md) for source and Docker.
 
 ---
 
-## CLI structure
+## Quickstart — collect AWS logs and hunt (60 seconds)
 
-Commands are nested by **provider → bucket → command**:
-
-```
-dredge <provider> <bucket> <command> [options]
-        │          │        │
-        │          │        └─ e.g. cloudtrail, quarantine-pod, audit
-        │          └────────── hunt · response · forensics
-        └───────────────────── aws · k8s · github
-```
-
-Help is available at every level, revealing what's below it:
+The fastest, lowest-risk way to get value: pull CloudTrail logs and hunt through
+them. All read-only.
 
 ```bash
-dredge --help              # global overview, grouped by provider × bucket
-dredge aws --help          # the buckets under aws (hunt/response/forensics)
-dredge aws hunt --help     # the commands under aws hunt
-dredge aws hunt cloudtrail --help   # that command's full options
-```
-
-Global flags (auth, region, `--dry-run`) go **before** the provider, e.g.
-`dredge --aws-profile ir --region us-east-1 aws response disable-user --user bob`.
-
----
-
-## Docker
-
-```bash
-docker build -t dredge:latest .
-# or
-podman build -t dredge:latest .
-```
-
----
-
-## AWS Integration
-
-### Authentication
-
-| Method | How |
-|---|---|
-| Default credential chain | env vars, `~/.aws/credentials`, EC2/ECS role |
-| Named profile | `--aws-profile` |
-| Explicit keys | `--aws-access-key-id` + `--aws-secret-access-key` |
-| Role assumption | `--aws-role-arn` (+ optional `--aws-external-id`) |
-
-**Region:** `--aws-region`, or `AWS_REGION` / `AWS_DEFAULT_REGION`, or your profile config.
-
-### Global AWS CLI Flags
-
-```
---aws-region         AWS region (e.g. us-east-1)
---aws-profile        Named AWS profile
---aws-access-key-id  Explicit access key ID
---aws-secret-access-key
---aws-session-token  STS session token
---aws-role-arn       Role to assume
---aws-external-id    External ID for role assumption
---dry-run            Simulate without making changes
-```
-
-### CLI Examples
-
-#### IAM Containment
-
-```bash
-# Disable an access key
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response disable-access-key --user compromised-user --access-key-id AKIA123456789
-
-# Disable a user (deactivate keys, remove groups, delete login profile, detach policies)
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response disable-user --user compromised-user
-
-# Revoke active sessions (deny-all inline policy with TokenIssueTime condition)
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response revoke-active-sessions --user compromised-user
-
-# Detach a single policy from a role
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response detach-iam-policy arn:aws:iam::123456789012:policy/AdminAccess --role-name OldRole
-```
-
-#### EC2 / Network Containment
-
-```bash
-# Network-isolate EC2 instances (forensic empty SG)
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response isolate-ec2 i-0123456789abcdef0 i-0abcdef1234567890
-
-# Block a CIDR at the NACL level
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response block-nacl-cidrs --vpc-id vpc-abc123 --cidr 198.51.100.0/24
-
-# Terminate an instance (snapshots EBS volumes first by default)
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response terminate-ec2 i-0123456789abcdef0
-```
-
-#### RDS / ECS / Lambda
-
-```bash
-# Isolate an RDS instance
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response isolate-rds my-prod-db
-
-# Scale down a compromised ECS service
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response stop-ecs-service my-cluster my-service
-
-# Throttle a Lambda to zero
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response disable-lambda --function-name my-function
-
-# Terminate active SSM sessions on an instance
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response terminate-ssm-sessions i-0123456789abcdef0
-```
-
-#### S3
-
-```bash
-# Block public access at account level
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response block-s3-account --account-id 111122223333
-
-# Quarantine a bucket (block public + deny all external principals)
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response quarantine-s3-bucket suspicious-bucket
-```
-
-#### Threat Hunting
-
-```bash
-# Hunt CloudTrail events for a compromised access key
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws hunt cloudtrail --access-key-id AKIAIOSFODNN7EXAMPLE \
-  --start-time 2026-04-01T00:00:00Z --end-time 2026-04-12T00:00:00Z
-
-# List high/critical GuardDuty findings
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws hunt guardduty --detector-id abc123 --severity-min 7.0
-
-# Query Security Hub for critical findings
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws hunt security-hub --severity-label CRITICAL --severity-label HIGH
-
-# Get IAM credential report (all users, key ages, MFA status)
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response iam-credential-report
-
-# Check AWS Config history for an EC2 instance
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws hunt config-history AWS::EC2::Instance i-0123456789abcdef0
-```
-
-#### Forensics
-
-```bash
-# Download the last 2 days of CloudTrail logs across every account/region
-# from an org/Control Tower S3 bucket (date-aware: only lists dated folders
-# inside the window, not years of history)
-dredge --aws-profile dredge-role --region us-east-1 \
+# 1. Collect — pull the last 2 days of CloudTrail across every account/region
+#    from an org / Control Tower S3 bucket. Date-aware: it only lists the dated
+#    folders inside the window, not years of history.
+dredge --aws-profile ir --region us-east-1 \
   aws forensics download-s3-logs \
   --bucket my-org-cloudtrail --prefix AWSLogs/ \
   --destination ./ct-logs --days-ago 2
 
-# Enable VPC flow logs
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response enable-vpc-flow-logs vpc-abc123 \
-  --deliver-logs-permission-arn arn:aws:iam::123:role/FlowLogsRole
+# 2. Hunt offline over what you just pulled — no more AWS calls.
+dredge aws hunt query-cloudtrail-logs \
+  --path ./ct-logs --access-key-id AKIAIOSFODNN7EXAMPLE \
+  --fields eventTime,eventName,sourceIPAddress,userIdentity.arn
 
-# Check CloudTrail is healthy and logging
-dredge --aws-profile dredge-role --region us-east-1 \
-  aws response cloudtrail-status
+# 3. Or hunt live via CloudTrail LookupEvents (last ~90 days).
+dredge --aws-profile ir --region us-east-1 \
+  aws hunt cloudtrail --user suspicious-user --week-ago 1
 ```
+
+Baseline-deviation hunts, built in:
+
+```bash
+# One identity, each event tagged by whether its source IP is in an allowlist.
+dredge --aws-profile ir --region us-east-1 \
+  aws hunt user-activity-by-ip --user deploy-bot \
+  --allowed-ip 10.0.0.0/8,203.0.113.10 --week-ago 1
+```
+
+👉 More: [Getting started](docs/getting-started.md) · [AWS CLI reference](docs/cli/aws.md)
 
 ---
 
-## GitHub Integration
+## Hunt CloudTrail across every region at once
 
-### Authentication
+⭐ **Dredge's killer feature.** CloudTrail `LookupEvents` is a **regional** API — each region's endpoint only
+returns the events recorded in that region. So the usual way to answer *"what did
+this access key do anywhere in my account?"* is to loop over ~30 regions by hand
+(or miss activity in the regions you forgot). Attackers know this, and operate in
+regions you don't watch.
 
-Token scopes required:
-- Org audit logs: `admin:org`, `audit_log`
-- Enterprise audit logs: `admin:enterprise`, `audit_log`
-
-**Prefer the environment variable.** Export `GITHUB_TOKEN` and let dredge read
-it — passing `--github-token <value>` puts the secret in your shell history and
-in the process list (`ps`), where other users on the host can see it. Use the
-`--github-token` flag only for ad-hoc, throwaway tokens.
+Dredge collapses that into one command. `--all-regions` queries **every enabled
+region concurrently** and merges everything into a single time-sorted timeline:
 
 ```bash
-export GITHUB_TOKEN="ghp_..."
+# Every enabled region, all queried in parallel, merged into one timeline
+dredge --aws-profile ir --region us-east-1 \
+  aws hunt cloudtrail --access-key-id AKIAIOSFODNN7EXAMPLE --all-regions
 ```
 
-### CLI Examples
-
-These read the token from `$GITHUB_TOKEN` (no `--github-token` flag needed):
+Or target a specific set of regions:
 
 ```bash
-# Hunt today's activity for a user
-dredge --github-org dbnz-io \
-  github hunt audit --actor sabastante --today --include all
-
-# Hunt an action over a date range
-dredge --github-enterprise dbnz-io \
-  github hunt audit --action repo.create \
-  --start-time 2025-01-01T00:00:00Z --end-time 2025-01-07T23:59:59Z
-
-# Hunt suspicious IP activity
-dredge --github-org dbnz-io \
-  github hunt audit --source-ip 203.0.113.50 --today --include all
+dredge --aws-profile ir --region us-east-1 \
+  aws hunt cloudtrail --user suspicious-user \
+  --regions us-east-1,eu-west-1,ap-southeast-2
 ```
+
+`--regions` is comma-separated and/or repeatable (`--regions us-east-1,us-east-2`,
+or `--regions us-east-1 --regions eu-west-1`, or any mix).
+
+What you get:
+
+- **Concurrent fan-out** — every regional endpoint is hit at the same time
+  (tune with `--max-workers`), not one after another.
+- **One merged, time-sorted timeline** — events from all regions in a single
+  ordered list; each event keeps its `aws_region`.
+- **Automatic region discovery** — `--all-regions` finds your *enabled* regions
+  via EC2 `DescribeRegions` (opted-in only), so it doesn't waste calls on
+  disabled ones.
+- **Per-region visibility, no all-or-nothing** — a `by_region` breakdown reports
+  each region's event count and any error, so a region you can't reach is noted
+  without failing the rest of the hunt.
+- **All the same filters** — `--access-key-id`, `--user`, `--event-name`,
+  `--source-ip`, and the time flags apply identically in every region;
+  `--max-events` becomes the per-region cap.
+
+From Python:
+
+```python
+res = d.aws_ir.hunt.lookup_events_multi_region(
+    access_key_id="AKIAIOSFODNN7EXAMPLE",
+    regions="all",                 # or ["us-east-1", "eu-west-1"]
+)
+res.details["events"]              # merged, time-sorted across regions
+res.details["by_region"]           # per-region counts + any errors
+```
+
+> The global `--region` sets the base session region; `--all-regions` /
+> `--regions` control the fan-out. Full details in
+> [AWS CLI reference](docs/cli/aws.md#across-multiple-regions-concurrent).
 
 ---
 
-## Kubernetes Integration
+## Command layout
 
-### Authentication
-
-Dredge authenticates to Kubernetes the same way `kubectl` does, plus a first-class path for direct service-account/bearer-token auth (for library callers and automation that don't have a kubeconfig file on disk).
-
-| Method | How |
-|---|---|
-| Kubeconfig ("auth like kubectl") | `--k8s-kubeconfig` (+ optional `--k8s-context`), or default `~/.kube/config` / `$KUBECONFIG`. Cloud-specific token exchange (`aws eks get-token`, `gke-gcloud-auth-plugin`, `kubelogin`) is resolved entirely by the kubeconfig's `exec` plugin — dredge never needs to know which cloud is behind the cluster. |
-| In-cluster | `--k8s-in-cluster` — uses the pod's mounted service-account token. |
-| Explicit service-account / bearer token | `--k8s-token` (or `--k8s-token-env-var`, default `K8S_TOKEN`) + `--k8s-api-server` (+ optional `--k8s-ca-cert`). In the library, `K8sAuthConfig.token_provider` accepts a callable that is re-invoked before **every** API call (no dredge-side caching) — useful for short-lived, auto-rotating tokens. |
-| Default | Tries in-cluster first, falls back to the default kubeconfig location. |
-
-**Region/cluster-flavor note:** response and forensics methods run against the standard Kubernetes API and behave identically on EKS, GKE, AKS, or self-managed clusters — only auth differs by flavor, and kubeconfig already abstracts that.
-
-### Global Kubernetes CLI Flags
-
-```
---k8s-kubeconfig               Path to kubeconfig file
---k8s-context                  Kubeconfig context to use
---k8s-in-cluster               Use the in-cluster (mounted) service account token
---k8s-token                    Explicit bearer/service-account token
---k8s-token-env-var            Env var to read the token from (default: K8S_TOKEN)
---k8s-api-server               API server URL (required with --k8s-token)
---k8s-ca-cert                  Path to CA cert file (used with --k8s-token)
---k8s-insecure-skip-tls-verify Disable TLS verification (used with --k8s-token)
---k8s-namespace                Default namespace for namespaced subcommands
---dry-run                      Simulate without making changes
-```
-
-### CLI Examples
+Commands are nested `provider → bucket → command`, with help at every level:
 
 ```bash
-# Quarantine a pod suspected of compromise
+dredge --help                      # everything, grouped by provider × bucket
+dredge aws hunt --help             # commands under aws hunt
+dredge aws hunt cloudtrail --help  # a command's options
+```
+
+Global flags (auth, region, `--dry-run`) go **before** the provider. Buckets are
+`review` (posture), `hunt` (read-only investigation), `response` (containment),
+`forensics` (evidence).
+
+---
+
+## Tactical one-liners
+
+```bash
+# Security review — posture snapshot as CSV + HTML (where to dig deeper)
+dredge --aws-profile ir --region us-east-1 \
+  aws review full --incident-start 2026-04-01T00:00:00Z \
+  --csv ./review.csv --html ./review.html
+
+# Contain — always dry-run destructive actions first (global --dry-run)
+dredge --aws-profile ir --region us-east-1 --dry-run \
+  aws response disable-user --user compromised-user
+dredge --aws-profile ir --region us-east-1 \
+  aws response quarantine-s3-bucket suspicious-bucket
+
+# GitHub — hunt the audit log (token from $GITHUB_TOKEN)
+dredge --github-org dbnz-io github hunt audit --actor sabastante --today --include all
+
+# Kubernetes — isolate a pod, hunt privileged pods
 dredge --k8s-context prod-cluster --k8s-namespace default \
   k8s response quarantine-pod suspicious-pod
-
-# Cordon and drain a node
-dredge --k8s-context prod-cluster \
-  k8s response drain-node ip-10-0-1-23.ec2.internal
-
-# Disable a compromised ServiceAccount (delete tokens + bindings)
-dredge --k8s-context prod-cluster --k8s-namespace default \
-  k8s response disable-service-account leaked-sa
-
-# Hunt Events for a namespace over the last 24h (default window)
-dredge --k8s-context prod-cluster \
-  k8s hunt events --namespace default --event-type Warning
-
-# Find what a compromised ServiceAccount can do
-dredge --k8s-context prod-cluster \
-  k8s hunt role-bindings-for-subject --kind ServiceAccount --name leaked-sa
-
-# Flag pods running with elevated host access
 dredge --k8s-context prod-cluster k8s hunt privileged-pods
-
-# Capture forensic evidence before containment
-dredge --k8s-context prod-cluster --k8s-namespace default \
-  k8s forensics get-pod-manifest suspicious-pod
 ```
 
 ---
 
-## Library Usage
-
-### AWS
+## Use it from Python
 
 ```python
 from dredge import Dredge
 from dredge.auth import AwsAuthConfig
 
-auth = AwsAuthConfig(profile_name="dredge-role", region_name="us-east-1")
-d = Dredge(auth=auth)
+d = Dredge(auth=AwsAuthConfig(profile_name="ir", region_name="us-east-1"))
 
-# Containment
-d.aws_ir.response.disable_user("compromised-user")
-d.aws_ir.response.isolate_ec2_instances(["i-0123456789abcdef0"])
-d.aws_ir.response.quarantine_s3_bucket("sensitive-bucket")
-
-# Hunting
-result = d.aws_ir.hunt.lookup_events(access_key_id="AKIAIOSFODNN7EXAMPLE")
-print(result.details["events"])
-
-result = d.aws_ir.hunt.list_guardduty_findings("detector-id", severity_min=7.0)
-print(result.details["findings"])
-```
-
-### GitHub
-
-```python
-from dredge import Dredge
-from dredge.github_ir.config import GitHubIRConfig
-
-cfg = GitHubIRConfig(org="dbnz-io", token="ghp_xxx")
-d = Dredge(github_config=cfg)
-
-res = d.github_ir.hunt.search_today(actor="sabastante")
+# collect, then hunt
+d.aws_ir.forensics.download_s3_logs("my-org-cloudtrail", prefix="AWSLogs/",
+                                    destination="./ct-logs", days_ago=2)
+res = d.aws_ir.hunt.lookup_events(access_key_id="AKIAIOSFODNN7EXAMPLE")
 print(res.details["events"])
 ```
 
-### Kubernetes
-
-```python
-from dredge import Dredge
-from dredge.k8s_ir.config import K8sAuthConfig
-
-# "Auth like kubectl" -- resolves cloud-specific token exchange via the
-# kubeconfig's exec plugin, same as `aws eks get-token` / `gke-gcloud-auth-plugin`.
-cfg = K8sAuthConfig(context="prod-cluster")
-d = Dredge(k8s_config=cfg)
-
-# Containment
-d.k8s_ir.response.quarantine_pod("default", "suspicious-pod")
-d.k8s_ir.response.disable_service_account("default", "leaked-sa")
-d.k8s_ir.response.drain_node("ip-10-0-1-23.ec2.internal")
-
-# Hunting
-result = d.k8s_ir.hunt.list_events(namespace="default", event_type="Warning")
-print(result.details["events"])
-
-result = d.k8s_ir.hunt.list_privileged_pods()
-print(result.details["flagged_pods"])
-```
-
-Direct service-account auth (no kubeconfig needed -- e.g. for CI or a token pulled from a secrets manager):
-
-```python
-cfg = K8sAuthConfig(
-    api_server="https://cluster.example.com",
-    token_provider=lambda: fetch_token_from_vault(),  # re-invoked before every call
-    ca_cert_file="/path/to/ca.pem",
-)
-d = Dredge(k8s_config=cfg)
-```
+Every action returns an `OperationResult` (`success`, `details`, `errors`).
+👉 [Library docs](docs/library/README.md).
 
 ---
 
-## Roadmap
+## Documentation
 
-- **Azure** support (auth, IR actions, log hunting).
-- **Okta** IR (suspend users, revoke sessions, hunt sign-in logs).
-- **GCP** — expand beyond Cloud Logging hunting to full IR actions + coverage (currently in progress).
-- **Kubernetes**: cloud-specific audit log hunting (EKS → CloudWatch, GKE → Cloud Logging) composed with `aws_ir`/`gcp_ir`.
-- **Kubernetes**: pod filesystem/memory forensic capture via ephemeral debug containers.
-- **Kubernetes**: cross-cloud credential revocation for IRSA (EKS) / Workload Identity (GKE/AKS) bound ServiceAccounts.
-- IoC-based hunting (IP/domain/hash correlation across providers).
-- Shodan + VirusTotal reintegration.
+| | |
+|---|---|
+| [Getting started](docs/getting-started.md) | Install → collect → first hunt |
+| [Installation](docs/installation.md) | PyPI, source, Docker |
+| [Authentication](docs/authentication.md) | AWS · GitHub · Kubernetes · GCP |
+| [CLI](docs/cli/README.md) | [AWS](docs/cli/aws.md) · [GitHub](docs/cli/github.md) · [Kubernetes](docs/cli/kubernetes.md) |
+| [Library](docs/library/README.md) | [AWS](docs/library/aws.md) · [GitHub](docs/library/github.md) · [Kubernetes](docs/library/kubernetes.md) |
+| [Command reference](docs/reference.md) | Every command, generated from the CLI |
+| [Roadmap](docs/roadmap.md) · [Contributing](docs/contributing.md) | |
 
 ---
 
-## Contributing
+## License
 
-PRs welcome. If you want to add modules (Azure, Okta, Datadog, JumpCloud), open an issue.
+[MPL-2.0](LICENSE). Security issues: see [SECURITY.md](SECURITY.md).
