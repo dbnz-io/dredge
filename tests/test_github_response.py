@@ -419,3 +419,51 @@ class TestArchiveRepository:
     def test_enterprise_config_raises(self):
         with pytest.raises(RuntimeError):
             _enterprise_response().archive_repository("repo")
+
+
+# ---- dry-run ----
+
+class TestDryRun:
+    def _dry_response(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok", dry_run=True)
+        svc = _make_services()
+        return GitHubIRResponse(svc, cfg), svc
+
+    def test_block_org_member_dry_run_makes_no_call(self):
+        r, svc = self._dry_response()
+        result = r.block_org_member("evil")
+        assert result.success is True
+        assert result.details["dry_run"] is True
+        assert "blocked" not in result.details
+        svc.put.assert_not_called()
+        svc.delete.assert_not_called()
+
+    def test_remove_org_member_dry_run_makes_no_call(self):
+        r, svc = self._dry_response()
+        result = r.remove_org_member("evil")
+        assert result.details["dry_run"] is True
+        svc.delete.assert_not_called()
+
+    def test_revoke_deploy_key_dry_run_makes_no_call(self):
+        r, svc = self._dry_response()
+        result = r.revoke_deploy_key("repo", 42)
+        assert result.details["dry_run"] is True
+        svc.delete.assert_not_called()
+
+    def test_delete_org_webhook_dry_run_makes_no_call(self):
+        r, svc = self._dry_response()
+        result = r.delete_org_webhook(7)
+        assert result.details["dry_run"] is True
+        svc.delete.assert_not_called()
+
+    def test_archive_repository_dry_run_makes_no_call(self):
+        r, svc = self._dry_response()
+        result = r.archive_repository("repo")
+        assert result.details["dry_run"] is True
+        svc.patch.assert_not_called()
+
+    def test_dry_run_still_requires_org_scope(self):
+        cfg = GitHubIRConfig(enterprise="acme", token="tok", dry_run=True)
+        svc = _make_services()
+        with pytest.raises(RuntimeError):
+            GitHubIRResponse(svc, cfg).block_org_member("evil")

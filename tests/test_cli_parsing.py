@@ -9,28 +9,30 @@ from dredge import cli as dredge_cli
 from dredge.auth import AwsAuthConfig
 from dredge.github_ir.config import GitHubIRConfig
 
-def test_cli_has_expected_subcommands():
+def test_cli_top_level_providers_are_subcommands():
     parser = dredge_cli.build_parser()
 
-    # Find the existing subparsers action without creating a new one
     subparsers_action = next(
         a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
     )
-    subparsers = subparsers_action.choices
+    providers = subparsers_action.choices
 
-    # Basic commands we expect to exist
-    for cmd in [
-        "aws-disable-access-key",
-        "aws-disable-user",
-        "aws-hunt-cloudtrail",
-        "github-hunt-audit",
-        "k8s-delete-pod",
-        "k8s-hunt-events",
-    ]:
-        assert cmd in subparsers
+    # The CLI is now nested: dredge <provider> <bucket> <command>.
+    for provider in ["aws", "github", "k8s"]:
+        assert provider in providers
 
 
-def test_cli_parses_aws_hunt_cloudtrail_args():
+def test_cli_provider_and_bucket_levels_have_subcommands():
+    parser = dredge_cli.build_parser()
+    # dredge aws -> buckets
+    args = parser.parse_args(["aws"])  # bare provider -> help printer default
+    assert callable(args.func)
+    # dredge aws hunt cloudtrail resolves to the concrete handler
+    args = parser.parse_args(["aws", "hunt", "cloudtrail", "--user", "x"])
+    assert args.func is dredge_cli.handle_aws_hunt_cloudtrail
+
+
+def test_cli_parses_nested_aws_hunt_cloudtrail_args():
     parser = dredge_cli.build_parser()
     args = parser.parse_args(
         [
@@ -38,7 +40,9 @@ def test_cli_parses_aws_hunt_cloudtrail_args():
             "backdoor",
             "--region",
             "us-east-1",
-            "aws-hunt-cloudtrail",
+            "aws",
+            "hunt",
+            "cloudtrail",
             "--user",
             "alice",
             "--max-events",
@@ -46,11 +50,25 @@ def test_cli_parses_aws_hunt_cloudtrail_args():
         ]
     )
 
-    assert args.command == "aws-hunt-cloudtrail"
+    assert args.provider == "aws"
+    assert args.func is dredge_cli.handle_aws_hunt_cloudtrail
     assert args.user == "alice"
     assert args.max_events == 10
     assert args.aws_profile == "backdoor"
-    assert args.aws_region == "us-east-1"
+
+
+def test_cli_flat_invocation_is_rejected():
+    # The old flat form is gone: there is exactly one way to invoke a command.
+    parser = dredge_cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["aws-hunt-cloudtrail", "--user", "alice"])
+
+
+def test_registrar_rejects_unknown_bucket():
+    parser = argparse.ArgumentParser(add_help=False)
+    reg = dredge_cli._NestedRegistrar(parser)
+    with pytest.raises(ValueError, match="unknown bucket"):
+        reg.command("aws", "not-a-bucket", "x", help="nope")
 
 
 # ---------------------------------------------------------------------------

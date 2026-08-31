@@ -32,6 +32,7 @@ class AwsServiceRegistry:
         self._awsconfig = None
         self._sts = None
         self._ecr = None
+        self._codebuild = None
 
     @property
     def iam(self):
@@ -152,3 +153,9 @@ class AwsServiceRegistry:
         if self._ecr is None:
             self._ecr = self._session.client("ecr")
         return self._ecr
+
+    @property
+    def codebuild(self):
+        if self._codebuild is None:
+            self._codebuild = self._session.client("codebuild")
+        return self._codebuild

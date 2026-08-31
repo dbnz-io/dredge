@@ -55,6 +55,9 @@ class Dredge:
         # passes github_config never imports PyGithub at all.
         self.github_ir: Optional["GitHubIRNamespace"]
         if github_config is not None:
+            # DredgeConfig.dry_run is the global switch; honor it for GitHub
+            # response actions too (either source enabling dry-run wins).
+            github_config.dry_run = github_config.dry_run or self.config.dry_run
             from .github_ir import GitHubIRNamespace
             self.github_ir = GitHubIRNamespace(github_config)
         else:

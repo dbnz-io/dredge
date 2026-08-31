@@ -14,8 +14,10 @@ _log = get_logger(__name__)
 
 _QUARANTINE_LABEL_KEY = "dredge.io/quarantine"
 
-_SA_TOKEN_SECRET_TYPE = "kubernetes.io/service-account-token"
-_SA_TOKEN_SECRET_NAME_ANNOTATION = "kubernetes.io/service-account.name"
+# These are well-known Kubernetes API string constants (a Secret `type` and an
+# annotation key), not credentials. nosec: bandit B105 false positive.
+_SA_TOKEN_SECRET_TYPE = "kubernetes.io/service-account-token"  # nosec B105
+_SA_TOKEN_SECRET_NAME_ANNOTATION = "kubernetes.io/service-account.name"  # nosec B105
 
 
 class K8sIRResponse:

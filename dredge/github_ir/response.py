@@ -45,6 +45,14 @@ class GitHubIRResponse:
         except ValueError:
             return resp.text[:200]
 
+    def _dry_run(self, result: OperationResult) -> OperationResult:
+        """Short-circuit a mutating action when dry-run is on: no GitHub API
+        call is made; success is returned with details["dry_run"] = True
+        (mirrors the AWS/k8s response convention)."""
+        result.details["dry_run"] = True
+        _log.info(log_event("github_ir_response", f"{result.operation}.dry_run", target=result.target))
+        return result
+
     # --------------------
     # Member management
     # --------------------
@@ -62,6 +70,8 @@ class GitHubIRResponse:
             target=f"org={self._org},user={username}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.put(f"/orgs/{self._org}/blocks/{username}")
             if resp.status_code in _SUCCESS_CODES:
@@ -87,6 +97,8 @@ class GitHubIRResponse:
             target=f"org={self._org},user={username}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.delete(f"/orgs/{self._org}/members/{username}")
             if resp.status_code in _SUCCESS_CODES:
@@ -112,6 +124,8 @@ class GitHubIRResponse:
             target=f"org={self._org},repo={repo},user={username}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.delete(f"/repos/{self._org}/{repo}/collaborators/{username}")
             if resp.status_code in _SUCCESS_CODES:
@@ -141,6 +155,8 @@ class GitHubIRResponse:
             target=f"org={self._org},repo={repo},key_id={key_id}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.delete(f"/repos/{self._org}/{repo}/keys/{key_id}")
             if resp.status_code in _SUCCESS_CODES:
@@ -169,6 +185,8 @@ class GitHubIRResponse:
             target=f"org={self._org},hook_id={hook_id}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.delete(f"/orgs/{self._org}/hooks/{hook_id}")
             if resp.status_code in _SUCCESS_CODES:
@@ -191,6 +209,8 @@ class GitHubIRResponse:
             target=f"org={self._org},repo={repo},hook_id={hook_id}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.delete(f"/repos/{self._org}/{repo}/hooks/{hook_id}")
             if resp.status_code in _SUCCESS_CODES:
@@ -220,6 +240,8 @@ class GitHubIRResponse:
             target=f"org={self._org},team={team_slug},user={username}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.delete(
                 f"/orgs/{self._org}/teams/{team_slug}/memberships/{username}"
@@ -251,6 +273,8 @@ class GitHubIRResponse:
             target=f"org={self._org},repo={repo},workflow={workflow_id}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.put(
                 f"/repos/{self._org}/{repo}/actions/workflows/{workflow_id}/disable"
@@ -278,6 +302,8 @@ class GitHubIRResponse:
             target=f"org={self._org},repo={repo}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.put(
                 f"/repos/{self._org}/{repo}/actions/permissions",
@@ -312,6 +338,8 @@ class GitHubIRResponse:
             target=f"org={self._org},installation={installation_id}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.delete(
                 f"/orgs/{self._org}/installations/{installation_id}"
@@ -343,6 +371,8 @@ class GitHubIRResponse:
             target=f"org={self._org},repo={repo}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.patch(
                 f"/repos/{self._org}/{repo}",
@@ -372,6 +402,8 @@ class GitHubIRResponse:
             target=f"org={self._org},repo={repo}",
             success=True,
         )
+        if self._config.dry_run:
+            return self._dry_run(result)
         try:
             resp = self._services.patch(f"/repos/{self._org}/{repo}", json={"archived": True})
             if resp.status_code == 200:

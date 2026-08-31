@@ -42,98 +42,98 @@ CLI_HANDLER_CASES = [
     # --- response ---
     (
         "k8s-revoke-role-binding",
-        [*K8S_ARGS, "k8s-revoke-role-binding", "rb1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "response", "revoke-role-binding", "rb1", "--namespace", "ns1"],
         "k8s_ir.response.revoke_role_binding",
         ("ns1", "rb1"),
         {},
     ),
     (
         "k8s-revoke-cluster-role-binding",
-        [*K8S_ARGS, "k8s-revoke-cluster-role-binding", "crb1"],
+        [*K8S_ARGS, "k8s", "response", "revoke-cluster-role-binding", "crb1"],
         "k8s_ir.response.revoke_cluster_role_binding",
         ("crb1",),
         {},
     ),
     (
         "k8s-disable-service-account",
-        [*K8S_ARGS, "k8s-disable-service-account", "sa1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "response", "disable-service-account", "sa1", "--namespace", "ns1"],
         "k8s_ir.response.disable_service_account",
         ("ns1", "sa1"),
         {},
     ),
     (
         "k8s-delete-service-account",
-        [*K8S_ARGS, "k8s-delete-service-account", "sa1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "response", "delete-service-account", "sa1", "--namespace", "ns1"],
         "k8s_ir.response.delete_service_account",
         ("ns1", "sa1"),
         {},
     ),
     (
         "k8s-delete-pod",
-        [*K8S_ARGS, "k8s-delete-pod", "pod1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "response", "delete-pod", "pod1", "--namespace", "ns1"],
         "k8s_ir.response.delete_pod",
         ("ns1", "pod1"),
         {"grace_period_seconds": 0},
     ),
     (
         "k8s-scale-deployment",
-        [*K8S_ARGS, "k8s-scale-deployment", "dep1", "--namespace", "ns1", "--replicas", "2"],
+        [*K8S_ARGS, "k8s", "response", "scale-deployment", "dep1", "--namespace", "ns1", "--replicas", "2"],
         "k8s_ir.response.scale_deployment",
         ("ns1", "dep1", 2),
         {},
     ),
     (
         "k8s-cordon-node",
-        [*K8S_ARGS, "k8s-cordon-node", "node1"],
+        [*K8S_ARGS, "k8s", "response", "cordon-node", "node1"],
         "k8s_ir.response.cordon_node",
         ("node1",),
         {},
     ),
     (
         "k8s-drain-node",
-        [*K8S_ARGS, "k8s-drain-node", "node1"],
+        [*K8S_ARGS, "k8s", "response", "drain-node", "node1"],
         "k8s_ir.response.drain_node",
         ("node1",),
         {"grace_period_seconds": 30, "ignore_daemonsets": True},
     ),
     (
         "k8s-delete-node",
-        [*K8S_ARGS, "k8s-delete-node", "node1"],
+        [*K8S_ARGS, "k8s", "response", "delete-node", "node1"],
         "k8s_ir.response.delete_node",
         ("node1",),
         {},
     ),
     (
         "k8s-quarantine-pod",
-        [*K8S_ARGS, "k8s-quarantine-pod", "pod1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "response", "quarantine-pod", "pod1", "--namespace", "ns1"],
         "k8s_ir.response.quarantine_pod",
         ("ns1", "pod1"),
         {"policy_name": "dredge-forensic-isolation"},
     ),
     (
         "k8s-quarantine-namespace",
-        [*K8S_ARGS, "k8s-quarantine-namespace", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "response", "quarantine-namespace", "--namespace", "ns1"],
         "k8s_ir.response.quarantine_namespace",
         ("ns1",),
         {"policy_name": "dredge-forensic-isolation"},
     ),
     (
         "k8s-delete-secret",
-        [*K8S_ARGS, "k8s-delete-secret", "sec1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "response", "delete-secret", "sec1", "--namespace", "ns1"],
         "k8s_ir.response.delete_secret",
         ("ns1", "sec1"),
         {},
     ),
     (
         "k8s-label-resource-pod",
-        [*K8S_ARGS, "k8s-label-resource", "pod", "pod1", "--namespace", "ns1", "--label", "a=b"],
+        [*K8S_ARGS, "k8s", "response", "label-resource", "pod", "pod1", "--namespace", "ns1", "--label", "a=b"],
         "k8s_ir.response.label_resource",
         ("pod", "ns1", "pod1", {"a": "b"}),
         {},
     ),
     (
         "k8s-label-resource-node",
-        [*K8S_ARGS, "k8s-label-resource", "node", "node1", "--label", "a=b"],
+        [*K8S_ARGS, "k8s", "response", "label-resource", "node", "node1", "--label", "a=b"],
         "k8s_ir.response.label_resource",
         ("node", None, "node1", {"a": "b"}),
         {},
@@ -141,49 +141,49 @@ CLI_HANDLER_CASES = [
     # --- forensics ---
     (
         "k8s-get-pod-manifest",
-        [*K8S_ARGS, "k8s-get-pod-manifest", "pod1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "forensics", "get-pod-manifest", "pod1", "--namespace", "ns1"],
         "k8s_ir.forensics.get_pod_manifest",
         ("ns1", "pod1"),
         {},
     ),
     (
         "k8s-get-pod-logs",
-        [*K8S_ARGS, "k8s-get-pod-logs", "pod1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "forensics", "get-pod-logs", "pod1", "--namespace", "ns1"],
         "k8s_ir.forensics.get_pod_logs",
         ("ns1", "pod1"),
         {"container": None, "previous": False, "tail_lines": None},
     ),
     (
         "k8s-get-pod-events",
-        [*K8S_ARGS, "k8s-get-pod-events", "pod1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "forensics", "get-pod-events", "pod1", "--namespace", "ns1"],
         "k8s_ir.forensics.get_pod_events",
         ("ns1", "pod1"),
         {},
     ),
     (
         "k8s-describe-node",
-        [*K8S_ARGS, "k8s-describe-node", "node1"],
+        [*K8S_ARGS, "k8s", "forensics", "describe-node", "node1"],
         "k8s_ir.forensics.describe_node",
         ("node1",),
         {},
     ),
     (
         "k8s-capture-workload-manifest",
-        [*K8S_ARGS, "k8s-capture-workload-manifest", "deployment", "dep1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "forensics", "capture-workload-manifest", "deployment", "dep1", "--namespace", "ns1"],
         "k8s_ir.forensics.capture_workload_manifest",
         ("deployment", "ns1", "dep1"),
         {},
     ),
     (
         "k8s-list-pods-on-node",
-        [*K8S_ARGS, "k8s-list-pods-on-node", "node1"],
+        [*K8S_ARGS, "k8s", "forensics", "list-pods-on-node", "node1"],
         "k8s_ir.forensics.list_pods_on_node",
         ("node1",),
         {},
     ),
     (
         "k8s-exec-pod-command",
-        [*K8S_ARGS, "k8s-exec-pod-command", "pod1", "ps", "aux", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "forensics", "exec-pod-command", "pod1", "ps", "aux", "--namespace", "ns1"],
         "k8s_ir.forensics.exec_pod_command",
         ("ns1", "pod1", ["ps", "aux"]),
         {"container": None},
@@ -191,7 +191,7 @@ CLI_HANDLER_CASES = [
     # --- hunt ---
     (
         "k8s-hunt-events",
-        [*K8S_ARGS, "k8s-hunt-events", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "hunt", "events", "--namespace", "ns1"],
         "k8s_ir.hunt.list_events",
         (),
         {
@@ -207,21 +207,21 @@ CLI_HANDLER_CASES = [
     ),
     (
         "k8s-hunt-role-bindings-for-subject",
-        [*K8S_ARGS, "k8s-hunt-role-bindings-for-subject", "--kind", "User", "--name", "alice", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "hunt", "role-bindings-for-subject", "--kind", "User", "--name", "alice", "--namespace", "ns1"],
         "k8s_ir.hunt.list_role_bindings_for_subject",
         (),
         {"kind": "User", "name": "alice", "namespace": "ns1"},
     ),
     (
         "k8s-hunt-pods-by-service-account",
-        [*K8S_ARGS, "k8s-hunt-pods-by-service-account", "--service-account", "sa1", "--namespace", "ns1"],
+        [*K8S_ARGS, "k8s", "hunt", "pods-by-service-account", "--service-account", "sa1", "--namespace", "ns1"],
         "k8s_ir.hunt.list_pods_by_service_account",
         ("ns1", "sa1"),
         {},
     ),
     (
         "k8s-hunt-privileged-pods",
-        [*K8S_ARGS, "k8s-hunt-privileged-pods"],
+        [*K8S_ARGS, "k8s", "hunt", "privileged-pods"],
         "k8s_ir.hunt.list_privileged_pods",
         (),
         {"max_pods": 500},
@@ -286,7 +286,7 @@ class TestBuildK8sConfigFromArgs:
 class TestK8sDredgeMissingConfig:
     def test_raises_system_exit_when_unconfigured(self):
         parser = dredge_cli.build_parser()
-        args = parser.parse_args(["k8s-cordon-node", "node1"])
+        args = parser.parse_args(["k8s", "response", "cordon-node", "node1"])
         with pytest.raises(SystemExit):
             dredge_cli._k8s_dredge(args)
 
@@ -294,16 +294,16 @@ class TestK8sDredgeMissingConfig:
 class TestK8sNamespaceHelper:
     def test_uses_subcommand_namespace(self):
         parser = dredge_cli.build_parser()
-        args = parser.parse_args([*K8S_ARGS, "k8s-delete-pod", "p1", "--namespace", "explicit-ns"])
+        args = parser.parse_args([*K8S_ARGS, "k8s", "response", "delete-pod", "p1", "--namespace", "explicit-ns"])
         assert dredge_cli._k8s_namespace(args) == "explicit-ns"
 
     def test_falls_back_to_global_namespace(self):
         parser = dredge_cli.build_parser()
-        args = parser.parse_args([*K8S_ARGS, "--k8s-namespace", "global-ns", "k8s-delete-pod", "p1"])
+        args = parser.parse_args([*K8S_ARGS, "--k8s-namespace", "global-ns", "k8s", "response", "delete-pod", "p1"])
         assert dredge_cli._k8s_namespace(args) == "global-ns"
 
     def test_raises_when_neither_set(self):
         parser = dredge_cli.build_parser()
-        args = parser.parse_args([*K8S_ARGS, "k8s-delete-pod", "p1"])
+        args = parser.parse_args([*K8S_ARGS, "k8s", "response", "delete-pod", "p1"])
         with pytest.raises(SystemExit):
             dredge_cli._k8s_namespace(args)

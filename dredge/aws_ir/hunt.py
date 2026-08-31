@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import base64
+import gzip
+import hashlib
+import ipaddress
 import json
+import os
+import re
 import time
-from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import boto3
 import botocore.exceptions
+from botocore.config import Config as BotoConfig
 
 from ..config import DredgeConfig
 from ..log import get_logger, event
@@ -21,6 +30,253 @@ _THROTTLE_ERROR_CODES = {
     "RequestLimitExceeded",
     "TooManyRequestsException",
 }
+
+
+# =====================
+# Exposed-secret detection engine
+#
+# Two layers:
+#   1. Pattern detectors — regexes for well-known credential shapes
+#      (AWS key pairs, GitHub/Slack/Stripe tokens, JWTs, PEM blocks).
+#   2. Key-name heuristic — a variable named like a secret whose value is
+#      also credential-shaped gets flagged as a generic secret.
+#
+# Raw values are never returned by default: each finding stores a
+# SHA-256 hash (first 16 hex chars, used for dedup) plus a redacted
+# preview. Pass keep_raw=True to hunt_exposed_secrets() to also get the
+# plaintext back (e.g. for a rotation worklist) — handle with care.
+# =====================
+
+
+@dataclass
+class _SecretDetector:
+    name: str
+    category: str
+    severity: str
+    pattern: "re.Pattern"
+
+
+# Notably absent: a bare `AKIA...` detector. An access key ID alone isn't
+# secret (you need the 40-char secret key to use it) and leaks routinely
+# in CloudTrail/IAM output. The paired check in _detect_aws_pair_in_bag
+# below catches the dangerous case: an AKIA AND its SAK in the same bag.
+_SECRET_DETECTORS: List[_SecretDetector] = [
+    _SecretDetector("github_token", "GitHub Token", "CRITICAL",
+                     re.compile(r"\bgh[psour]_[A-Za-z0-9_]{30,255}\b")),
+    _SecretDetector("stripe_key", "Stripe Key", "CRITICAL",
+                     re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{20,}\b")),
+    _SecretDetector("private_key_block", "Private Key Block", "CRITICAL",
+                     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    _SecretDetector("google_api_key", "Google API Key", "HIGH",
+                     re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
+    _SecretDetector("slack_token", "Slack Token", "HIGH",
+                     re.compile(r"\bxox[bpoars]-[A-Za-z0-9-]{15,}\b")),
+    _SecretDetector("jwt_token", "JWT Token", "HIGH",
+                     re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")),
+    _SecretDetector("aws_secret_with_context", "AWS Secret Access Key", "CRITICAL",
+                     re.compile(r"(?i)aws_secret_access_key\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{40})['\"]?")),
+]
+
+_AKIA_RE = re.compile(r"\b(?:AKIA|ASIA|AGPA|ANPA|ANVA|AROA|AIDA)[0-9A-Z]{16}\b")
+_SAK_SHAPE_RE = re.compile(r"^[A-Za-z0-9/+=]{40}$")
+
+_SECRET_KEY_NAME_RE = re.compile(
+    r"(?i)(secret|password|passwd|pwd|api[_-]?key|access[_-]?key|"
+    r"token|credential|private[_-]?key|auth)"
+)
+_GENERIC_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9_\-./+=:]{12,}$")
+_SECRET_PLACEHOLDERS = {
+    "changeme", "change-me", "password", "passw0rd", "secret", "test",
+    "true", "false", "none", "null", "todo", "fixme", "your-token-here",
+    "your-secret-here", "<password>", "<secret>",
+}
+
+_SECRET_URL_RE = re.compile(r"^(https?://[^/?#]+)(.*)$", re.IGNORECASE)
+_SECRET_ARN_RE = re.compile(
+    r"^(arn:[a-z\-]+:[a-z0-9\-]+:[a-z0-9\-]*:[0-9]*:[^/]+)(.*)$", re.IGNORECASE,
+)
+
+_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+
+def _hash_secret(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _redact_secret(value: str) -> str:
+    """Shape-aware redaction: keeps the non-sensitive prefix of URLs/ARNs,
+    otherwise first4 + asterisks + last4."""
+    n = len(value)
+    if n <= 8:
+        return f"{'*' * n} ({n} chars)"
+
+    m = _SECRET_URL_RE.match(value)
+    if m:
+        prefix, tail = m.group(1), m.group(2)
+        if not tail or tail in ("/", "?"):
+            return f"{prefix} ({n} chars)"
+        return f"{prefix}/[…{len(tail)} chars] ({n} chars)"
+
+    m = _SECRET_ARN_RE.match(value)
+    if m:
+        prefix, tail = m.group(1), m.group(2)
+        if not tail:
+            return f"{prefix} ({n} chars)"
+        return f"{prefix}/[…{len(tail)} chars] ({n} chars)"
+
+    return f"{value[:4]}{'*' * max(4, n - 8)}{value[-4:]} ({n} chars)"
+
+
+def _detect_secret(value: str, key_name: str = "") -> Optional[Tuple[str, str, str]]:
+    """Return (category, severity, detection_method) or None. AWS access
+    key IDs are intentionally NOT detected here — see
+    _detect_aws_pair_in_bag for the context-aware paired check."""
+    if not value or not isinstance(value, str):
+        return None
+
+    for d in _SECRET_DETECTORS:
+        if d.pattern.search(value):
+            return d.category, d.severity, f"regex:{d.name}"
+
+    if key_name and _SECRET_KEY_NAME_RE.search(key_name):
+        v_norm = value.strip()
+        if v_norm.lower() in _SECRET_PLACEHOLDERS:
+            return None
+        if _SECRET_ARN_RE.match(v_norm):
+            return None
+        if _GENERIC_SECRET_VALUE_RE.match(v_norm) and len(v_norm) >= 16:
+            return "Generic Secret", "MEDIUM", "key_name_heuristic"
+
+    return None
+
+
+def _detect_aws_pair_in_bag(bag: Dict[str, str]) -> List[Tuple[str, str, str, str, str]]:
+    """An AKIA on its own isn't a secret; an AKIA AND a matching 40-char SAK
+    shape in the same bag (env vars, task-def env, etc.) is a leaked
+    credential pair. Returns (key_name, value, category, severity, method)
+    tuples, empty if no pair is present."""
+    out: List[Tuple[str, str, str, str, str]] = []
+    if not bag:
+        return out
+    akias = [(k, v) for k, v in bag.items() if isinstance(v, str) and _AKIA_RE.search(v)]
+    saks = [
+        (k, v) for k, v in bag.items()
+        if isinstance(v, str) and _SAK_SHAPE_RE.match(v or "") and not _AKIA_RE.search(v)
+    ]
+    if not akias or not saks:
+        return out
+    for k, v in akias:
+        out.append((k, v, "AWS Access Key", "CRITICAL", "regex:aws_pair_access_key"))
+    for k, v in saks:
+        out.append((k, v, "AWS Secret Access Key", "CRITICAL", "regex:aws_pair_secret_access_key"))
+    return out
+
+
+class _SecretBucket:
+    """Aggregates detected secrets by hash. With keep_raw=True the raw
+    plaintext is also held in memory (keyed by hash) so the caller can
+    return it; findings themselves never carry the raw value."""
+
+    def __init__(self, keep_raw: bool = False) -> None:
+        self.findings: Dict[str, Dict[str, Any]] = {}
+        self.keep_raw = keep_raw
+        self.raw_by_hash: Dict[str, str] = {}
+
+    def _upsert(self, value: str, source: Dict[str, Any], category: str, severity: str, method: str) -> None:
+        h = _hash_secret(value)
+        if self.keep_raw:
+            self.raw_by_hash[h] = value
+        existing = self.findings.get(h)
+        if existing:
+            if _SEVERITY_ORDER.get(severity, 9) < _SEVERITY_ORDER.get(existing["severity"], 9):
+                existing["severity"] = severity
+            existing["sources"].append(source)
+        else:
+            self.findings[h] = {
+                "hash": h,
+                "category": category,
+                "redacted_value": _redact_secret(value),
+                "detection_method": method,
+                "severity": severity,
+                "sources": [source],
+                "live_test_result": None,
+            }
+
+    def add(self, value: str, source: Dict[str, Any], key_name: str = "") -> None:
+        det = _detect_secret(value, key_name)
+        if det is None:
+            return
+        category, severity, method = det
+        self._upsert(value, source, category, severity, method)
+
+    def add_explicit(self, value: str, source: Dict[str, Any], category: str, severity: str, method: str) -> None:
+        if not value:
+            return
+        self._upsert(value, source, category, severity, method)
+
+    def values(self) -> List[Dict[str, Any]]:
+        return list(self.findings.values())
+
+
+def _emit_aws_pair(bag: Dict[str, str], make_source, bucket: "_SecretBucket") -> None:
+    for key_name, value, category, severity, method in _detect_aws_pair_in_bag(bag):
+        bucket.add_explicit(str(value), make_source(key_name), category, severity, method)
+
+
+def verify_aws_key_pair(
+    access_key_id: str,
+    secret_access_key: str,
+    *,
+    region: str = "us-east-1",
+    timeout: int = 10,
+) -> Dict[str, Any]:
+    """Call sts:GetCallerIdentity with the supplied pair. Never raises —
+    returns a dict with status "live" | "denied" | "expired" | "error".
+
+    Only sts:GetCallerIdentity is ever called; the response's principal
+    ARN identifies exactly which user/role the leaked pair belongs to.
+    The secret value itself is used only to build a throwaway boto3
+    client for this one call and is never logged.
+    """
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cfg = BotoConfig(connect_timeout=timeout, read_timeout=timeout, retries={"max_attempts": 1})
+    try:
+        sts = boto3.client(
+            "sts",
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            region_name=region,
+            config=cfg,
+        )
+        ident = sts.get_caller_identity()
+        return {
+            "status": "live",
+            "tested_at": now,
+            "caller_arn": ident.get("Arn", ""),
+            "caller_account": ident.get("Account", ""),
+            "caller_user_id": ident.get("UserId", ""),
+        }
+    except botocore.exceptions.ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in {"InvalidClientTokenId", "SignatureDoesNotMatch", "InvalidAccessKeyId"}:
+            return {"status": "denied", "tested_at": now, "error": code}
+        if code in {"ExpiredToken", "TokenRefreshRequired"}:
+            return {"status": "expired", "tested_at": now, "error": code}
+        msg = e.response.get("Error", {}).get("Message", "")
+        return {"status": "error", "tested_at": now, "error": f"{code}: {msg}".strip(": ")}
+    except botocore.exceptions.BotoCoreError as e:
+        return {"status": "error", "tested_at": now, "error": str(e)}
+
+
+def _dig(record: Dict[str, Any], dotted_path: str) -> Any:
+    """Extract a value from a nested dict via a dot-separated path, e.g.
+    "userIdentity.accountId". Returns None on any missing/non-dict step."""
+    cur: Any = record
+    for part in dotted_path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
 
 
 class AwsIRHunt:
@@ -48,10 +304,11 @@ class AwsIRHunt:
         source_ip: Optional[str] = None,
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
-        max_events: int = 500,
+        max_events: Optional[int] = 500,
         page_size: int = 50,
         throttle_max_retries: int = 5,
         throttle_base_delay: float = 0.5,
+        allow_full_scan: bool = False,
     ) -> OperationResult:
         """
         Search CloudTrail LookupEvents by simple filters.
@@ -61,10 +318,12 @@ class AwsIRHunt:
         and then apply additional filters (e.g., source_ip) client-side.
 
         NOTE: source_ip is always applied client-side — CloudTrail does not
-        support it as a server-side LookupAttribute. It MUST be combined with
-        at least one of user_name, access_key_id, or event_name, otherwise
-        the call will scan all events in the time range, which is expensive
-        and may silently miss matching records if total events exceed max_events.
+        support it as a server-side LookupAttribute. Using it alone means every
+        event in the time range has to be paged through and inspected, which is
+        expensive and may miss matches beyond max_events if the range is wide.
+        By default this requires combining source_ip with at least one of
+        user_name, access_key_id, or event_name to narrow the server-side scan;
+        pass allow_full_scan=True to explicitly opt into scanning by IP alone.
 
         Args:
             user_name: Filter by CloudTrail Username.
@@ -73,30 +332,40 @@ class AwsIRHunt:
             source_ip: Filter by sourceIPAddress (client-side only).
             start_time: Earliest event time (UTC). Defaults to now - 24h.
             end_time: Latest event time (UTC). Defaults to now.
-            max_events: Maximum number of events to return.
+            max_events: Maximum number of events to return. None or a
+                value <= 0 means unlimited — keep paginating until
+                CloudTrail has no more matching events for the time range.
             page_size: CloudTrail MaxResults per request (<= 50).
             throttle_max_retries: Max retries on throttling.
             throttle_base_delay: Base seconds for exponential backoff.
+            allow_full_scan: If True, permits source_ip as the sole filter,
+                scanning every event in the time range client-side. Results
+                may still be truncated at max_events — check
+                details["statistics"]["truncated"].
 
         Raises:
-            ValueError: If source_ip is the only filter provided. CloudTrail
-                cannot filter by IP server-side; combining it with a sole
-                source_ip filter would scan all events and silently truncate
-                results at max_events.
+            ValueError: If source_ip is the only filter provided and
+                allow_full_scan is False.
 
         Returns:
             OperationResult with:
               - details["events"]: list of normalized event dicts
               - details["statistics"]: counts and filter info
         """
-        if source_ip and not any([user_name, access_key_id, event_name]):
+        if source_ip and not any([user_name, access_key_id, event_name]) and not allow_full_scan:
             raise ValueError(
                 "source_ip cannot be the sole filter for CloudTrail lookup_events. "
                 "CloudTrail does not support IP-based server-side filtering; using "
-                "source_ip alone would scan all events in the time range and silently "
-                "truncate results at max_events. Provide at least one of: "
-                "user_name, access_key_id, event_name."
+                "source_ip alone would scan all events in the time range and may "
+                "truncate results at max_events. Either provide at least one of: "
+                "user_name, access_key_id, event_name — or pass allow_full_scan=True "
+                "to explicitly opt into a full client-side scan."
             )
+
+        # None or <=0 means unlimited: normalize once so every bound check
+        # below is a simple "is there a cap, and have we hit it".
+        if max_events is not None and max_events <= 0:
+            max_events = None
 
         now = datetime.now(timezone.utc)
 
@@ -143,7 +412,7 @@ class AwsIRHunt:
 
         # Main pagination loop
         while True:
-            if len(events) >= max_events:
+            if max_events is not None and len(events) >= max_events:
                 break
 
             params: Dict[str, Any] = {
@@ -171,7 +440,7 @@ class AwsIRHunt:
 
             raw_events = resp.get("Events", [])
             for raw_event in raw_events:
-                if len(events) >= max_events:
+                if max_events is not None and len(events) >= max_events:
                     break
 
                 # Fast path: EventName is a top-level field — filter before any JSON work.
@@ -203,6 +472,7 @@ class AwsIRHunt:
             "total_events_returned": len(events),
             "api_calls": total_api_calls,
             "lookup_attributes": lookup_attributes,
+            "truncated": max_events is not None and bool(next_token) and len(events) >= max_events,
             "time_range": {
                 "start_time": start_time.isoformat(),
                 "end_time": end_time.isoformat(),
@@ -324,6 +594,266 @@ class AwsIRHunt:
                 _log.warning(event("aws_ir_hunt", "cloudtrail_throttle", code=code, attempt=attempt, delay=delay))
                 time.sleep(delay)
                 attempt += 1
+
+    # =====================
+    # CloudTrail — list-driven hunts
+    # =====================
+
+    def hunt_cloudtrail_multi_user(
+        self,
+        users: List[str],
+        *,
+        mode: str = "per_user",
+        event_name: Optional[str] = None,
+        source_ip: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        max_events_per_user: Optional[int] = 500,
+        page_size: int = 50,
+        throttle_max_retries: int = 5,
+        throttle_base_delay: float = 0.5,
+        allow_full_scan: bool = False,
+        stop_on_error: bool = False,
+        output_path: Optional[str] = None,
+    ) -> OperationResult:
+        """
+        Run lookup_events once per username in `users` (CloudTrail LookupEvents
+        has no server-side "IN a list" filter, so each identity gets its own
+        call) and combine the results.
+
+        If `output_path` is given, each user's record is appended as one line
+        of JSON (JSON Lines) to that file as soon as it completes, flushed and
+        fsynced immediately. That way a failure partway through a long list
+        (throttling, a bad username, a network blip) doesn't lose the results
+        already gathered for earlier users — the file on disk always reflects
+        progress up to the last completed user.
+
+        Args:
+            users: Usernames to hunt, one lookup_events call each.
+            mode: "per_user" (default) keeps results keyed by user only.
+                "batch" additionally merges every user's events into one
+                time-sorted list at details["events"].
+            event_name, source_ip, start_time, end_time, page_size,
+                throttle_max_retries, throttle_base_delay, allow_full_scan:
+                passed straight through to each lookup_events call.
+            max_events_per_user: max_events cap applied per user (not overall).
+            stop_on_error: If True, stop after the first user whose lookup
+                fails instead of continuing with the rest of the list.
+            output_path: Optional path to stream per-user JSON Lines records
+                to as they complete (see above). Parent directories are
+                created if missing.
+
+        Returns:
+            OperationResult with:
+              - details["per_user"]: {username: {events, statistics, errors?}}
+              - details["events"]: merged, time-sorted events (mode="batch" only)
+              - details["statistics"]: users_requested/succeeded/failed, totals
+        """
+        if mode not in ("per_user", "batch"):
+            raise ValueError('mode must be "per_user" or "batch"')
+        if not users:
+            raise ValueError("users must be a non-empty list")
+
+        result = OperationResult(
+            operation="hunt_cloudtrail_multi_user",
+            target=f"users={len(users)},mode={mode}",
+            success=True,
+        )
+
+        fh = None
+        if output_path:
+            dirname = os.path.dirname(output_path)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
+            fh = open(output_path, "w")
+
+        per_user: Dict[str, Dict[str, Any]] = {}
+        all_events: List[Dict[str, Any]] = []
+
+        try:
+            for user in users:
+                user_result = self.lookup_events(
+                    user_name=user,
+                    event_name=event_name,
+                    source_ip=source_ip,
+                    start_time=start_time,
+                    end_time=end_time,
+                    max_events=max_events_per_user,
+                    page_size=page_size,
+                    throttle_max_retries=throttle_max_retries,
+                    throttle_base_delay=throttle_base_delay,
+                    allow_full_scan=allow_full_scan,
+                )
+                record: Dict[str, Any] = {
+                    "user": user,
+                    "success": user_result.success,
+                    "events": user_result.details.get("events", []),
+                    "statistics": user_result.details.get("statistics", {}),
+                }
+                if user_result.errors:
+                    record["errors"] = user_result.errors
+
+                if not record["success"]:
+                    result.add_error(f"{user}: " + "; ".join(record.get("errors", ["unknown error"])))
+                    _log.warning(event("aws_ir_hunt", "hunt_cloudtrail_multi_user.user_error", user=user, errors=record.get("errors")))
+
+                per_user[user] = record
+                all_events.extend(record["events"])
+
+                if fh:
+                    fh.write(json.dumps(record, default=str) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+
+                if not record["success"] and stop_on_error:
+                    break
+        finally:
+            if fh:
+                fh.close()
+
+        result.details["per_user"] = per_user
+        if mode == "batch":
+            all_events.sort(key=lambda e: e.get("event_time") or "")
+            result.details["events"] = all_events
+        result.details["statistics"] = {
+            "users_requested": len(users),
+            "users_completed": len(per_user),
+            "users_succeeded": sum(1 for r in per_user.values() if r.get("success")),
+            "users_failed": sum(1 for r in per_user.values() if not r.get("success")),
+            "total_events": sum(len(r.get("events", [])) for r in per_user.values()),
+        }
+        if output_path:
+            result.details["output_path"] = output_path
+
+        _log.info(event("aws_ir_hunt", "hunt_cloudtrail_multi_user.complete", target=result.target, **result.details["statistics"]))
+
+        return result
+
+    @staticmethod
+    def _parse_ip_allowlist(allowed_ips: List[str]) -> List["ipaddress._BaseNetwork"]:
+        networks = []
+        for entry in allowed_ips:
+            try:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                raise ValueError(f"Invalid IP or CIDR in allowlist: {entry!r}")
+        return networks
+
+    @staticmethod
+    def _classify_ip_against_allowlist(
+        source_ip: Optional[str], networks: List["ipaddress._BaseNetwork"]
+    ) -> str:
+        """Returns "expected", "unexpected", or "unparseable_source_ip" (the
+        source IP field wasn't a real IP at all — e.g. an AWS service
+        principal like "cloudtrail.amazonaws.com" on a service-linked call)."""
+        if not source_ip:
+            return "unparseable_source_ip"
+        try:
+            addr = ipaddress.ip_address(source_ip)
+        except ValueError:
+            return "unparseable_source_ip"
+        return "expected" if any(addr in net for net in networks) else "unexpected"
+
+    def hunt_user_activity_by_ip(
+        self,
+        user_name: str,
+        allowed_ips: List[str],
+        *,
+        event_name: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        max_events: Optional[int] = 500,
+        page_size: int = 50,
+        throttle_max_retries: int = 5,
+        throttle_base_delay: float = 0.5,
+    ) -> OperationResult:
+        """
+        Hunt one identity's CloudTrail activity and classify every event by
+        whether its source IP falls inside `allowed_ips` (IPs and/or CIDRs).
+
+        Unlike lookup_events(source_ip=...), which filters down to exactly one
+        IP, this evaluates every event the user generated against the whole
+        allowlist and keeps all three buckets — so a baseline ("expected")
+        picture and any deviations ("unexpected") are both visible in one
+        call, instead of having to guess which single IP to filter by.
+
+        Args:
+            user_name: CloudTrail Username to hunt.
+            allowed_ips: IPs and/or CIDRs the identity is expected to operate
+                from (e.g. office/VPN egress ranges, known instance IPs).
+            event_name, start_time, end_time, max_events, page_size,
+                throttle_max_retries, throttle_base_delay: passed straight
+                through to the underlying lookup_events call.
+
+        Raises:
+            ValueError: allowed_ips is empty, or contains something that
+                isn't a valid IP or CIDR.
+
+        Returns:
+            OperationResult with:
+              - details["expected_events"]: source IP is in allowed_ips
+              - details["unexpected_events"]: source IP is NOT in allowed_ips
+              - details["unparseable_source_ip_events"]: no usable IP (e.g.
+                an AWS service principal on a service-linked call)
+              - details["statistics"]: counts per bucket plus the underlying
+                lookup_events statistics
+        """
+        if not allowed_ips:
+            raise ValueError("allowed_ips must be a non-empty list")
+        networks = self._parse_ip_allowlist(allowed_ips)
+
+        result = OperationResult(
+            operation="hunt_user_activity_by_ip",
+            target=f"user={user_name},allowed_ips={len(allowed_ips)}",
+            success=True,
+        )
+
+        lookup_result = self.lookup_events(
+            user_name=user_name,
+            event_name=event_name,
+            start_time=start_time,
+            end_time=end_time,
+            max_events=max_events,
+            page_size=page_size,
+            throttle_max_retries=throttle_max_retries,
+            throttle_base_delay=throttle_base_delay,
+        )
+        for err in lookup_result.errors:
+            result.add_error(err)
+
+        expected: List[Dict[str, Any]] = []
+        unexpected: List[Dict[str, Any]] = []
+        unparseable: List[Dict[str, Any]] = []
+        buckets = {
+            "expected": expected,
+            "unexpected": unexpected,
+            "unparseable_source_ip": unparseable,
+        }
+
+        for ev in lookup_result.details.get("events", []):
+            status = self._classify_ip_against_allowlist(ev.get("source_ip_address"), networks)
+            tagged = dict(ev)
+            tagged["ip_allowlist_status"] = status
+            buckets[status].append(tagged)
+
+        result.details["expected_events"] = expected
+        result.details["unexpected_events"] = unexpected
+        result.details["unparseable_source_ip_events"] = unparseable
+        result.details["statistics"] = {
+            "total_events": len(expected) + len(unexpected) + len(unparseable),
+            "expected_count": len(expected),
+            "unexpected_count": len(unexpected),
+            "unparseable_count": len(unparseable),
+            "allowed_ips": allowed_ips,
+            "lookup": lookup_result.details.get("statistics", {}),
+        }
+
+        _log.info(event(
+            "aws_ir_hunt", "hunt_user_activity_by_ip.complete", target=result.target,
+            expected=len(expected), unexpected=len(unexpected), unparseable=len(unparseable),
+        ))
+
+        return result
 
     # =====================
     # GuardDuty
@@ -1298,3 +1828,714 @@ class AwsIRHunt:
         _log.info(event("aws_ir_hunt", "list_open_security_groups.complete",
                         scanned=total, open=len(open_groups)))
         return result
+
+    # =====================
+    # EC2: Security groups referencing specific IP(s)
+    # =====================
+
+    def hunt_security_groups_by_ip(
+        self,
+        ips: List[str],
+        *,
+        direction: str = "both",
+        max_groups: int = 500,
+    ) -> OperationResult:
+        """
+        Find EC2 security groups with ingress or egress rules whose CIDR
+        ranges cover one or more of the given IP addresses (or CIDRs).
+
+        Each entry in `ips` may be a bare address ("1.2.3.4") or a CIDR
+        block ("1.2.3.0/24"), IPv4 or IPv6. A rule matches when its CIDR
+        range overlaps a target — this catches both an exact /32 match and
+        a broader rule that happens to cover the target IP.
+
+        Args:
+            ips: IP addresses or CIDR blocks to search for.
+            direction: "ingress", "egress", or "both" (default). Restricts
+                which side of the security group is scanned.
+            max_groups: Maximum security groups to scan.
+
+        Returns:
+            OperationResult with details["matches"] = list of group findings.
+            Each matched rule includes match_type: "explicit" if the rule's
+            CIDR was written to cover this IP/range specifically, or
+            "wildcard" if it's 0.0.0.0/0 or ::/0 (open to everyone — the
+            target IP just happens to be included).
+
+        Raises:
+            ValueError: If `ips` is empty, any entry doesn't parse as an IP
+                address or CIDR network, or `direction` isn't one of
+                "ingress", "egress", "both".
+        """
+        if not ips:
+            raise ValueError("At least one IP or CIDR is required")
+        if direction not in ("ingress", "egress", "both"):
+            raise ValueError(f"direction must be 'ingress', 'egress', or 'both' — got {direction!r}")
+
+        targets = []
+        for raw in ips:
+            try:
+                targets.append(ipaddress.ip_network(raw, strict=False))
+            except ValueError as exc:
+                raise ValueError(f"Invalid IP or CIDR: {raw!r} ({exc})") from exc
+
+        result = OperationResult(
+            operation="hunt_security_groups_by_ip",
+            target=f"ips={','.join(ips)},direction={direction}",
+            success=True,
+        )
+
+        ec2 = self._services.ec2
+        matches: List[Dict[str, Any]] = []
+        total = 0
+
+        try:
+            paginator = ec2.get_paginator("describe_security_groups")
+            for page in paginator.paginate():
+                for sg in page.get("SecurityGroups", []):
+                    if total >= max_groups:
+                        break
+                    total += 1
+
+                    matched_rules: List[Dict[str, Any]] = []
+                    if direction in ("ingress", "both"):
+                        matched_rules += self._match_sg_rules_by_ip(
+                            sg.get("IpPermissions", []), "ingress", targets,
+                        )
+                    if direction in ("egress", "both"):
+                        matched_rules += self._match_sg_rules_by_ip(
+                            sg.get("IpPermissionsEgress", []), "egress", targets,
+                        )
+
+                    if matched_rules:
+                        matches.append({
+                            "group_id": sg.get("GroupId"),
+                            "group_name": sg.get("GroupName"),
+                            "vpc_id": sg.get("VpcId"),
+                            "description": sg.get("Description"),
+                            "matched_rules": matched_rules,
+                        })
+
+                if total >= max_groups:
+                    break
+
+        except botocore.exceptions.ClientError as exc:
+            result.add_error(f"Failed to describe security groups: {exc}")
+            _log.error(event("aws_ir_hunt", "hunt_security_groups_by_ip.error", error=str(exc)))
+
+        result.details["matches"] = matches
+        result.details["statistics"] = {
+            "groups_scanned": total,
+            "groups_matched": len(matches),
+            "targets": [str(t) for t in targets],
+        }
+        _log.info(event("aws_ir_hunt", "hunt_security_groups_by_ip.complete",
+                        scanned=total, matched=len(matches)))
+        return result
+
+    @staticmethod
+    def _match_sg_rules_by_ip(
+        perms: List[Dict[str, Any]],
+        direction: str,
+        targets: List[ipaddress._BaseNetwork],
+    ) -> List[Dict[str, Any]]:
+        matched: List[Dict[str, Any]] = []
+        for perm in perms:
+            cidrs = [
+                (r.get("CidrIp"), r.get("Description"))
+                for r in perm.get("IpRanges", []) if r.get("CidrIp")
+            ] + [
+                (r.get("CidrIpv6"), r.get("Description"))
+                for r in perm.get("Ipv6Ranges", []) if r.get("CidrIpv6")
+            ]
+            for cidr_str, description in cidrs:
+                try:
+                    cidr_net = ipaddress.ip_network(cidr_str, strict=False)
+                except ValueError:
+                    continue
+                hit_targets = [
+                    str(t) for t in targets
+                    if t.version == cidr_net.version and t.overlaps(cidr_net)
+                ]
+                if hit_targets:
+                    matched.append({
+                        "direction": direction,
+                        "protocol": perm.get("IpProtocol"),
+                        "from_port": perm.get("FromPort"),
+                        "to_port": perm.get("ToPort"),
+                        "cidr": cidr_str,
+                        "description": description,
+                        # "wildcard": the rule is 0.0.0.0/0 or ::/0 — it allows
+                        # everyone, the target IP just happens to be covered.
+                        # "explicit": the rule's CIDR is narrower than that,
+                        # i.e. it was written to allow this IP/range specifically.
+                        "match_type": "wildcard" if cidr_net.prefixlen == 0 else "explicit",
+                        "matched_targets": hit_targets,
+                    })
+        return matched
+
+    # =====================
+    # Exposed secrets: Lambda / ECS / SSM / EC2 user-data / CodeBuild
+    # =====================
+
+    _SECRET_SCANNERS = ("lambda", "ecs", "ssm", "ec2_user_data", "codebuild")
+
+    def _scan_lambda_secrets(self, bucket: "_SecretBucket", errors: List[str]) -> int:
+        lambda_ = self._services.lambda_
+        scanned = 0
+        try:
+            paginator = lambda_.get_paginator("list_functions")
+            for page in paginator.paginate():
+                for f in page.get("Functions", []):
+                    scanned += 1
+                    env = (f.get("Environment") or {}).get("Variables") or {}
+                    env = {k: str(v) for k, v in env.items()}
+
+                    def make_src(key, _f=f):
+                        return {
+                            "location_type": "lambda_env",
+                            "resource_id": _f.get("FunctionName", ""),
+                            "resource_arn": _f.get("FunctionArn", ""),
+                            "key_name": key,
+                        }
+
+                    _emit_aws_pair(env, make_src, bucket)
+                    for k, v in env.items():
+                        bucket.add(v, make_src(k), key_name=k)
+        except botocore.exceptions.ClientError as exc:
+            errors.append(f"lambda: {exc}")
+        return scanned
+
+    def _scan_ecs_secrets(self, bucket: "_SecretBucket", errors: List[str]) -> int:
+        ecs = self._services.ecs
+        arns: List[str] = []
+        try:
+            paginator = ecs.get_paginator("list_task_definitions")
+            for page in paginator.paginate(status="ACTIVE"):
+                arns.extend(page.get("taskDefinitionArns", []))
+        except botocore.exceptions.ClientError as exc:
+            errors.append(f"ecs: {exc}")
+            return 0
+
+        # Collapse to one revision per family — newest wins.
+        by_family: Dict[str, str] = {}
+        for arn in arns:
+            family = arn.rsplit("/", 1)[-1].rsplit(":", 1)[0]
+            by_family[family] = arn
+
+        scanned = 0
+        for arn in by_family.values():
+            scanned += 1
+            try:
+                resp = ecs.describe_task_definition(taskDefinition=arn)
+                td = resp.get("taskDefinition", {})
+                for c in td.get("containerDefinitions", []):
+                    cname = c.get("name", "")
+                    bag = {
+                        env.get("name", ""): str(env.get("value", ""))
+                        for env in (c.get("environment", []) or [])
+                    }
+
+                    def make_src(key, _arn=arn, _cname=cname):
+                        return {
+                            "location_type": "ecs_task_env",
+                            "resource_id": f"{_arn}::{_cname}",
+                            "resource_arn": _arn,
+                            "key_name": key,
+                        }
+
+                    _emit_aws_pair(bag, make_src, bucket)
+                    for k, v in bag.items():
+                        bucket.add(v, make_src(k), key_name=k)
+            except botocore.exceptions.ClientError as exc:
+                errors.append(f"ecs: {exc}")
+        return scanned
+
+    def _scan_ssm_secrets(self, bucket: "_SecretBucket", errors: List[str]) -> int:
+        ssm = self._services.ssm
+
+        # Only String parameters — SecureString is encrypted at rest with KMS.
+        names: List[str] = []
+        try:
+            paginator = ssm.get_paginator("describe_parameters")
+            for page in paginator.paginate(
+                ParameterFilters=[{"Key": "Type", "Option": "Equals", "Values": ["String"]}],
+            ):
+                for p in page.get("Parameters", []):
+                    names.append(p.get("Name", ""))
+        except botocore.exceptions.ClientError as exc:
+            errors.append(f"ssm: {exc}")
+            return 0
+
+        for i in range(0, len(names), 10):  # GetParameters caps at 10 names/call
+            chunk = names[i:i + 10]
+            try:
+                resp = ssm.get_parameters(Names=chunk)
+                for p in resp.get("Parameters", []):
+                    name = p.get("Name", "")
+                    bucket.add(str(p.get("Value", "")), {
+                        "location_type": "ssm_parameter",
+                        "resource_id": name,
+                        "resource_arn": p.get("ARN", ""),
+                        "key_name": name,
+                    }, key_name=name)
+            except botocore.exceptions.ClientError as exc:
+                errors.append(f"ssm: {exc}")
+        return len(names)
+
+    def _scan_ec2_user_data_secrets(
+        self, bucket: "_SecretBucket", errors: List[str], max_instances: int,
+    ) -> int:
+        ec2 = self._services.ec2
+
+        instance_ids: List[str] = []
+        try:
+            paginator = ec2.get_paginator("describe_instances")
+            for page in paginator.paginate():
+                for r in page.get("Reservations", []):
+                    for inst in r.get("Instances", []):
+                        instance_ids.append(inst["InstanceId"])
+        except botocore.exceptions.ClientError as exc:
+            errors.append(f"ec2: {exc}")
+            return 0
+
+        scanned = 0
+        for inst_id in instance_ids[:max_instances]:
+            scanned += 1
+            try:
+                resp = ec2.describe_instance_attribute(InstanceId=inst_id, Attribute="userData")
+                ud_b64 = (resp.get("UserData", {}) or {}).get("Value", "")
+                if not ud_b64:
+                    continue
+                # Unparseable user-data is skipped by design.
+                try:
+                    user_data = base64.b64decode(ud_b64).decode("utf-8", errors="replace")
+                except Exception:  # nosec B112
+                    continue
+
+                # Walk line-by-line so the line itself works as a synthetic key_name.
+                for lineno, line in enumerate(user_data.splitlines(), start=1):
+                    bucket.add(line.strip(), {
+                        "location_type": "ec2_user_data",
+                        "resource_id": inst_id,
+                        "key_name": "user-data",
+                        "extra": f"line {lineno}",
+                    }, key_name=line[:120])
+            except botocore.exceptions.ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code != "InvalidInstanceID.NotFound":
+                    errors.append(f"ec2: {exc}")
+        return scanned
+
+    def _scan_codebuild_secrets(self, bucket: "_SecretBucket", errors: List[str]) -> int:
+        cb = self._services.codebuild
+
+        names: List[str] = []
+        try:
+            paginator = cb.get_paginator("list_projects")
+            for page in paginator.paginate():
+                names.extend(page.get("projects", []))
+        except botocore.exceptions.ClientError as exc:
+            errors.append(f"codebuild: {exc}")
+            return 0
+
+        scanned = 0
+        for i in range(0, len(names), 100):  # BatchGetProjects caps at 100 names/call
+            chunk = names[i:i + 100]
+            try:
+                resp = cb.batch_get_projects(names=chunk)
+                for p in resp.get("projects", []):
+                    scanned += 1
+                    proj_name = p.get("name", "")
+                    proj_arn = p.get("arn", "")
+                    env_vars = (p.get("environment") or {}).get("environmentVariables", []) or []
+                    bag = {
+                        ev.get("name", ""): str(ev.get("value", ""))
+                        for ev in env_vars if ev.get("type") in (None, "PLAINTEXT")
+                    }
+
+                    def make_src(key, _n=proj_name, _a=proj_arn):
+                        return {
+                            "location_type": "codebuild_env",
+                            "resource_id": _n,
+                            "resource_arn": _a,
+                            "key_name": key,
+                        }
+
+                    _emit_aws_pair(bag, make_src, bucket)
+                    for k, v in bag.items():
+                        bucket.add(v, make_src(k), key_name=k)
+            except botocore.exceptions.ClientError as exc:
+                errors.append(f"codebuild: {exc}")
+        return scanned
+
+    def _verify_secret_pairs(self, bucket: "_SecretBucket") -> None:
+        """Group AKIA + SAK occurrences by source-resource bag, test each
+        unique (AKIA, SAK) pair once via sts:GetCallerIdentity, and attach
+        the outcome to every finding built from that pair."""
+
+        def _source_key(s: Dict[str, Any]) -> Tuple[str, str]:
+            return (s.get("location_type", ""), s.get("resource_arn") or s.get("resource_id", ""))
+
+        grouped: Dict[Tuple[str, str], Dict[str, list]] = {}
+        for finding in bucket.values():
+            if finding["category"] not in ("AWS Access Key", "AWS Secret Access Key"):
+                continue
+            raw = bucket.raw_by_hash.get(finding["hash"])
+            if not raw:
+                continue
+            side = "akia" if finding["category"] == "AWS Access Key" else "sak"
+            for s in finding["sources"]:
+                key = _source_key(s)
+                grouped.setdefault(key, {"akia": [], "sak": []})
+                grouped[key][side].append((finding, raw))
+
+        seen_pairs: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for sides in grouped.values():
+            if not sides["akia"] or not sides["sak"]:
+                continue
+            for akia_finding, akia_raw in sides["akia"]:
+                for sak_finding, sak_raw in sides["sak"]:
+                    pair_key = (akia_finding["hash"], sak_finding["hash"])
+                    entry = seen_pairs.setdefault(pair_key, {
+                        "akia_raw": akia_raw, "sak_raw": sak_raw, "findings": [],
+                    })
+                    entry["findings"].append((akia_finding, sak_finding))
+
+        if not seen_pairs:
+            return
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            future_to_key = {
+                ex.submit(verify_aws_key_pair, info["akia_raw"], info["sak_raw"]): pair_key
+                for pair_key, info in seen_pairs.items()
+            }
+            for fut in as_completed(future_to_key):
+                pair_key = future_to_key[fut]
+                outcome = fut.result()
+                for akia_finding, sak_finding in seen_pairs[pair_key]["findings"]:
+                    akia_finding["live_test_result"] = outcome
+                    sak_finding["live_test_result"] = outcome
+
+    def hunt_exposed_secrets(
+        self,
+        *,
+        include: Optional[List[str]] = None,
+        keep_raw: bool = False,
+        test_pairs: bool = False,
+        max_ec2_instances: int = 500,
+    ) -> OperationResult:
+        """
+        Scan common plaintext-secret hiding spots across the account/region:
+        Lambda env vars, ECS task-definition env vars, SSM String
+        parameters, EC2 instance user-data, and CodeBuild project env vars.
+
+        Detection runs two layers: regex matchers for well-known credential
+        shapes (AWS access-key pairs, GitHub/Slack/Stripe tokens, JWTs, PEM
+        private-key blocks) plus a key-name heuristic (a variable named
+        like a secret whose value is also credential-shaped). Findings are
+        deduplicated by a SHA-256 hash of the raw value — the raw value
+        itself is never returned unless keep_raw=True.
+
+        A bare AWS access key ID (AKIA...) is never flagged on its own —
+        it's not usable without its secret key and leaks routinely in
+        CloudTrail/IAM output. It's only flagged when a same-shaped 40-char
+        secret key is found in the same env-var/parameter bag.
+
+        Args:
+            include: Subset of {"lambda", "ecs", "ssm", "ec2_user_data",
+                "codebuild"} to scan. Defaults to all five.
+            keep_raw: If True, details["raw_values"] maps hash -> the
+                plaintext value (e.g. to build a rotation worklist).
+                Treat the result as sensitive when set.
+            test_pairs: If True, every detected AWS access-key + secret-key
+                pair found together is verified live via
+                sts:GetCallerIdentity — read-only, no other API is ever
+                called, and the raw values are held only in memory for the
+                duration of the check. The outcome (live/denied/expired/
+                error + calling principal ARN) is attached to the finding
+                as live_test_result. Off by default since this makes
+                authenticated calls using the discovered credentials.
+            max_ec2_instances: Cap on EC2 instances scanned for user-data
+                (one DescribeInstanceAttribute call per instance).
+
+        Returns:
+            OperationResult with:
+              - details["credentials"]: deduplicated findings (category,
+                severity, redacted preview, detection method, source
+                locations, and live_test_result if test_pairs=True).
+              - details["raw_values"]: hash -> plaintext, only if keep_raw.
+              - details["statistics"]: per-source scan counts and total
+                findings.
+        """
+        scanners = include if include is not None else list(self._SECRET_SCANNERS)
+        unknown = sorted(set(scanners) - set(self._SECRET_SCANNERS))
+        if unknown:
+            raise ValueError(
+                f"Unknown scanner(s): {unknown}. Valid: {list(self._SECRET_SCANNERS)}"
+            )
+
+        result = OperationResult(
+            operation="hunt_exposed_secrets",
+            target=f"sources={','.join(scanners)}",
+            success=True,
+        )
+
+        bucket = _SecretBucket(keep_raw=keep_raw or test_pairs)
+        errors: List[str] = []
+        scan_counts: Dict[str, int] = {}
+
+        if "lambda" in scanners:
+            scan_counts["lambda"] = self._scan_lambda_secrets(bucket, errors)
+        if "ecs" in scanners:
+            scan_counts["ecs"] = self._scan_ecs_secrets(bucket, errors)
+        if "ssm" in scanners:
+            scan_counts["ssm"] = self._scan_ssm_secrets(bucket, errors)
+        if "ec2_user_data" in scanners:
+            scan_counts["ec2_user_data"] = self._scan_ec2_user_data_secrets(
+                bucket, errors, max_ec2_instances,
+            )
+        if "codebuild" in scanners:
+            scan_counts["codebuild"] = self._scan_codebuild_secrets(bucket, errors)
+
+        if test_pairs:
+            self._verify_secret_pairs(bucket)
+
+        result.details["credentials"] = bucket.values()
+        if keep_raw:
+            result.details["raw_values"] = dict(bucket.raw_by_hash)
+        result.details["statistics"] = {
+            "scanned": scan_counts,
+            "findings": len(bucket.findings),
+        }
+        if errors:
+            result.details["scan_errors"] = errors
+            result.add_error(f"{len(errors)} source scan(s) failed — see details.scan_errors")
+            for e in errors:
+                _log.warning(event("aws_ir_hunt", "hunt_exposed_secrets.scan_error", error=e))
+
+        _log.info(event("aws_ir_hunt", "hunt_exposed_secrets.complete", findings=len(bucket.findings)))
+        return result
+
+    # =====================
+    # Local CloudTrail log query (files already on disk, e.g. from
+    # aws_ir.forensics.download_s3_logs())
+    # =====================
+
+    _DEFAULT_QUERY_FIELDS = (
+        "eventTime", "userIdentity.accountId", "userIdentity.arn",
+        "userIdentity.accessKeyId", "eventSource", "eventName",
+        "awsRegion", "userAgent",
+    )
+
+    def query_local_cloudtrail_logs(
+        self,
+        path: str,
+        *,
+        source_ip: Optional[str] = None,
+        user_name: Optional[str] = None,
+        access_key_id: Optional[str] = None,
+        event_name: Optional[str] = None,
+        event_source: Optional[str] = None,
+        aws_region: Optional[str] = None,
+        account_id: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        fields: Optional[List[str]] = None,
+        max_events: Optional[int] = None,
+    ) -> OperationResult:
+        """
+        Filter and project fields from CloudTrail log files already on
+        disk — e.g. the flat folder produced by
+        aws_ir.forensics.download_s3_logs().
+
+        This is an offline query: no AWS API calls, no 90-day CloudTrail
+        history limit (works on however far back you downloaded), and
+        every field in the raw record is available for projection — not
+        just what LookupEvents exposes. Use hunt.lookup_events() instead
+        for live/recent data straight from the CloudTrail API.
+
+        Reads every "*.json" and "*.json.gz" file directly under `path`
+        (non-recursive; pass a single file path to query just that file).
+        Each file is expected to be a standard CloudTrail log file (a
+        top-level {"Records": [...]}), though a bare list of records or a
+        single record object is also accepted.
+
+        Args:
+            path: Directory of CloudTrail log files, or a single file.
+            source_ip: Exact match on sourceIPAddress.
+            user_name: Matches userIdentity.userName exactly, or as a
+                substring of userIdentity.arn (covers assumed-role
+                sessions, which have no userName field).
+            access_key_id: Exact match on userIdentity.accessKeyId.
+            event_name: Exact match on eventName.
+            event_source: Exact match on eventSource (e.g. "s3.amazonaws.com").
+            aws_region: Exact match on awsRegion.
+            account_id: Matches userIdentity.accountId or recipientAccountId.
+            start_time / end_time: Filter by eventTime (UTC).
+            fields: Dot-path fields to project per matching record, e.g.
+                "userIdentity.accountId". Defaults to the fields IR triage
+                usually wants first: eventTime, userIdentity.accountId,
+                userIdentity.arn, userIdentity.accessKeyId, eventSource,
+                eventName, awsRegion, userAgent.
+            max_events: Cap on matched records returned. None = unlimited.
+
+        Returns:
+            OperationResult with:
+              - details["events"]: matching records projected to `fields`,
+                sorted by eventTime ascending.
+              - details["statistics"]: files scanned/failed, records
+                scanned, records matched.
+              - details["failed_files"]: present only if some files
+                couldn't be parsed — the run still returns what it could.
+        """
+        fields = list(fields) if fields else list(self._DEFAULT_QUERY_FIELDS)
+
+        result = OperationResult(
+            operation="query_local_cloudtrail_logs",
+            target=f"path={path}",
+            success=True,
+        )
+
+        files = self._collect_cloudtrail_log_files(path)
+        if not files:
+            result.add_error(f"No .json/.json.gz files found under {path!r}")
+            result.details["events"] = []
+            result.details["statistics"] = {
+                "files_scanned": 0, "files_failed": 0,
+                "records_scanned": 0, "records_matched": 0,
+            }
+            return result
+
+        matched: List[Tuple[str, Dict[str, Any]]] = []
+        records_scanned = 0
+        failed_files: List[str] = []
+
+        for file_path in files:
+            if max_events is not None and len(matched) >= max_events:
+                break
+
+            try:
+                records = self._read_cloudtrail_records(file_path)
+            except (OSError, ValueError) as exc:
+                failed_files.append(f"{file_path}: {exc}")
+                continue
+
+            for record in records:
+                records_scanned += 1
+                if max_events is not None and len(matched) >= max_events:
+                    break
+                if not self._cloudtrail_record_matches(
+                    record,
+                    source_ip=source_ip, user_name=user_name,
+                    access_key_id=access_key_id, event_name=event_name,
+                    event_source=event_source, aws_region=aws_region,
+                    account_id=account_id, start_time=start_time, end_time=end_time,
+                ):
+                    continue
+                matched.append((
+                    record.get("eventTime") or "",
+                    {f: _dig(record, f) for f in fields},
+                ))
+
+        matched.sort(key=lambda pair: pair[0])
+        events = [projected for _, projected in matched]
+
+        result.details["events"] = events
+        result.details["statistics"] = {
+            "files_scanned": len(files),
+            "files_failed": len(failed_files),
+            "records_scanned": records_scanned,
+            "records_matched": len(events),
+        }
+        if failed_files:
+            result.details["failed_files"] = failed_files
+            result.add_error(f"{len(failed_files)} file(s) failed to parse — see details.failed_files")
+
+        _log.info(event("aws_ir_hunt", "query_local_cloudtrail_logs.complete",
+                        files=len(files), scanned=records_scanned, matched=len(events)))
+        return result
+
+    @staticmethod
+    def _collect_cloudtrail_log_files(path: str) -> List[str]:
+        if os.path.isfile(path):
+            return [path]
+        if not os.path.isdir(path):
+            return []
+        return [
+            os.path.join(path, name)
+            for name in sorted(os.listdir(path))
+            if name.endswith(".json") or name.endswith(".json.gz")
+        ]
+
+    @staticmethod
+    def _read_cloudtrail_records(file_path: str) -> List[Dict[str, Any]]:
+        opener = gzip.open if file_path.endswith(".gz") else open
+        with opener(file_path, "rt", encoding="utf-8", errors="replace") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("Records"), list):
+            return data["Records"]
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return [data]
+        raise ValueError(f"unrecognized CloudTrail log shape in {file_path}")
+
+    @staticmethod
+    def _parse_cloudtrail_time(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        v = value[:-1] + "+00:00" if value.endswith("Z") else value
+        try:
+            dt = datetime.fromisoformat(v)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    @staticmethod
+    def _cloudtrail_record_matches(
+        record: Dict[str, Any],
+        *,
+        source_ip: Optional[str],
+        user_name: Optional[str],
+        access_key_id: Optional[str],
+        event_name: Optional[str],
+        event_source: Optional[str],
+        aws_region: Optional[str],
+        account_id: Optional[str],
+        start_time: Optional[datetime],
+        end_time: Optional[datetime],
+    ) -> bool:
+        if source_ip and record.get("sourceIPAddress") != source_ip:
+            return False
+        if event_name and record.get("eventName") != event_name:
+            return False
+        if event_source and record.get("eventSource") != event_source:
+            return False
+        if aws_region and record.get("awsRegion") != aws_region:
+            return False
+
+        user_identity = record.get("userIdentity") or {}
+        if access_key_id and user_identity.get("accessKeyId") != access_key_id:
+            return False
+        if user_name:
+            arn = user_identity.get("arn") or ""
+            if user_identity.get("userName") != user_name and user_name not in arn:
+                return False
+        if account_id:
+            record_account = user_identity.get("accountId") or record.get("recipientAccountId")
+            if record_account != account_id:
+                return False
+
+        if start_time or end_time:
+            event_time = AwsIRHunt._parse_cloudtrail_time(record.get("eventTime"))
+            if event_time is None:
+                return False
+            if start_time and event_time < start_time:
+                return False
+            if end_time and event_time > end_time:
+                return False
+
+        return True

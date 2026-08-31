@@ -52,6 +52,21 @@ class TestDredgeInit:
         d = Dredge(session=make_session())
         assert d.github_ir is None
 
+    def test_github_ir_receives_dredge_dry_run_config(self):
+        # Regression: DredgeConfig(dry_run=True) must reach GitHub response
+        # actions, not just AWS/k8s. Otherwise --dry-run silently executes
+        # destructive GitHub calls.
+        cfg = GitHubIRConfig(org="test-org", token="tok")
+        d = Dredge(session=make_session(), config=DredgeConfig(dry_run=True), github_config=cfg)
+        result = d.github_ir.response.remove_org_member("evil")
+        assert result.details.get("dry_run") is True
+
+    def test_github_config_own_dry_run_is_not_clobbered(self):
+        cfg = GitHubIRConfig(org="test-org", token="tok", dry_run=True)
+        d = Dredge(session=make_session(), config=DredgeConfig(dry_run=False), github_config=cfg)
+        result = d.github_ir.response.remove_org_member("evil")
+        assert result.details.get("dry_run") is True
+
     def test_custom_config_used(self):
         config = DredgeConfig(dry_run=True, region_name="eu-west-1")
         d = Dredge(session=make_session(), config=config)

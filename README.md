@@ -1,16 +1,16 @@
 <div align="center">
  <p>
   <h1>
-    Dredge - 0.2.0
+    Dredge - 1.0.0
   </h1>
  </p>
 </div>
 
 <div align="center">
 
-![CI](https://github.com/dbnz-io/dredge-internal/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/dbnz-io/dredge/actions/workflows/ci.yml/badge.svg)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-![Coverage](https://img.shields.io/badge/coverage-99%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-%E2%89%A580%25-brightgreen)
 
 </div>
 
@@ -27,9 +27,9 @@
 - Python library + CLI for cloud incident response and threat hunting.
 - **AWS**: containment, forensics, and hunting across IAM, EC2, RDS, ECS, S3, Lambda, KMS, GuardDuty, Security Hub, CloudTrail, and more.
 - **Kubernetes**: containment, forensics, and hunting across RBAC, pods, nodes, NetworkPolicy, and Secrets — works against any cluster (EKS, GKE, AKS, or self-managed) via standard kubeconfig or service-account auth.
-- **GitHub**: org/enterprise audit log hunting.
+- **GitHub**: org/enterprise audit log hunting **and** containment (block/remove members, revoke deploy keys, delete webhooks, archive/lock down repos).
 - **GCP**: Cloud Logging hunting (in progress).
-- 891 tests, 99% coverage, 80% floor enforced in CI.
+- 1,100+ tests, ~98% coverage, 80% floor enforced in CI.
 
 ---
 
@@ -146,20 +146,51 @@ v1 hunting uses the built-in Kubernetes Events API only — flavor-agnostic, no 
 ## Installation
 
 ```bash
-git clone https://github.com/dbnz-io/dredge-cli.git
-cd dredge-cli
-pip install -e .
+pip install dredge-ir
 ```
 
-Run tests:
+The distribution is named **`dredge-ir`** (the bare `dredge` name is taken on
+PyPI by an unrelated package), but the import package and CLI are just
+`dredge` — `import dredge` and `dredge ...` work as shown throughout this
+README.
+
+Dependencies are declared entirely in `pyproject.toml` — there is no separate
+`requirements.txt`.
+
+From source (for development — adds the test toolchain, then run the suite):
+
 ```bash
+git clone https://github.com/dbnz-io/dredge.git
+cd dredge
+pip install -e ".[test]"
 pytest -q
 ```
 
-See available commands:
-```bash
-dredge --help
+---
+
+## CLI structure
+
+Commands are nested by **provider → bucket → command**:
+
 ```
+dredge <provider> <bucket> <command> [options]
+        │          │        │
+        │          │        └─ e.g. cloudtrail, quarantine-pod, audit
+        │          └────────── hunt · response · forensics
+        └───────────────────── aws · k8s · github
+```
+
+Help is available at every level, revealing what's below it:
+
+```bash
+dredge --help              # global overview, grouped by provider × bucket
+dredge aws --help          # the buckets under aws (hunt/response/forensics)
+dredge aws hunt --help     # the commands under aws hunt
+dredge aws hunt cloudtrail --help   # that command's full options
+```
+
+Global flags (auth, region, `--dry-run`) go **before** the provider, e.g.
+`dredge --aws-profile ir --region us-east-1 aws response disable-user --user bob`.
 
 ---
 
@@ -206,19 +237,19 @@ podman build -t dredge:latest .
 ```bash
 # Disable an access key
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-disable-access-key --user compromised-user --access-key-id AKIA123456789
+  aws response disable-access-key --user compromised-user --access-key-id AKIA123456789
 
 # Disable a user (deactivate keys, remove groups, delete login profile, detach policies)
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-disable-user --user compromised-user
+  aws response disable-user --user compromised-user
 
 # Revoke active sessions (deny-all inline policy with TokenIssueTime condition)
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-revoke-active-sessions --user compromised-user
+  aws response revoke-active-sessions --user compromised-user
 
 # Detach a single policy from a role
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-detach-iam-policy arn:aws:iam::123456789012:policy/AdminAccess --role-name OldRole
+  aws response detach-iam-policy arn:aws:iam::123456789012:policy/AdminAccess --role-name OldRole
 ```
 
 #### EC2 / Network Containment
@@ -226,15 +257,15 @@ dredge --aws-profile dredge-role --region us-east-1 \
 ```bash
 # Network-isolate EC2 instances (forensic empty SG)
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-isolate-ec2 i-0123456789abcdef0 i-0abcdef1234567890
+  aws response isolate-ec2 i-0123456789abcdef0 i-0abcdef1234567890
 
 # Block a CIDR at the NACL level
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-block-nacl-cidrs --vpc-id vpc-abc123 --cidr 198.51.100.0/24
+  aws response block-nacl-cidrs --vpc-id vpc-abc123 --cidr 198.51.100.0/24
 
 # Terminate an instance (snapshots EBS volumes first by default)
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-terminate-ec2 i-0123456789abcdef0
+  aws response terminate-ec2 i-0123456789abcdef0
 ```
 
 #### RDS / ECS / Lambda
@@ -242,19 +273,19 @@ dredge --aws-profile dredge-role --region us-east-1 \
 ```bash
 # Isolate an RDS instance
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-isolate-rds my-prod-db
+  aws response isolate-rds my-prod-db
 
 # Scale down a compromised ECS service
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-stop-ecs-service my-cluster my-service
+  aws response stop-ecs-service my-cluster my-service
 
 # Throttle a Lambda to zero
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-disable-lambda my-function
+  aws response disable-lambda --function-name my-function
 
 # Terminate active SSM sessions on an instance
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-terminate-ssm-sessions i-0123456789abcdef0
+  aws response terminate-ssm-sessions i-0123456789abcdef0
 ```
 
 #### S3
@@ -262,11 +293,11 @@ dredge --aws-profile dredge-role --region us-east-1 \
 ```bash
 # Block public access at account level
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-block-s3-account --account-id 111122223333
+  aws response block-s3-account --account-id 111122223333
 
 # Quarantine a bucket (block public + deny all external principals)
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-quarantine-s3-bucket suspicious-bucket
+  aws response quarantine-s3-bucket suspicious-bucket
 ```
 
 #### Threat Hunting
@@ -274,41 +305,45 @@ dredge --aws-profile dredge-role --region us-east-1 \
 ```bash
 # Hunt CloudTrail events for a compromised access key
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-hunt-cloudtrail --access-key-id AKIAIOSFODNN7EXAMPLE \
+  aws hunt cloudtrail --access-key-id AKIAIOSFODNN7EXAMPLE \
   --start-time 2026-04-01T00:00:00Z --end-time 2026-04-12T00:00:00Z
 
 # List high/critical GuardDuty findings
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-hunt-guardduty --detector-id abc123 --severity-min 7.0
+  aws hunt guardduty --detector-id abc123 --severity-min 7.0
 
 # Query Security Hub for critical findings
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-hunt-security-hub --severity-label CRITICAL --severity-label HIGH
+  aws hunt security-hub --severity-label CRITICAL --severity-label HIGH
 
 # Get IAM credential report (all users, key ages, MFA status)
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-iam-credential-report
+  aws response iam-credential-report
 
 # Check AWS Config history for an EC2 instance
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-hunt-config-history AWS::EC2::Instance i-0123456789abcdef0
+  aws hunt config-history AWS::EC2::Instance i-0123456789abcdef0
 ```
 
 #### Forensics
 
 ```bash
-# Snapshot all volumes on an instance
+# Download the last 2 days of CloudTrail logs across every account/region
+# from an org/Control Tower S3 bucket (date-aware: only lists dated folders
+# inside the window, not years of history)
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-snapshot-instance i-0123456789abcdef0
+  aws forensics download-s3-logs \
+  --bucket my-org-cloudtrail --prefix AWSLogs/ \
+  --destination ./ct-logs --days-ago 2
 
 # Enable VPC flow logs
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-enable-vpc-flow-logs vpc-abc123 \
+  aws response enable-vpc-flow-logs vpc-abc123 \
   --deliver-logs-permission-arn arn:aws:iam::123:role/FlowLogsRole
 
 # Check CloudTrail is healthy and logging
 dredge --aws-profile dredge-role --region us-east-1 \
-  aws-cloudtrail-status
+  aws response cloudtrail-status
 ```
 
 ---
@@ -321,27 +356,32 @@ Token scopes required:
 - Org audit logs: `admin:org`, `audit_log`
 - Enterprise audit logs: `admin:enterprise`, `audit_log`
 
-```bash
---github-token "$GITHUB_TOKEN"
-```
+**Prefer the environment variable.** Export `GITHUB_TOKEN` and let dredge read
+it — passing `--github-token <value>` puts the secret in your shell history and
+in the process list (`ps`), where other users on the host can see it. Use the
+`--github-token` flag only for ad-hoc, throwaway tokens.
 
-Or set `GITHUB_TOKEN` in your environment.
+```bash
+export GITHUB_TOKEN="ghp_..."
+```
 
 ### CLI Examples
 
+These read the token from `$GITHUB_TOKEN` (no `--github-token` flag needed):
+
 ```bash
 # Hunt today's activity for a user
-dredge --github-org dbnz-io --github-token "$GITHUB_TOKEN" \
-  github-hunt-audit --actor sabastante --today --include all
+dredge --github-org dbnz-io \
+  github hunt audit --actor sabastante --today --include all
 
 # Hunt an action over a date range
-dredge --github-enterprise dbnz-io --github-token "$GITHUB_TOKEN" \
-  github-hunt-audit --action repo.create \
+dredge --github-enterprise dbnz-io \
+  github hunt audit --action repo.create \
   --start-time 2025-01-01T00:00:00Z --end-time 2025-01-07T23:59:59Z
 
 # Hunt suspicious IP activity
-dredge --github-org dbnz-io --github-token "$GITHUB_TOKEN" \
-  github-hunt-audit --source-ip 203.0.113.50 --today --include all
+dredge --github-org dbnz-io \
+  github hunt audit --source-ip 203.0.113.50 --today --include all
 ```
 
 ---
@@ -381,30 +421,30 @@ Dredge authenticates to Kubernetes the same way `kubectl` does, plus a first-cla
 ```bash
 # Quarantine a pod suspected of compromise
 dredge --k8s-context prod-cluster --k8s-namespace default \
-  k8s-quarantine-pod suspicious-pod
+  k8s response quarantine-pod suspicious-pod
 
 # Cordon and drain a node
 dredge --k8s-context prod-cluster \
-  k8s-drain-node ip-10-0-1-23.ec2.internal
+  k8s response drain-node ip-10-0-1-23.ec2.internal
 
 # Disable a compromised ServiceAccount (delete tokens + bindings)
 dredge --k8s-context prod-cluster --k8s-namespace default \
-  k8s-disable-service-account leaked-sa
+  k8s response disable-service-account leaked-sa
 
 # Hunt Events for a namespace over the last 24h (default window)
 dredge --k8s-context prod-cluster \
-  k8s-hunt-events --namespace default --event-type Warning
+  k8s hunt events --namespace default --event-type Warning
 
 # Find what a compromised ServiceAccount can do
 dredge --k8s-context prod-cluster \
-  k8s-hunt-role-bindings-for-subject --kind ServiceAccount --name leaked-sa
+  k8s hunt role-bindings-for-subject --kind ServiceAccount --name leaked-sa
 
 # Flag pods running with elevated host access
-dredge --k8s-context prod-cluster k8s-hunt-privileged-pods
+dredge --k8s-context prod-cluster k8s hunt privileged-pods
 
 # Capture forensic evidence before containment
 dredge --k8s-context prod-cluster --k8s-namespace default \
-  k8s-get-pod-manifest suspicious-pod
+  k8s forensics get-pod-manifest suspicious-pod
 ```
 
 ---
@@ -487,8 +527,7 @@ d = Dredge(k8s_config=cfg)
 
 - **Azure** support (auth, IR actions, log hunting).
 - **Okta** IR (suspend users, revoke sessions, hunt sign-in logs).
-- **GitHub IR actions** (suspend user, revoke token, remove from org).
-- **GCP** — complete implementation and test coverage.
+- **GCP** — expand beyond Cloud Logging hunting to full IR actions + coverage (currently in progress).
 - **Kubernetes**: cloud-specific audit log hunting (EKS → CloudWatch, GKE → Cloud Logging) composed with `aws_ir`/`gcp_ir`.
 - **Kubernetes**: pod filesystem/memory forensic capture via ephemeral debug containers.
 - **Kubernetes**: cross-cloud credential revocation for IRSA (EKS) / Workload Identity (GKE/AKS) bound ServiceAccounts.

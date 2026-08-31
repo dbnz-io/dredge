@@ -1,8 +1,34 @@
 [project]
-name = "dredge"
-version = "0.1.1"
-description = "Cloud Incident Response & Threat Hunting for AWS + GitHub"
+# Distribution name is "dredge-ir" (the bare "dredge" is taken on PyPI by an
+# unrelated 2019 package). The import package and CLI stay "dredge":
+#   pip install dredge-ir  ->  import dredge  /  $ dredge ...
+name = "dredge-ir"
+version = "1.0.0"
+description = "Cloud Incident Response & Threat Hunting for AWS, Kubernetes, GitHub & GCP"
 readme = "README.md"
+keywords = [
+    "incident-response",
+    "dfir",
+    "threat-hunting",
+    "aws",
+    "kubernetes",
+    "github",
+    "gcp",
+    "cloudtrail",
+    "security",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
 # google-cloud-python (google-cloud-logging's own dependency chain, via
 # google-cloud-core) dropped Python 3.9 support and moved to a 3.10+ floor.
 # Claiming 3.9 here (as this project did until CI actually tested it) sends
@@ -10,8 +36,12 @@ readme = "README.md"
 # a mutually-compatible boto3/google-cloud-logging/grpcio version set that
 # doesn't exist -- not a real code incompatibility, just a stale floor.
 requires-python = ">=3.10"
-license = {text = "MPL-2.0"}
+license = "MPL-2.0"
+license-files = ["LICENSE"]
 authors = [
+    { name="Solidarity Labs", email="sabastante@solidaritylabs.io" }
+]
+maintainers = [
     { name="Solidarity Labs", email="sabastante@solidaritylabs.io" }
 ]
 
@@ -25,10 +55,28 @@ dependencies = [
     "kubernetes>=29.0.0",
 ]
 
+[project.optional-dependencies]
+# Test toolchain, so contributors and CI install the same set from one place:
+#   pip install -e ".[test]"
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-mock>=3.10",
+]
+
+# Keep this table AFTER the top-level [project] keys: a [project.urls] header
+# opens a sub-table, so any bare `key = ...` placed below it would be parsed
+# as project.urls.key (TOML tables extend until the next header).
+[project.urls]
+Homepage = "https://github.com/dbnz-io/dredge"
+Repository = "https://github.com/dbnz-io/dredge"
+Issues = "https://github.com/dbnz-io/dredge/issues"
+
 [project.scripts]
 dredge = "dredge.cli:main"
 
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+# setuptools>=77 for PEP 639 SPDX `license = "MPL-2.0"` string + license-files.
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 

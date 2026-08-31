@@ -1,6 +1,7 @@
 import os
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock
 import pytest
 from botocore.exceptions import ClientError
@@ -605,3 +606,476 @@ class TestCaptureGuarddutyFindingDetail:
         services.guardduty.get_findings.side_effect = make_client_error()
         result = AwsIRForensics(services, DredgeConfig()).capture_guardduty_finding_detail("detector-1", "f-1")
         assert result.success is False
+
+
+class TestDownloadS3Logs:
+    def _make_s3(self, pages, objects_by_key):
+        s3 = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = pages
+        s3.get_paginator.return_value = paginator
+
+        def get_object(Bucket, Key):
+            return {"Body": MagicMock(read=MagicMock(return_value=objects_by_key[Key]))}
+
+        s3.get_object.side_effect = get_object
+        return s3
+
+    def test_flattens_keys_and_gunzips(self, tmp_path):
+        import gzip
+
+        services = make_services()
+        raw_json = b'{"eventName": "ConsoleLogin"}'
+        objects = {
+            "AWSLogs/123/CloudTrail/us-east-1/2026/08/25/file1.json.gz": gzip.compress(raw_json),
+            "AWSLogs/123/CloudTrail/eu-west-1/2026/08/25/file1.json.gz": gzip.compress(raw_json),
+        }
+        pages = [{"Contents": [{"Key": k} for k in objects]}]
+        services.s3 = self._make_s3(pages, objects)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", prefix="AWSLogs/", destination=str(tmp_path)
+        )
+
+        assert result.success is True
+        assert result.details["downloaded"] == 2
+        written = sorted(os.listdir(tmp_path))
+        assert len(written) == 2
+        # flattened, no nested directories created
+        assert all(os.path.isfile(tmp_path / f) for f in written)
+        for f in written:
+            assert (tmp_path / f).read_bytes() == raw_json
+            assert f.endswith(".json")
+            assert "/" not in f
+
+    def test_skips_non_matching_suffixes(self, tmp_path):
+        services = make_services()
+        objects = {"logs/readme.txt": b"hello"}
+        pages = [{"Contents": [{"Key": k} for k in objects]}]
+        services.s3 = self._make_s3(pages, objects)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", destination=str(tmp_path)
+        )
+
+        assert result.details["downloaded"] == 0
+        assert result.details["skipped"] == 1
+        assert os.listdir(tmp_path) == []
+
+    def test_empty_suffixes_downloads_everything(self, tmp_path):
+        services = make_services()
+        objects = {"logs/readme.txt": b"hello"}
+        pages = [{"Contents": [{"Key": k} for k in objects]}]
+        services.s3 = self._make_s3(pages, objects)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", destination=str(tmp_path), suffixes=()
+        )
+
+        assert result.details["downloaded"] == 1
+
+    def test_object_download_error_recorded_but_others_continue(self, tmp_path):
+        services = make_services()
+        objects = {
+            "a/one.json": b"{}",
+            "b/two.json": b"{}",
+        }
+        pages = [{"Contents": [{"Key": k} for k in objects]}]
+        s3 = self._make_s3(pages, objects)
+
+        def get_object(Bucket, Key):
+            if Key == "a/one.json":
+                raise make_client_error()
+            return {"Body": MagicMock(read=MagicMock(return_value=objects[Key]))}
+
+        s3.get_object.side_effect = get_object
+        services.s3 = s3
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", destination=str(tmp_path)
+        )
+
+        assert result.success is False
+        assert result.details["downloaded"] == 1
+        assert "a/one.json" in result.details["failed"]
+
+    def test_list_error_records_failure(self, tmp_path):
+        services = make_services()
+        paginator = MagicMock()
+        paginator.paginate.side_effect = make_client_error()
+        services.s3.get_paginator.return_value = paginator
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", destination=str(tmp_path)
+        )
+
+        assert result.success is False
+
+    def test_skips_folder_placeholder_keys(self, tmp_path):
+        services = make_services()
+        objects = {"logs/one.json": b"{}"}
+        pages = [{"Contents": [{"Key": "logs/"}, {"Key": "logs/one.json"}]}]
+        services.s3 = self._make_s3(pages, objects)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", destination=str(tmp_path)
+        )
+
+        assert result.details["downloaded"] == 1
+
+    def test_gzip_decompress_error_recorded(self, tmp_path):
+        services = make_services()
+        objects = {"logs/bad.json.gz": b"not actually gzip"}
+        pages = [{"Contents": [{"Key": k} for k in objects]}]
+        services.s3 = self._make_s3(pages, objects)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", destination=str(tmp_path)
+        )
+
+        assert result.success is False
+        assert "gzip decompress failed" in result.details["failed"]["logs/bad.json.gz"]
+
+    def test_flattened_name_collision_is_deduped(self, tmp_path):
+        services = make_services()
+        objects = {
+            "a_b/c.json": b"first",
+            "a/b_c.json": b"second",
+        }
+        pages = [{"Contents": [{"Key": k} for k in objects]}]
+        services.s3 = self._make_s3(pages, objects)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", destination=str(tmp_path)
+        )
+
+        assert result.details["downloaded"] == 2
+        written = sorted(os.listdir(tmp_path))
+        assert written == ["a_b_c.json", "a_b_c__1.json"]
+
+    def test_max_objects_stops_mid_page(self, tmp_path):
+        services = make_services()
+        objects = {"logs/one.json": b"1", "logs/two.json": b"2"}
+        pages = [{"Contents": [{"Key": k} for k in objects]}]
+        services.s3 = self._make_s3(pages, objects)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", destination=str(tmp_path), max_objects=1,
+        )
+
+        assert result.details["downloaded"] == 1
+
+
+def _make_hierarchical_s3(common_prefixes_by_prefix, objects_by_leaf_prefix, object_bodies=None):
+    """S3 double for the date-filtered discovery path: routes list_objects_v2
+    paginate() calls by whether Delimiter='/' was passed (folder discovery)
+    or not (real object listing under a leaf prefix). Every folder-discovery
+    prefix queried is recorded on s3.delimited_prefixes_queried, so tests can
+    assert that pruned branches were never listed at all."""
+    object_bodies = object_bodies or {}
+    s3 = MagicMock()
+    s3.delimited_prefixes_queried = []
+
+    def get_paginator(name):
+        paginator = MagicMock()
+
+        def paginate(**kwargs):
+            prefix = kwargs.get("Prefix", "")
+            if kwargs.get("Delimiter") == "/":
+                s3.delimited_prefixes_queried.append(prefix)
+                children = common_prefixes_by_prefix.get(prefix, [])
+                return [{"CommonPrefixes": [{"Prefix": c} for c in children]}]
+            keys = objects_by_leaf_prefix.get(prefix, [])
+            return [{"Contents": [{"Key": k} for k in keys]}]
+
+        paginator.paginate.side_effect = paginate
+        return paginator
+
+    s3.get_paginator.side_effect = get_paginator
+
+    def get_object(Bucket, Key):
+        return {"Body": MagicMock(read=MagicMock(return_value=object_bodies.get(Key, b"{}")))}
+
+    s3.get_object.side_effect = get_object
+    return s3
+
+
+class TestDiscoverDatePrefixes:
+    def _org_tree(self, days=("25", "26", "27"), accounts=("111111111111", "222222222222")):
+        tree = {"AWSLogs/": [f"AWSLogs/{a}/" for a in accounts]}
+        for a in accounts:
+            tree[f"AWSLogs/{a}/"] = [f"AWSLogs/{a}/CloudTrail/"]
+            tree[f"AWSLogs/{a}/CloudTrail/"] = [f"AWSLogs/{a}/CloudTrail/us-east-1/"]
+            tree[f"AWSLogs/{a}/CloudTrail/us-east-1/"] = [f"AWSLogs/{a}/CloudTrail/us-east-1/2026/"]
+            tree[f"AWSLogs/{a}/CloudTrail/us-east-1/2026/"] = [f"AWSLogs/{a}/CloudTrail/us-east-1/2026/08/"]
+            tree[f"AWSLogs/{a}/CloudTrail/us-east-1/2026/08/"] = [
+                f"AWSLogs/{a}/CloudTrail/us-east-1/2026/08/{d}/" for d in days
+            ]
+        return tree
+
+    def test_prunes_days_outside_range_across_all_accounts(self):
+        s3 = _make_hierarchical_s3(self._org_tree(), {})
+        forensics = AwsIRForensics(make_services(), DredgeConfig())
+
+        leaves = forensics._discover_date_prefixes(
+            s3, "bucket", "AWSLogs/", date(2026, 8, 26), date(2026, 8, 27), max_workers=4,
+        )
+
+        assert leaves == [
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/",
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/27/",
+            "AWSLogs/222222222222/CloudTrail/us-east-1/2026/08/26/",
+            "AWSLogs/222222222222/CloudTrail/us-east-1/2026/08/27/",
+        ]
+
+    def test_month_boundary_crossing(self):
+        tree = {
+            "AWSLogs/": ["AWSLogs/111111111111/"],
+            "AWSLogs/111111111111/": ["AWSLogs/111111111111/CloudTrail/"],
+            "AWSLogs/111111111111/CloudTrail/": ["AWSLogs/111111111111/CloudTrail/us-east-1/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/01/",
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/02/",
+            ],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/01/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/01/30/",
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/01/31/",
+            ],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/02/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/02/01/",
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/02/02/",
+            ],
+        }
+        s3 = _make_hierarchical_s3(tree, {})
+        forensics = AwsIRForensics(make_services(), DredgeConfig())
+
+        leaves = forensics._discover_date_prefixes(
+            s3, "bucket", "AWSLogs/", date(2026, 1, 31), date(2026, 2, 1), max_workers=4,
+        )
+
+        assert leaves == [
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/01/31/",
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/02/01/",
+        ]
+
+    def test_out_of_range_year_is_pruned_without_descending(self):
+        tree = {
+            "AWSLogs/": ["AWSLogs/111111111111/"],
+            "AWSLogs/111111111111/": ["AWSLogs/111111111111/CloudTrail/"],
+            "AWSLogs/111111111111/CloudTrail/": ["AWSLogs/111111111111/CloudTrail/us-east-1/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2025/",
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/",
+            ],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/",
+            ],
+        }
+        s3 = _make_hierarchical_s3(tree, {})
+        forensics = AwsIRForensics(make_services(), DredgeConfig())
+
+        leaves = forensics._discover_date_prefixes(
+            s3, "bucket", "AWSLogs/", date(2026, 8, 26), date(2026, 8, 26), max_workers=4,
+        )
+
+        assert leaves == ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/"]
+        # The out-of-range 2025/ branch must never have been listed at all.
+        assert "AWSLogs/111111111111/CloudTrail/us-east-1/2025/" not in s3.delimited_prefixes_queried
+
+    def test_month_outside_range_within_boundary_year_is_pruned(self):
+        tree = {
+            "AWSLogs/": ["AWSLogs/111111111111/"],
+            "AWSLogs/111111111111/": ["AWSLogs/111111111111/CloudTrail/"],
+            "AWSLogs/111111111111/CloudTrail/": ["AWSLogs/111111111111/CloudTrail/us-east-1/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/01/",
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/06/",
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/",
+            ],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/",
+            ],
+        }
+        s3 = _make_hierarchical_s3(tree, {})
+        forensics = AwsIRForensics(make_services(), DredgeConfig())
+
+        leaves = forensics._discover_date_prefixes(
+            s3, "bucket", "AWSLogs/", date(2026, 8, 26), date(2026, 8, 26), max_workers=4,
+        )
+
+        assert leaves == ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/"]
+        assert "AWSLogs/111111111111/CloudTrail/us-east-1/2026/01/" not in s3.delimited_prefixes_queried
+        assert "AWSLogs/111111111111/CloudTrail/us-east-1/2026/06/" not in s3.delimited_prefixes_queried
+
+    def test_non_numeric_month_and_day_folders_are_skipped(self):
+        tree = {
+            "AWSLogs/": ["AWSLogs/111111111111/"],
+            "AWSLogs/111111111111/": ["AWSLogs/111111111111/CloudTrail/"],
+            "AWSLogs/111111111111/CloudTrail/": ["AWSLogs/111111111111/CloudTrail/us-east-1/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/_manifest/",
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/",
+            ],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/_manifest/",
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/",
+            ],
+        }
+        s3 = _make_hierarchical_s3(tree, {})
+        forensics = AwsIRForensics(make_services(), DredgeConfig())
+
+        leaves = forensics._discover_date_prefixes(
+            s3, "bucket", "AWSLogs/", date(2026, 8, 26), date(2026, 8, 26), max_workers=4,
+        )
+
+        assert leaves == ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/"]
+
+    def test_invalid_calendar_date_is_skipped(self):
+        tree = {
+            "AWSLogs/": ["AWSLogs/111111111111/"],
+            "AWSLogs/111111111111/": ["AWSLogs/111111111111/CloudTrail/"],
+            "AWSLogs/111111111111/CloudTrail/": ["AWSLogs/111111111111/CloudTrail/us-east-1/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/02/"],
+            # "30" isn't a real day in February -- must be skipped, not raise.
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/02/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/02/30/",
+            ],
+        }
+        s3 = _make_hierarchical_s3(tree, {})
+        forensics = AwsIRForensics(make_services(), DredgeConfig())
+
+        leaves = forensics._discover_date_prefixes(
+            s3, "bucket", "AWSLogs/", date(2026, 1, 1), date(2026, 12, 31), max_workers=4,
+        )
+
+        assert leaves == []
+
+    def test_non_date_sibling_folders_are_still_walked(self):
+        tree = {
+            "AWSLogs/": ["AWSLogs/111111111111/"],
+            "AWSLogs/111111111111/": [
+                "AWSLogs/111111111111/CloudTrail/",
+                "AWSLogs/111111111111/Config/",
+            ],
+            "AWSLogs/111111111111/CloudTrail/": ["AWSLogs/111111111111/CloudTrail/us-east-1/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/",
+            ],
+            "AWSLogs/111111111111/Config/": ["AWSLogs/111111111111/Config/us-east-1/"],
+            "AWSLogs/111111111111/Config/us-east-1/": ["AWSLogs/111111111111/Config/us-east-1/2026/"],
+            "AWSLogs/111111111111/Config/us-east-1/2026/": ["AWSLogs/111111111111/Config/us-east-1/2026/08/"],
+            "AWSLogs/111111111111/Config/us-east-1/2026/08/": [
+                "AWSLogs/111111111111/Config/us-east-1/2026/08/26/",
+            ],
+        }
+        s3 = _make_hierarchical_s3(tree, {})
+        forensics = AwsIRForensics(make_services(), DredgeConfig())
+
+        leaves = forensics._discover_date_prefixes(
+            s3, "bucket", "AWSLogs/", date(2026, 8, 26), date(2026, 8, 26), max_workers=4,
+        )
+
+        assert leaves == [
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/",
+            "AWSLogs/111111111111/Config/us-east-1/2026/08/26/",
+        ]
+
+
+class TestDownloadS3LogsDateFiltering:
+    def _two_account_two_day_setup(self):
+        tree = TestDiscoverDatePrefixes()._org_tree()
+        objects_by_leaf_prefix = {
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/f1.json.gz",
+            ],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/27/": [
+                "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/27/f2.json.gz",
+            ],
+            "AWSLogs/222222222222/CloudTrail/us-east-1/2026/08/26/": [
+                "AWSLogs/222222222222/CloudTrail/us-east-1/2026/08/26/f3.json.gz",
+            ],
+            "AWSLogs/222222222222/CloudTrail/us-east-1/2026/08/27/": [
+                "AWSLogs/222222222222/CloudTrail/us-east-1/2026/08/27/f4.json.gz",
+            ],
+        }
+        import gzip
+        body = gzip.compress(b"{}")
+        object_bodies = {
+            key: body for keys in objects_by_leaf_prefix.values() for key in keys
+        }
+        return tree, objects_by_leaf_prefix, object_bodies
+
+    def test_only_leaf_prefixes_in_range_are_downloaded(self, tmp_path):
+        tree, objects_by_leaf_prefix, bodies = self._two_account_two_day_setup()
+        services = make_services()
+        services.s3 = _make_hierarchical_s3(tree, objects_by_leaf_prefix, bodies)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", prefix="AWSLogs/", destination=str(tmp_path),
+            start_time=datetime(2026, 8, 26, tzinfo=timezone.utc),
+            end_time=datetime(2026, 8, 27, tzinfo=timezone.utc),
+        )
+
+        assert result.success is True
+        assert result.details["downloaded"] == 4
+        assert sorted(result.details["scanned_prefixes"]) == sorted(objects_by_leaf_prefix.keys())
+        assert all("2026/08/25" not in p for p in result.details["scanned_prefixes"])
+
+    def test_days_ago_shortcut_computes_start_time(self, tmp_path, monkeypatch):
+        tree, objects_by_leaf_prefix, bodies = self._two_account_two_day_setup()
+        services = make_services()
+        services.s3 = _make_hierarchical_s3(tree, objects_by_leaf_prefix, bodies)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 8, 27, 12, 0, tzinfo=tz)
+
+        monkeypatch.setattr("dredge.aws_ir.forensics.datetime", _FixedDatetime)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", prefix="AWSLogs/", destination=str(tmp_path), days_ago=1,
+        )
+
+        assert result.details["downloaded"] == 4
+
+    def test_start_time_and_days_ago_are_mutually_exclusive(self, tmp_path):
+        with pytest.raises(ValueError):
+            AwsIRForensics(make_services(), DredgeConfig()).download_s3_logs(
+                "my-bucket", destination=str(tmp_path),
+                start_time=datetime(2026, 8, 26, tzinfo=timezone.utc), days_ago=1,
+            )
+
+    def test_prefix_without_trailing_slash_is_normalized(self, tmp_path):
+        tree, objects_by_leaf_prefix, bodies = self._two_account_two_day_setup()
+        services = make_services()
+        services.s3 = _make_hierarchical_s3(tree, objects_by_leaf_prefix, bodies)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", prefix="AWSLogs", destination=str(tmp_path),
+            start_time=datetime(2026, 8, 26, tzinfo=timezone.utc),
+            end_time=datetime(2026, 8, 27, tzinfo=timezone.utc),
+        )
+
+        assert result.details["downloaded"] == 4
+
+    def test_max_objects_stops_across_leaf_prefixes(self, tmp_path):
+        tree, objects_by_leaf_prefix, bodies = self._two_account_two_day_setup()
+        services = make_services()
+        services.s3 = _make_hierarchical_s3(tree, objects_by_leaf_prefix, bodies)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", prefix="AWSLogs/", destination=str(tmp_path),
+            start_time=datetime(2026, 8, 26, tzinfo=timezone.utc),
+            end_time=datetime(2026, 8, 27, tzinfo=timezone.utc),
+            max_objects=2,
+        )
+
+        assert result.details["downloaded"] == 2
