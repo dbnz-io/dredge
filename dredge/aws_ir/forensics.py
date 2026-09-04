@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import os
 import re
+import threading
 from calendar import monthrange
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -22,6 +23,19 @@ _log = get_logger(__name__)
 # looking for dated .../YYYY/MM/DD/ folders.
 _YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 _TWO_DIGIT_RE = re.compile(r"^\d{2}$")
+
+# CloudTrail writes two things into a trail bucket: the actual event logs
+# under a ``.../CloudTrail/<region>/...`` path and separate hash-chain digest
+# files under ``.../CloudTrail-Digest/<region>/...``. The digests are only
+# useful for log-integrity validation, not threat hunting, and in an org
+# trail they roughly double the object count -- so downloads skip them by
+# default.
+_CLOUDTRAIL_DIGEST_SEGMENT = "CloudTrail-Digest"
+
+
+def _is_cloudtrail_digest_key(key: str) -> bool:
+    """True if any path segment of `key` is the CloudTrail digest folder."""
+    return f"/{_CLOUDTRAIL_DIGEST_SEGMENT}/" in f"/{key}"
 
 
 class AwsIRForensics:
@@ -766,6 +780,7 @@ class AwsIRForensics:
         start_date: date,
         end_date: date,
         max_workers: int,
+        exclude_cloudtrail_digest: bool = True,
     ) -> List[str]:
         """
         Walk the bucket's folder hierarchy under root_prefix looking for
@@ -801,6 +816,10 @@ class AwsIRForensics:
                     name = child_prefix[len(node_prefix):].rstrip("/")
 
                     if date_state is None:
+                        if exclude_cloudtrail_digest and name == _CLOUDTRAIL_DIGEST_SEGMENT:
+                            # Prune the whole digest subtree -- never even list
+                            # its dated folders.
+                            continue
                         if _YEAR_RE.match(name):
                             if start_date.year <= int(name) <= end_date.year:
                                 next_frontier.append((child_prefix, ("year", int(name))))
@@ -849,6 +868,7 @@ class AwsIRForensics:
         end_time: Optional[datetime] = None,
         days_ago: Optional[int] = None,
         max_workers: int = 8,
+        exclude_cloudtrail_digest: bool = True,
     ) -> OperationResult:
         """
         Download log objects from an S3 bucket/prefix into a single flat local
@@ -894,8 +914,17 @@ class AwsIRForensics:
             end_time: Only consider log objects dated on/before this day.
                 Defaults to now when start_time/days_ago is given.
             days_ago: Shortcut for start_time = now - timedelta(days=days_ago).
-            max_workers: Concurrency for the folder-discovery phase when date
-                filtering is active (ignored otherwise).
+            max_workers: Concurrency for both the folder-discovery phase (when
+                date filtering is active) and the object downloads. Object
+                GETs are the bottleneck for a large trail bucket, so they run
+                across this many threads instead of one-at-a-time.
+            exclude_cloudtrail_digest: Skip CloudTrail digest objects (keys
+                under a ``CloudTrail-Digest/`` folder). On by default -- the
+                digests are integrity-validation artifacts, not event logs,
+                and dropping them roughly halves the objects pulled from an
+                org trail bucket. When date filtering is active the digest
+                subtree is also pruned during discovery, so its dated folders
+                are never even listed.
 
         Raises:
             ValueError: Both start_time and days_ago are given.
@@ -905,6 +934,8 @@ class AwsIRForensics:
               - details["downloaded"]: count of files written
               - details["local_files"]: list of local file paths written
               - details["skipped"]: count of keys that didn't match `suffixes`
+              - details["digest_skipped"]: count of CloudTrail digest keys
+                skipped (only when exclude_cloudtrail_digest is set)
               - details["failed"]: {key: error} for objects that failed to download
               - details["scanned_prefixes"]: leaf date prefixes that were
                 listed (date-filtered calls only)
@@ -932,9 +963,14 @@ class AwsIRForensics:
         local_files: List[str] = []
         failed: Dict[str, str] = {}
         seen_names: Dict[str, int] = {}
-        skipped_holder = [0]
+        skipped = 0
+        digest_skipped = 0
+        # Only download bookkeeping (local_files/failed/seen_names) is touched
+        # from worker threads; listing/counter updates stay on the main thread.
+        state_lock = threading.Lock()
 
-        def _dedupe(name: str) -> str:
+        def _dedupe_locked(name: str) -> str:
+            """Reserve a unique local filename. Caller must hold state_lock."""
             if name not in seen_names:
                 seen_names[name] = 0
                 return name
@@ -944,82 +980,103 @@ class AwsIRForensics:
                 return f"{stem}__{seen_names[name]}.{ext}"
             return f"{name}__{seen_names[name]}"
 
-        def _download_matching_under_prefix(list_prefix: Optional[str]) -> bool:
-            """Downloads matching objects under one prefix (Contents listing,
-            no delimiter). Returns True once max_objects has been reached."""
+        def _download_one(key: str) -> None:
+            """Fetch, optionally gunzip, and write one object. Records its own
+            failures; safe to run concurrently across the download pool."""
+            try:
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+            except botocore.exceptions.ClientError as exc:
+                with state_lock:
+                    failed[key] = str(exc)
+                _log.warning(event("aws_ir_forensics", "download_s3_logs.object_error",
+                                    target=result.target, key=key, error=str(exc)))
+                return
+
+            local_name = key.replace("/", "_")
+            if decompress_gzip and local_name.lower().endswith(".gz"):
+                try:
+                    body = gzip.decompress(body)
+                    local_name = local_name[: -len(".gz")]
+                except OSError as exc:
+                    with state_lock:
+                        failed[key] = f"gzip decompress failed: {exc}"
+                    return
+
+            with state_lock:
+                local_name = _dedupe_locked(local_name)
+            local_path = os.path.join(destination, local_name)
+            with open(local_path, "wb") as fh:
+                fh.write(body)
+            with state_lock:
+                local_files.append(local_path)
+
+        # Number of download tasks submitted so far -- bounds max_objects.
+        # Listing is serial on the main thread, so a plain int is safe here.
+        submitted = [0]
+
+        def _submit_matching_under_prefix(executor, list_prefix: Optional[str]):
+            """List one prefix (Contents, no delimiter) and submit a download
+            task for every matching object. Returns (futures, reached_limit)."""
+            nonlocal skipped, digest_skipped
             list_kwargs: Dict[str, Any] = {"Bucket": bucket}
             if list_prefix:
                 list_kwargs["Prefix"] = list_prefix
 
+            futures = []
             paginator = s3.get_paginator("list_objects_v2")
             for page in paginator.paginate(**list_kwargs):
                 for obj in page.get("Contents", []):
-                    if max_objects is not None and len(local_files) >= max_objects:
-                        return True
-
                     key = obj["Key"]
                     if key.endswith("/"):
                         continue
+                    if exclude_cloudtrail_digest and _is_cloudtrail_digest_key(key):
+                        digest_skipped += 1
+                        continue
                     if lower_suffixes and not key.lower().endswith(lower_suffixes):
-                        skipped_holder[0] += 1
+                        skipped += 1
                         continue
+                    if max_objects is not None and submitted[0] >= max_objects:
+                        return futures, True
 
-                    try:
-                        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-                    except botocore.exceptions.ClientError as exc:
-                        failed[key] = str(exc)
-                        _log.warning(event("aws_ir_forensics", "download_s3_logs.object_error",
-                                            target=result.target, key=key, error=str(exc)))
-                        continue
-
-                    local_name = key.replace("/", "_")
-                    if decompress_gzip and local_name.lower().endswith(".gz"):
-                        try:
-                            body = gzip.decompress(body)
-                            local_name = local_name[: -len(".gz")]
-                        except OSError as exc:
-                            failed[key] = f"gzip decompress failed: {exc}"
-                            continue
-
-                    local_name = _dedupe(local_name)
-                    local_path = os.path.join(destination, local_name)
-                    with open(local_path, "wb") as fh:
-                        fh.write(body)
-                    local_files.append(local_path)
-
-                if max_objects is not None and len(local_files) >= max_objects:
-                    return True
-            return False
+                    futures.append(executor.submit(_download_one, key))
+                    submitted[0] += 1
+            return futures, (max_objects is not None and submitted[0] >= max_objects)
 
         try:
-            if date_filtered:
-                root_prefix = prefix or ""
-                if root_prefix and not root_prefix.endswith("/"):
-                    root_prefix += "/"
-                leaf_prefixes = self._discover_date_prefixes(
-                    s3, bucket, root_prefix, start_time.date(), end_time.date(), max_workers,
-                )
-                result.details["scanned_prefixes"] = leaf_prefixes
-                for leaf_prefix in leaf_prefixes:
-                    if _download_matching_under_prefix(leaf_prefix):
-                        break
-            else:
-                _download_matching_under_prefix(prefix)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                if date_filtered:
+                    root_prefix = prefix or ""
+                    if root_prefix and not root_prefix.endswith("/"):
+                        root_prefix += "/"
+                    leaf_prefixes = self._discover_date_prefixes(
+                        s3, bucket, root_prefix, start_time.date(), end_time.date(),
+                        max_workers, exclude_cloudtrail_digest=exclude_cloudtrail_digest,
+                    )
+                    result.details["scanned_prefixes"] = leaf_prefixes
+                    for leaf_prefix in leaf_prefixes:
+                        _, reached_limit = _submit_matching_under_prefix(executor, leaf_prefix)
+                        if reached_limit:
+                            break
+                else:
+                    _submit_matching_under_prefix(executor, prefix)
+                # Leaving the `with` block waits for every submitted download.
         except botocore.exceptions.ClientError as exc:
             result.add_error(f"Failed to list objects in s3://{bucket}: {exc}")
             _log.error(event("aws_ir_forensics", "download_s3_logs.list_error",
                              target=result.target, error=str(exc)))
             return result
 
-        skipped = skipped_holder[0]
         result.details["destination"] = destination
         result.details["downloaded"] = len(local_files)
         result.details["local_files"] = local_files
         result.details["skipped"] = skipped
+        if exclude_cloudtrail_digest:
+            result.details["digest_skipped"] = digest_skipped
         if failed:
             result.details["failed"] = failed
             result.add_error(f"Failed to download {len(failed)} object(s)")
 
         _log.info(event("aws_ir_forensics", "download_s3_logs.complete", target=result.target,
-                        downloaded=len(local_files), skipped=skipped, failed=len(failed)))
+                        downloaded=len(local_files), skipped=skipped,
+                        digest_skipped=digest_skipped, failed=len(failed)))
         return result

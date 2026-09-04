@@ -342,6 +342,7 @@ CLI_HANDLER_CASES = [
             "end_time": None,
             "days_ago": None,
             "max_workers": 8,
+            "exclude_cloudtrail_digest": True,
         },
     ),
     (
@@ -361,6 +362,7 @@ CLI_HANDLER_CASES = [
             "end_time": None,
             "fields": None,
             "max_events": None,
+            "ir": False,
         },
     ),
     (
@@ -892,6 +894,22 @@ class TestAwsDownloadS3LogsDateFilter:
         target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.forensics.download_s3_logs")
         _, kwargs = target.call_args
         assert kwargs["max_workers"] == 16
+
+    def test_digest_excluded_by_default(self, monkeypatch, capsys):
+        argv = [
+            "aws", "forensics", "download-s3-logs", "--bucket", "b1", "--destination", "/tmp/out",
+        ]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.forensics.download_s3_logs")
+        _, kwargs = target.call_args
+        assert kwargs["exclude_cloudtrail_digest"] is True
+
+    def test_include_digest_flag_opts_in(self, monkeypatch, capsys):
+        argv = [
+            "aws", "forensics", "download-s3-logs", "--bucket", "b1", "--destination", "/tmp/out", "--include-digest",
+        ]
+        target, out = _run_handler(monkeypatch, capsys, argv, "aws_ir.forensics.download_s3_logs")
+        _, kwargs = target.call_args
+        assert kwargs["exclude_cloudtrail_digest"] is False
 
 
 class TestAwsQueryCloudtrailLogsFieldsFlag:

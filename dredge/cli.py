@@ -854,6 +854,7 @@ def handle_aws_download_s3_logs(args: argparse.Namespace) -> None:
         end_time=parse_iso_datetime(args.end_time),
         days_ago=args.days_ago,
         max_workers=args.max_workers,
+        exclude_cloudtrail_digest=not args.include_digest,
     )
     print_result(res, output=getattr(args, "output", "json"))
 
@@ -877,6 +878,7 @@ def handle_aws_query_cloudtrail_logs(args: argparse.Namespace) -> None:
         end_time=parse_iso_datetime(args.end_time),
         fields=args.fields.split(",") if args.fields else None,
         max_events=args.max_events,
+        ir=args.ir,
     )
     print_result(res, output=getattr(args, "output", "json"))
 
@@ -1796,6 +1798,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not gunzip .gz objects; write them as-is",
     )
+    p.add_argument(
+        "--include-digest",
+        action="store_true",
+        dest="include_digest",
+        help="Also download CloudTrail digest objects (keys under a "
+        "CloudTrail-Digest/ folder). By default these integrity-validation "
+        "files are skipped -- and, when --start-time/--days-ago is used, their "
+        "dated folders are pruned during discovery so they are never listed.",
+    )
     p.add_argument("--max-objects", type=int, default=None, dest="max_objects", help="Stop after downloading this many objects")
     p.add_argument(
         "--start-time",
@@ -1819,7 +1830,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         dest="max_workers",
-        help="Concurrency for the folder-discovery phase when --start-time/--days-ago is given",
+        help="Number of parallel threads for object downloads (and, when "
+        "--start-time/--days-ago is given, the folder-discovery phase)",
     )
     p.set_defaults(func=handle_aws_download_s3_logs)
 
@@ -1834,6 +1846,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user", default=None, help="Match userIdentity.userName, or substring of userIdentity.arn")
     p.add_argument("--access-key-id", default=None, help="Exact match on userIdentity.accessKeyId")
     p.add_argument("--event-name", default=None, help="Exact match on eventName")
+    p.add_argument(
+        "--ir",
+        action="store_true",
+        help="Incident-response triage: keep only high-signal 'dangerous' "
+        "eventNames (disabling logging, credential access, persistence/privesc, "
+        "resource hijacking/exfil) so you can visualize the important activity "
+        "on an incident timeline. Combines with the other filters (e.g. "
+        "--start-time/--end-time, --user).",
+    )
     p.add_argument("--event-source", default=None, help="Exact match on eventSource (e.g. s3.amazonaws.com)")
     p.add_argument("--region", default=None, help="Exact match on awsRegion")
     p.add_argument("--account-id", default=None, help="Match userIdentity.accountId or recipientAccountId")
