@@ -3,7 +3,7 @@
 # unrelated 2019 package). The import package and CLI stay "dredge":
 #   pip install dredge-ir  ->  import dredge  /  $ dredge ...
 name = "dredge-ir"
-version = "1.1.0"
+version = "1.1.1"
 description = "Cloud Incident Response & Threat Hunting for AWS, Kubernetes, GitHub & GCP"
 readme = "README.md"
 keywords = [
