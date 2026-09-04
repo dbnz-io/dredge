@@ -1,5 +1,6 @@
 import os
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+import gzip
 
 from datetime import date, datetime, timezone
 from unittest.mock import MagicMock
@@ -765,6 +766,42 @@ class TestDownloadS3Logs:
 
         assert result.details["downloaded"] == 1
 
+    def test_cloudtrail_digest_skipped_by_default(self, tmp_path):
+        services = make_services()
+        objects = {
+            "AWSLogs/123/CloudTrail/us-east-1/2026/08/25/log.json.gz": gzip.compress(b"{}"),
+            "AWSLogs/123/CloudTrail-Digest/us-east-1/2026/08/25/digest.json.gz": gzip.compress(b"{}"),
+        }
+        pages = [{"Contents": [{"Key": k} for k in objects]}]
+        services.s3 = self._make_s3(pages, objects)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", prefix="AWSLogs/", destination=str(tmp_path)
+        )
+
+        assert result.details["downloaded"] == 1
+        assert result.details["digest_skipped"] == 1
+        written = os.listdir(tmp_path)
+        assert len(written) == 1
+        assert all("CloudTrail-Digest" not in f for f in written)
+
+    def test_cloudtrail_digest_included_when_opted_in(self, tmp_path):
+        services = make_services()
+        objects = {
+            "AWSLogs/123/CloudTrail/us-east-1/2026/08/25/log.json.gz": gzip.compress(b"{}"),
+            "AWSLogs/123/CloudTrail-Digest/us-east-1/2026/08/25/digest.json.gz": gzip.compress(b"{}"),
+        }
+        pages = [{"Contents": [{"Key": k} for k in objects]}]
+        services.s3 = self._make_s3(pages, objects)
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "my-bucket", prefix="AWSLogs/", destination=str(tmp_path),
+            exclude_cloudtrail_digest=False,
+        )
+
+        assert result.details["downloaded"] == 2
+        assert "digest_skipped" not in result.details
+
 
 def _make_hierarchical_s3(common_prefixes_by_prefix, objects_by_leaf_prefix, object_bodies=None):
     """S3 double for the date-filtered discovery path: routes list_objects_v2
@@ -985,6 +1022,50 @@ class TestDiscoverDatePrefixes:
         assert leaves == [
             "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/",
             "AWSLogs/111111111111/Config/us-east-1/2026/08/26/",
+        ]
+
+    def _tree_with_digest(self):
+        return {
+            "AWSLogs/": ["AWSLogs/111111111111/"],
+            "AWSLogs/111111111111/": [
+                "AWSLogs/111111111111/CloudTrail/",
+                "AWSLogs/111111111111/CloudTrail-Digest/",
+            ],
+            "AWSLogs/111111111111/CloudTrail/": ["AWSLogs/111111111111/CloudTrail/us-east-1/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/"],
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/": ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/"],
+            "AWSLogs/111111111111/CloudTrail-Digest/": ["AWSLogs/111111111111/CloudTrail-Digest/us-east-1/"],
+            "AWSLogs/111111111111/CloudTrail-Digest/us-east-1/": ["AWSLogs/111111111111/CloudTrail-Digest/us-east-1/2026/"],
+            "AWSLogs/111111111111/CloudTrail-Digest/us-east-1/2026/": ["AWSLogs/111111111111/CloudTrail-Digest/us-east-1/2026/08/"],
+            "AWSLogs/111111111111/CloudTrail-Digest/us-east-1/2026/08/": ["AWSLogs/111111111111/CloudTrail-Digest/us-east-1/2026/08/26/"],
+        }
+
+    def test_digest_subtree_pruned_and_never_listed_by_default(self):
+        s3 = _make_hierarchical_s3(self._tree_with_digest(), {})
+        forensics = AwsIRForensics(make_services(), DredgeConfig())
+
+        leaves = forensics._discover_date_prefixes(
+            s3, "bucket", "AWSLogs/", date(2026, 8, 26), date(2026, 8, 26), max_workers=4,
+        )
+
+        assert leaves == ["AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/"]
+        # The digest folder must have been pruned at the log-type level, so its
+        # region/date folders were never even listed.
+        assert not any("CloudTrail-Digest" in p for p in s3.delimited_prefixes_queried)
+
+    def test_digest_subtree_walked_when_opted_in(self):
+        s3 = _make_hierarchical_s3(self._tree_with_digest(), {})
+        forensics = AwsIRForensics(make_services(), DredgeConfig())
+
+        leaves = forensics._discover_date_prefixes(
+            s3, "bucket", "AWSLogs/", date(2026, 8, 26), date(2026, 8, 26), max_workers=4,
+            exclude_cloudtrail_digest=False,
+        )
+
+        assert leaves == [
+            "AWSLogs/111111111111/CloudTrail-Digest/us-east-1/2026/08/26/",
+            "AWSLogs/111111111111/CloudTrail/us-east-1/2026/08/26/",
         ]
 
 

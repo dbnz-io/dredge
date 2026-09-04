@@ -2270,3 +2270,44 @@ class TestQueryLocalCloudtrailLogs:
         )
         assert len(result.details["events"]) == 2
         assert result.details["statistics"]["records_matched"] == 2
+
+    def test_ir_filter_keeps_only_dangerous_events(self, tmp_path):
+        _write_json(tmp_path / "file1.json", {"Records": [
+            _make_ct_record(eventName="GetObject"),            # benign, dropped
+            _make_ct_record(eventName="StopLogging"),          # anti-forensics
+            _make_ct_record(eventName="CreateAccessKey"),      # persistence
+            _make_ct_record(eventName="DescribeInstances"),    # benign, dropped
+            _make_ct_record(eventName="GetSecretValue"),       # credential access
+        ]})
+        result = AwsIRHunt(make_services(), DredgeConfig()).query_local_cloudtrail_logs(
+            str(tmp_path), ir=True,
+        )
+        names = sorted(ev["eventName"] for ev in result.details["events"])
+        assert names == ["CreateAccessKey", "GetSecretValue", "StopLogging"]
+        assert result.details["statistics"]["records_scanned"] == 5
+
+    def test_ir_filter_combines_with_other_filters(self, tmp_path):
+        _write_json(tmp_path / "file1.json", {"Records": [
+            _make_ct_record(eventName="StopLogging", sourceIPAddress="1.1.1.1"),
+            _make_ct_record(eventName="CreateAccessKey", sourceIPAddress="2.2.2.2"),
+        ]})
+        result = AwsIRHunt(make_services(), DredgeConfig()).query_local_cloudtrail_logs(
+            str(tmp_path), ir=True, source_ip="2.2.2.2",
+        )
+        assert [ev["eventName"] for ev in result.details["events"]] == ["CreateAccessKey"]
+
+    def test_ir_flag_recorded_in_target(self, tmp_path):
+        _write_json(tmp_path / "file1.json", {"Records": [_make_ct_record(eventName="StopLogging")]})
+        result = AwsIRHunt(make_services(), DredgeConfig()).query_local_cloudtrail_logs(
+            str(tmp_path), ir=True,
+        )
+        assert "ir=true" in result.target
+
+    def test_ir_dangerous_event_set_is_curated_and_bounded(self):
+        names = AwsIRHunt._IR_DANGEROUS_EVENT_NAMES
+        # "top 50" -- keep the list tight and high-signal.
+        assert 0 < len(names) <= 50
+        # No duplicates across categories.
+        flat = [n for names_ in AwsIRHunt._IR_DANGEROUS_EVENTS.values() for n in names_]
+        assert len(flat) == len(set(flat))
+        assert len(names) == len(flat)

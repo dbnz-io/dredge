@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import boto3
 import botocore.exceptions
@@ -2494,6 +2494,62 @@ class AwsIRHunt:
         "awsRegion", "userAgent",
     )
 
+    # Curated set of high-signal CloudTrail eventNames worth surfacing first in
+    # an incident, grouped by the attacker objective they usually serve. These
+    # are the calls an IR analyst wants to see plotted on a timeline before
+    # anything else: turning off logging, harvesting credentials, planting
+    # persistence/privesc, and hijacking or exfiltrating resources. Passing
+    # ir=True to query_local_cloudtrail_logs() filters to just these eventNames
+    # so you don't have to hand-type each --event-name. Grouped (rather than a
+    # flat list) so the categories can drive a visualization/legend; the actual
+    # matcher uses the flattened _IR_DANGEROUS_EVENT_NAMES set below.
+    _IR_DANGEROUS_EVENTS = {
+        # Anti-forensics: disabling or tampering with logging, monitoring, and
+        # the guardrails that would otherwise record the rest of the attack.
+        "anti-forensics": (
+            "StopLogging", "DeleteTrail", "UpdateTrail", "PutEventSelectors",
+            "DeleteFlowLogs", "StopConfigurationRecorder",
+            "DeleteConfigurationRecorder", "DeleteDetector", "UpdateDetector",
+            "DisableSecurityHub", "DeleteLogGroup", "DeleteAlarms",
+            "LeaveOrganization",
+        ),
+        # Credential access: reading secrets/params, decrypting data, and
+        # minting or resetting credentials to move laterally.
+        "credential-access": (
+            "GetSecretValue", "GetParameter", "GetParameters",
+            "GetParametersByPath", "Decrypt", "GetPasswordData",
+            "CreateLoginProfile", "UpdateLoginProfile", "GetFederationToken",
+            "GetSessionToken",
+        ),
+        # Persistence & privilege escalation: creating identities, keys, and
+        # policy bindings that outlive the initial access.
+        "persistence-privesc": (
+            "CreateUser", "CreateAccessKey", "CreateRole", "AttachUserPolicy",
+            "AttachRolePolicy", "AttachGroupPolicy", "PutUserPolicy",
+            "PutRolePolicy", "PutGroupPolicy", "AddUserToGroup",
+            "UpdateAssumeRolePolicy", "CreatePolicyVersion",
+            "SetDefaultPolicyVersion", "DeactivateMFADevice",
+        ),
+        # Resource hijacking & exfiltration: spinning up compute, and sharing
+        # snapshots/AMIs/buckets or opening the network to move data out.
+        "hijacking-exfil": (
+            "RunInstances", "CreateKeyPair", "ImportKeyPair",
+            "ModifySnapshotAttribute", "ModifyImageAttribute",
+            "ModifyDBSnapshotAttribute", "PutBucketPolicy", "PutBucketAcl",
+            "DeleteBucketPolicy", "AuthorizeSecurityGroupIngress",
+        ),
+        # Discovery: the "who am I / what can I reach" recon that usually
+        # bookends the noisy actions above.
+        "discovery": (
+            "GetCallerIdentity",
+        ),
+    }
+
+    # Flattened membership set used by the ir=True filter.
+    _IR_DANGEROUS_EVENT_NAMES = frozenset(
+        name for names in _IR_DANGEROUS_EVENTS.values() for name in names
+    )
+
     def query_local_cloudtrail_logs(
         self,
         path: str,
@@ -2509,6 +2565,7 @@ class AwsIRHunt:
         end_time: Optional[datetime] = None,
         fields: Optional[List[str]] = None,
         max_events: Optional[int] = None,
+        ir: bool = False,
     ) -> OperationResult:
         """
         Filter and project fields from CloudTrail log files already on
@@ -2545,6 +2602,15 @@ class AwsIRHunt:
                 userIdentity.arn, userIdentity.accessKeyId, eventSource,
                 eventName, awsRegion, userAgent.
             max_events: Cap on matched records returned. None = unlimited.
+            ir: Incident-response triage filter. When True, only records whose
+                eventName is in the curated high-signal set
+                (AwsIRHunt._IR_DANGEROUS_EVENTS -- disabling logging, credential
+                access, persistence/privesc, resource hijacking/exfil) are
+                matched, so a single command surfaces the "dangerous" activity
+                to plot on an incident timeline. Combines (AND) with the other
+                filters; e.g. add start_time/end_time to bound the window, or
+                user_name/access_key_id to focus on one principal. If
+                event_name is also given, it must additionally match.
 
         Returns:
             OperationResult with:
@@ -2556,10 +2622,12 @@ class AwsIRHunt:
                 couldn't be parsed — the run still returns what it could.
         """
         fields = list(fields) if fields else list(self._DEFAULT_QUERY_FIELDS)
+        event_names = self._IR_DANGEROUS_EVENT_NAMES if ir else None
 
+        target = f"path={path}" + (",ir=true" if ir else "")
         result = OperationResult(
             operation="query_local_cloudtrail_logs",
-            target=f"path={path}",
+            target=target,
             success=True,
         )
 
@@ -2597,6 +2665,7 @@ class AwsIRHunt:
                     access_key_id=access_key_id, event_name=event_name,
                     event_source=event_source, aws_region=aws_region,
                     account_id=account_id, start_time=start_time, end_time=end_time,
+                    event_names=event_names,
                 ):
                     continue
                 matched.append((
@@ -2673,8 +2742,11 @@ class AwsIRHunt:
         account_id: Optional[str],
         start_time: Optional[datetime],
         end_time: Optional[datetime],
+        event_names: Optional[FrozenSet[str]] = None,
     ) -> bool:
         if source_ip and record.get("sourceIPAddress") != source_ip:
+            return False
+        if event_names is not None and record.get("eventName") not in event_names:
             return False
         if event_name and record.get("eventName") != event_name:
             return False
