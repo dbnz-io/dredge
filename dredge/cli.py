@@ -1530,7 +1530,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --version flag
     try:
-        dredge_version = version("dredge")
+        dredge_version = version("dredge-ir")
     except PackageNotFoundError:
         dredge_version = "development"
 
