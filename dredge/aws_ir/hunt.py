@@ -2550,6 +2550,45 @@ class AwsIRHunt:
         name for names in _IR_DANGEROUS_EVENTS.values() for name in names
     )
 
+    # Reverse index: eventName -> attacker-objective category, so an incident
+    # finding can be labelled and scored by what the call is usually used for.
+    _IR_EVENT_CATEGORY = {
+        name: category
+        for category, names in _IR_DANGEROUS_EVENTS.items()
+        for name in names
+    }
+
+    # Base severity (0-100) per category, ranking how urgently a responder
+    # should look at a dangerous event *on its own merits* (before any IOC
+    # correlation). Turning off logging and planting persistence outrank pure
+    # recon. These drive the ranking in incident_local_cloudtrail_logs().
+    _IR_CATEGORY_SEVERITY = {
+        "anti-forensics": 90,
+        "persistence-privesc": 80,
+        "hijacking-exfil": 75,
+        "credential-access": 70,
+        "discovery": 30,
+    }
+
+    # Score added when a finding also matches a supplied IOC (known-bad IP or
+    # principal). A dangerous action performed by a flagged actor is the top
+    # priority — e.g. CreateAccessKey from a flagged IP outranks a GetSecretValue
+    # by an unremarkable role, even though both are worth reporting.
+    _IR_IOC_OVERLAP_BOOST = 100
+    # Base score for an event attributable to an IOC that is NOT itself in the
+    # dangerous set — surfaced as "related IOC activity", low priority context.
+    _IR_IOC_ONLY_SEVERITY = 40
+
+    @staticmethod
+    def _severity_label(score: int) -> str:
+        if score >= 150:
+            return "CRITICAL"
+        if score >= 70:
+            return "HIGH"
+        if score >= 40:
+            return "MEDIUM"
+        return "LOW"
+
     def query_local_cloudtrail_logs(
         self,
         path: str,
@@ -2690,6 +2729,233 @@ class AwsIRHunt:
         _log.info(event("aws_ir_hunt", "query_local_cloudtrail_logs.complete",
                         files=len(files), scanned=records_scanned, matched=len(events)))
         return result
+
+    def incident_local_cloudtrail_logs(
+        self,
+        path: str,
+        *,
+        ioc_ips: Optional[List[str]] = None,
+        ioc_users: Optional[List[str]] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        max_findings: Optional[int] = None,
+    ) -> OperationResult:
+        """
+        Offline incident-triage sweep over CloudTrail log files on disk,
+        producing findings ranked by severity — the "what do I look at
+        first" report for a responder holding a folder of logs.
+
+        Two things are surfaced, and their overlap is the whole point:
+
+          1. Dangerous activity: every record whose eventName is in the
+             curated high-signal set (AwsIRHunt._IR_DANGEROUS_EVENTS —
+             disabling logging, credential access, persistence/privesc,
+             resource hijacking/exfil, recon). This runs whether or not
+             IOCs are supplied.
+          2. IOC-attributable activity (only when ioc_ips/ioc_users are
+             given): any record whose sourceIPAddress matches an IOC IP
+             (exact or CIDR) or whose principal matches an IOC user token
+             (userName, accessKeyId, principalId, or substring of the ARN)
+             — even non-dangerous calls, kept as related context.
+
+        A record that is BOTH dangerous AND attributable to an IOC is the
+        highest-priority finding (category base severity + IOC overlap
+        boost). This is what makes "CreateAccessKey from a flagged IP"
+        outrank "GetSecretValue by an unremarkable role": both are
+        reported, but the overlap floats to the top.
+
+        Scoring:
+            score = (category base severity if dangerous else 0)
+                    + (IOC overlap boost if dangerous & IOC-matched
+                       else IOC-only base if IOC-matched
+                       else 0)
+        mapped to CRITICAL / HIGH / MEDIUM / LOW labels.
+
+        Args:
+            path: Directory of CloudTrail log files, or a single file.
+            ioc_ips: Known-bad IPs/CIDRs to correlate on sourceIPAddress.
+            ioc_users: Known-bad principals — matched against
+                userIdentity.userName / accessKeyId / principalId
+                (exact) or as a substring of userIdentity.arn (covers
+                assumed-role sessions and role ARNs).
+            start_time / end_time: Bound the window by eventTime (UTC).
+            max_findings: Cap on findings returned (highest severity
+                kept). None = unlimited.
+
+        Returns:
+            OperationResult with:
+              - details["findings"]: ranked list (severity desc, then
+                eventTime asc), each a flat dict ready for CSV.
+              - details["severity_counts"]: {label: count}.
+              - details["iocs"]: the IOCs that were applied.
+              - details["statistics"]: files/records scanned & matched.
+              - details["failed_files"]: only if some files failed to parse.
+        """
+        ioc_ips = [ip.strip() for ip in (ioc_ips or []) if ip and ip.strip()]
+        ioc_users = [u.strip() for u in (ioc_users or []) if u and u.strip()]
+
+        # Pre-parse IOC IPs into (exact-string set, networks) so we match
+        # both plain IPs and CIDRs without re-parsing per record.
+        ioc_ip_exact = set()
+        ioc_networks = []
+        for raw in ioc_ips:
+            try:
+                ioc_networks.append(ipaddress.ip_network(raw, strict=False))
+            except ValueError:
+                ioc_ip_exact.add(raw)
+
+        target = f"path={path}"
+        if ioc_ips or ioc_users:
+            target += f",iocs={len(ioc_ips)}ip/{len(ioc_users)}user"
+        result = OperationResult(
+            operation="incident_local_cloudtrail_logs",
+            target=target,
+            success=True,
+        )
+
+        files = self._collect_cloudtrail_log_files(path)
+        if not files:
+            result.add_error(f"No .json/.json.gz files found under {path!r}")
+            result.details["findings"] = []
+            result.details["severity_counts"] = {}
+            result.details["iocs"] = {"ips": ioc_ips, "users": ioc_users}
+            result.details["statistics"] = {
+                "files_scanned": 0, "files_failed": 0,
+                "records_scanned": 0, "records_matched": 0,
+            }
+            return result
+
+        findings: List[Dict[str, Any]] = []
+        records_scanned = 0
+        failed_files: List[str] = []
+
+        for file_path in files:
+            try:
+                records = self._read_cloudtrail_records(file_path)
+            except (OSError, ValueError) as exc:
+                failed_files.append(f"{file_path}: {exc}")
+                continue
+
+            for record in records:
+                records_scanned += 1
+
+                if start_time or end_time:
+                    et = self._parse_cloudtrail_time(record.get("eventTime"))
+                    if et is None:
+                        continue
+                    if start_time and et < start_time:
+                        continue
+                    if end_time and et > end_time:
+                        continue
+
+                finding = self._score_incident_record(
+                    record,
+                    ioc_ip_exact=ioc_ip_exact,
+                    ioc_networks=ioc_networks,
+                    ioc_users=ioc_users,
+                )
+                if finding is not None:
+                    findings.append(finding)
+
+        # Rank: highest severity first, then chronological within a score.
+        findings.sort(key=lambda f: (-f["severity_score"], f["eventTime"] or ""))
+        if max_findings is not None:
+            findings = findings[:max_findings]
+
+        severity_counts: Dict[str, int] = {}
+        for f in findings:
+            severity_counts[f["severity"]] = severity_counts.get(f["severity"], 0) + 1
+
+        result.details["findings"] = findings
+        result.details["severity_counts"] = severity_counts
+        result.details["iocs"] = {"ips": ioc_ips, "users": ioc_users}
+        result.details["statistics"] = {
+            "files_scanned": len(files),
+            "files_failed": len(failed_files),
+            "records_scanned": records_scanned,
+            "records_matched": len(findings),
+        }
+        if failed_files:
+            result.details["failed_files"] = failed_files
+            result.add_error(f"{len(failed_files)} file(s) failed to parse — see details.failed_files")
+
+        _log.info(event("aws_ir_hunt", "incident_local_cloudtrail_logs.complete",
+                        files=len(files), scanned=records_scanned,
+                        findings=len(findings), **severity_counts))
+        return result
+
+    @classmethod
+    def _score_incident_record(
+        cls,
+        record: Dict[str, Any],
+        *,
+        ioc_ip_exact: set,
+        ioc_networks: list,
+        ioc_users: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Turn one CloudTrail record into a ranked finding, or None if it is
+        neither dangerous nor attributable to an IOC."""
+        event_name = record.get("eventName") or ""
+        category = cls._IR_EVENT_CATEGORY.get(event_name)
+        is_dangerous = category is not None
+
+        user_identity = record.get("userIdentity") or {}
+        arn = user_identity.get("arn") or ""
+        user_name = user_identity.get("userName") or ""
+        access_key_id = user_identity.get("accessKeyId") or ""
+        principal_id = user_identity.get("principalId") or ""
+        source_ip = record.get("sourceIPAddress") or ""
+
+        reasons: List[str] = []
+        if is_dangerous:
+            reasons.append(f"dangerous:{category}")
+
+        # IOC IP correlation (exact or CIDR).
+        ip_hit = False
+        if source_ip in ioc_ip_exact:
+            ip_hit = True
+        elif ioc_networks:
+            try:
+                addr = ipaddress.ip_address(source_ip)
+                ip_hit = any(addr in net for net in ioc_networks)
+            except ValueError:
+                ip_hit = False
+        if ip_hit:
+            reasons.append(f"ioc-ip:{source_ip}")
+
+        # IOC principal correlation.
+        user_hit = False
+        for token in ioc_users:
+            if token in (user_name, access_key_id, principal_id) or (arn and token in arn):
+                user_hit = True
+                reasons.append(f"ioc-user:{token}")
+        ioc_match = ip_hit or user_hit
+
+        if not is_dangerous and not ioc_match:
+            return None
+
+        base = cls._IR_CATEGORY_SEVERITY.get(category, 0) if is_dangerous else 0
+        if ioc_match:
+            base += cls._IR_IOC_OVERLAP_BOOST if is_dangerous else cls._IR_IOC_ONLY_SEVERITY
+        score = base
+
+        return {
+            "severity": cls._severity_label(score),
+            "severity_score": score,
+            "ioc_match": ioc_match,
+            "category": category or ("ioc-related" if ioc_match else ""),
+            "reasons": "; ".join(reasons),
+            "eventTime": record.get("eventTime") or "",
+            "eventName": event_name,
+            "eventSource": record.get("eventSource") or "",
+            "awsRegion": record.get("awsRegion") or "",
+            "arn": arn,
+            "userName": user_name,
+            "accessKeyId": access_key_id,
+            "sourceIPAddress": source_ip,
+            "userAgent": record.get("userAgent") or "",
+            "errorCode": record.get("errorCode") or "",
+        }
 
     @staticmethod
     def _collect_cloudtrail_log_files(path: str) -> List[str]:

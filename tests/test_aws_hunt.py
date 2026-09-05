@@ -2311,3 +2311,159 @@ class TestQueryLocalCloudtrailLogs:
         flat = [n for names_ in AwsIRHunt._IR_DANGEROUS_EVENTS.values() for n in names_]
         assert len(flat) == len(set(flat))
         assert len(names) == len(flat)
+
+
+class TestIncidentLocalCloudtrailLogs:
+    def _hunt(self):
+        return AwsIRHunt(make_services(), DredgeConfig())
+
+    def test_no_matching_files_records_error(self, tmp_path):
+        result = self._hunt().incident_local_cloudtrail_logs(str(tmp_path))
+        assert result.success is False
+        assert result.details["findings"] == []
+        assert result.details["severity_counts"] == {}
+
+    def test_dangerous_only_ranked_by_category_severity(self, tmp_path):
+        # No IOCs: only the curated dangerous events, ranked by base severity.
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="GetObject"),          # benign -> dropped
+            _make_ct_record(eventName="GetSecretValue"),     # credential-access 70
+            _make_ct_record(eventName="StopLogging"),        # anti-forensics 90
+            _make_ct_record(eventName="CreateAccessKey"),    # persistence 80
+            _make_ct_record(eventName="GetCallerIdentity"),  # discovery 30
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(str(tmp_path))
+        findings = result.details["findings"]
+        # Benign non-dangerous, non-IOC record is not surfaced.
+        assert [f["eventName"] for f in findings] == [
+            "StopLogging", "CreateAccessKey", "GetSecretValue", "GetCallerIdentity",
+        ]
+        assert [f["severity_score"] for f in findings] == [90, 80, 70, 30]
+        assert [f["severity"] for f in findings] == ["HIGH", "HIGH", "HIGH", "LOW"]
+        assert all(f["ioc_match"] is False for f in findings)
+        assert result.details["statistics"]["records_scanned"] == 5
+
+    def test_ioc_overlap_outranks_plain_dangerous_event(self, tmp_path):
+        # The user's example: CreateAccessKey from a flagged IP must outrank a
+        # GetSecretValue by an unremarkable role -- both reported, ranked.
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="GetSecretValue", sourceIPAddress="10.0.0.9",
+                            userIdentity={"arn": "arn:aws:sts::111:assumed-role/eks/pod"}),
+            _make_ct_record(eventName="CreateAccessKey", sourceIPAddress="1.2.3.4",
+                            userIdentity={"arn": "arn:aws:iam::111:user/mallory",
+                                          "userName": "mallory"}),
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(
+            str(tmp_path), ioc_ips=["1.2.3.4"],
+        )
+        findings = result.details["findings"]
+        assert findings[0]["eventName"] == "CreateAccessKey"
+        assert findings[0]["severity"] == "CRITICAL"
+        assert findings[0]["ioc_match"] is True
+        assert findings[0]["severity_score"] == 180  # 80 + 100 overlap boost
+        assert findings[1]["eventName"] == "GetSecretValue"
+        assert findings[1]["severity"] == "HIGH"
+        assert findings[1]["ioc_match"] is False
+
+    def test_ioc_only_non_dangerous_event_surfaced_as_context(self, tmp_path):
+        # A non-dangerous call by an IOC is still reported, at low priority.
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="DescribeInstances", sourceIPAddress="1.2.3.4"),
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(
+            str(tmp_path), ioc_ips=["1.2.3.4"],
+        )
+        findings = result.details["findings"]
+        assert len(findings) == 1
+        assert findings[0]["eventName"] == "DescribeInstances"
+        assert findings[0]["category"] == "ioc-related"
+        assert findings[0]["severity"] == "MEDIUM"
+        assert findings[0]["severity_score"] == 40
+
+    def test_non_dangerous_non_ioc_record_dropped(self, tmp_path):
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="GetObject", sourceIPAddress="8.8.8.8"),
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(
+            str(tmp_path), ioc_ips=["1.2.3.4"],
+        )
+        assert result.details["findings"] == []
+        assert result.details["statistics"]["records_scanned"] == 1
+
+    def test_ioc_ip_cidr_match(self, tmp_path):
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="CreateAccessKey", sourceIPAddress="1.2.3.55"),
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(
+            str(tmp_path), ioc_ips=["1.2.3.0/24"],
+        )
+        assert result.details["findings"][0]["ioc_match"] is True
+        assert "ioc-ip:1.2.3.55" in result.details["findings"][0]["reasons"]
+
+    def test_ioc_user_matches_arn_substring(self, tmp_path):
+        # Assumed-role sessions have no userName; match on the ARN substring.
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="RunInstances",
+                            userIdentity={"arn": "arn:aws:sts::111:assumed-role/eks-workload/pod"}),
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(
+            str(tmp_path), ioc_users=["eks-workload"],
+        )
+        f = result.details["findings"][0]
+        assert f["ioc_match"] is True
+        assert "ioc-user:eks-workload" in f["reasons"]
+
+    def test_ioc_user_matches_access_key_id(self, tmp_path):
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="GetSecretValue",
+                            userIdentity={"accessKeyId": "AKIACOMPROMISED"}),
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(
+            str(tmp_path), ioc_users=["AKIACOMPROMISED"],
+        )
+        assert result.details["findings"][0]["ioc_match"] is True
+
+    def test_time_window_bounds_records(self, tmp_path):
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="StopLogging", eventTime="2026-08-25T10:00:00Z"),
+            _make_ct_record(eventName="StopLogging", eventTime="2026-08-25T20:00:00Z"),
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(
+            str(tmp_path),
+            start_time=datetime(2026, 8, 25, 15, 0, tzinfo=timezone.utc),
+        )
+        assert len(result.details["findings"]) == 1
+        assert result.details["findings"][0]["eventTime"] == "2026-08-25T20:00:00Z"
+
+    def test_max_findings_keeps_highest_severity(self, tmp_path):
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="GetCallerIdentity"),  # 30
+            _make_ct_record(eventName="StopLogging"),        # 90
+            _make_ct_record(eventName="GetSecretValue"),     # 70
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(
+            str(tmp_path), max_findings=2,
+        )
+        findings = result.details["findings"]
+        assert [f["eventName"] for f in findings] == ["StopLogging", "GetSecretValue"]
+
+    def test_severity_counts_and_iocs_recorded(self, tmp_path):
+        _write_json(tmp_path / "f.json", {"Records": [
+            _make_ct_record(eventName="StopLogging", sourceIPAddress="1.2.3.4"),  # CRITICAL
+            _make_ct_record(eventName="GetSecretValue"),                          # HIGH
+        ]})
+        result = self._hunt().incident_local_cloudtrail_logs(
+            str(tmp_path), ioc_ips=["1.2.3.4"], ioc_users=["nobody"],
+        )
+        assert result.details["severity_counts"] == {"CRITICAL": 1, "HIGH": 1}
+        assert result.details["iocs"] == {"ips": ["1.2.3.4"], "users": ["nobody"]}
+
+    def test_severity_label_thresholds(self):
+        label = AwsIRHunt._severity_label
+        assert label(190) == "CRITICAL"
+        assert label(150) == "CRITICAL"
+        assert label(90) == "HIGH"
+        assert label(70) == "HIGH"
+        assert label(40) == "MEDIUM"
+        assert label(30) == "LOW"
+        assert label(0) == "LOW"

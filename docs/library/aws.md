@@ -29,6 +29,18 @@ res = d.aws_ir.hunt.query_local_cloudtrail_logs(
 for event in res.details["events"]:
     ...
 
+# 2b) Or triage them into a severity-ranked incident report. Sweeps the curated
+#     dangerous eventNames; pass IOCs to also pull IOC-attributable activity and
+#     float dangerous+IOC overlaps to the top.
+res = d.aws_ir.hunt.incident_local_cloudtrail_logs(
+    "./ct-logs",
+    ioc_ips=["1.2.3.4", "10.0.0.0/24"],           # exact or CIDR
+    ioc_users=["alice", "arn:aws:iam::111:role/foo"],
+)
+for f in res.details["findings"]:                  # sorted severity desc
+    print(f["severity"], f["severity_score"], f["eventName"], f["reasons"])
+print(res.details["severity_counts"])              # {"CRITICAL": 2, "HIGH": 5, ...}
+
 # 3) Or hunt live via LookupEvents (last ~90 days)
 res = d.aws_ir.hunt.lookup_events(access_key_id="AKIAIOSFODNN7EXAMPLE")
 print(res.details["events"])

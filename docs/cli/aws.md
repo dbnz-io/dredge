@@ -144,7 +144,41 @@ dredge aws hunt query-cloudtrail-logs --path ./ct-logs \
 
 Filters: `--source-ip`, `--user`, `--access-key-id`, `--event-name`,
 `--event-source`, `--region`, `--account-id`, `--start-time`/`--end-time`.
-`--fields` projects dot-paths (e.g. `userIdentity.accountId`).
+`--fields` projects dot-paths (e.g. `userIdentity.accountId`). `--ir` keeps only
+the curated high-signal "dangerous" eventNames so you can plot them on a
+timeline.
+
+#### Incident report — ranked by severity
+
+`--incident` turns the same offline scan into a triage **report**: it sweeps the
+logs for the curated dangerous eventNames and emits findings **ranked by
+severity** (`CRITICAL` → `HIGH` → `MEDIUM` → `LOW`), highest first. Output
+defaults to CSV (add `--output json` for the raw result).
+
+```bash
+# Top dangerous events across a folder of logs, ranked.
+dredge aws hunt query-cloudtrail-logs --path ./ct-logs --incident > report.csv
+```
+
+Add `--iocs` to correlate against known indicators. It runs the same
+dangerous-event sweep **and** pulls any activity attributable to an IOC — even
+non-dangerous calls, kept as lower-priority context — then floats the
+**overlaps** (a dangerous action *by* a flagged IOC) to the top:
+
+```bash
+dredge aws hunt query-cloudtrail-logs --path ./ct-logs \
+  --iocs "ips=1.2.3.4,10.0.0.0/24;users=alice,arn:aws:iam::111:role/foo" \
+  > report.csv          # --iocs implies --incident
+```
+
+IOC format: `ips=<csv>;users=<csv>`. IPs match `sourceIPAddress` exactly or by
+CIDR; users match `userName` / `accessKeyId` / `principalId` exactly or as a
+substring of the ARN (so assumed-role sessions match). Severity =
+per-category base score + an overlap boost when a dangerous event also hits an
+IOC. Concretely, a `CreateAccessKey` from a flagged IP (`CRITICAL`) outranks a
+`GetSecretValue` by an unremarkable role (`HIGH`) — both reported, one
+prioritised. `--start-time`/`--end-time` bound the window; `--max-events` caps
+the findings kept.
 
 ### CloudTrail — list-driven hunts
 

@@ -947,6 +947,89 @@ class TestAwsQueryCloudtrailLogsFieldsFlag:
         assert kwargs["fields"] is None
 
 
+class TestAwsQueryCloudtrailLogsIncidentFlag:
+    def _mock(self, monkeypatch):
+        mock_dredge_class = MagicMock()
+        mock_instance = mock_dredge_class.return_value
+        monkeypatch.setattr(dredge_cli, "Dredge", mock_dredge_class)
+        mock_instance.aws_ir.hunt.incident_local_cloudtrail_logs.return_value = OperationResult(
+            operation="incident_local_cloudtrail_logs", target="t", success=True,
+            details={"findings": [], "severity_counts": {}, "iocs": {"ips": [], "users": []},
+                     "statistics": {"files_scanned": 0, "records_scanned": 0}},
+        )
+        return mock_instance
+
+    def test_incident_flag_routes_to_incident_method(self, monkeypatch, capsys):
+        mock_instance = self._mock(monkeypatch)
+        parser = dredge_cli.build_parser()
+        args = parser.parse_args([
+            "aws", "hunt", "query-cloudtrail-logs", "--path", "/tmp/logs", "--incident",
+        ])
+        args.func(args)
+
+        mock_instance.aws_ir.hunt.incident_local_cloudtrail_logs.assert_called_once()
+        pos, kwargs = mock_instance.aws_ir.hunt.incident_local_cloudtrail_logs.call_args
+        assert pos == ("/tmp/logs",)
+        assert kwargs["ioc_ips"] == []
+        assert kwargs["ioc_users"] == []
+        # Plain query path must NOT be taken.
+        mock_instance.aws_ir.hunt.query_local_cloudtrail_logs.assert_not_called()
+
+    def test_iocs_flag_implies_incident_and_is_parsed(self, monkeypatch, capsys):
+        mock_instance = self._mock(monkeypatch)
+        parser = dredge_cli.build_parser()
+        args = parser.parse_args([
+            "aws", "hunt", "query-cloudtrail-logs", "--path", "/tmp/logs",
+            "--iocs", "ips=1.2.3.4,10.0.0.0/24;users=alice,arn:aws:iam::1:role/r",
+        ])
+        args.func(args)
+
+        mock_instance.aws_ir.hunt.incident_local_cloudtrail_logs.assert_called_once()
+        _, kwargs = mock_instance.aws_ir.hunt.incident_local_cloudtrail_logs.call_args
+        assert kwargs["ioc_ips"] == ["1.2.3.4", "10.0.0.0/24"]
+        assert kwargs["ioc_users"] == ["alice", "arn:aws:iam::1:role/r"]
+
+    def test_incident_defaults_to_csv_with_severity_header(self, monkeypatch, capsys):
+        mock_instance = self._mock(monkeypatch)
+        mock_instance.aws_ir.hunt.incident_local_cloudtrail_logs.return_value = OperationResult(
+            operation="incident_local_cloudtrail_logs", target="t", success=True,
+            details={
+                "findings": [{
+                    "severity": "CRITICAL", "severity_score": 180, "ioc_match": True,
+                    "category": "persistence-privesc", "reasons": "dangerous:persistence-privesc; ioc-ip:1.2.3.4",
+                    "eventTime": "2026-08-28T01:00:00Z", "eventName": "CreateAccessKey",
+                    "eventSource": "iam.amazonaws.com", "awsRegion": "us-east-1",
+                    "arn": "arn:aws:iam::1:user/m", "userName": "m", "accessKeyId": "AKIA",
+                    "sourceIPAddress": "1.2.3.4", "errorCode": "", "userAgent": "cli",
+                }],
+                "severity_counts": {"CRITICAL": 1},
+                "iocs": {"ips": ["1.2.3.4"], "users": []},
+                "statistics": {"files_scanned": 1, "records_scanned": 1},
+            },
+        )
+        parser = dredge_cli.build_parser()
+        args = parser.parse_args([
+            "aws", "hunt", "query-cloudtrail-logs", "--path", "/tmp/logs", "--incident",
+        ])
+        args.func(args)
+
+        out = capsys.readouterr().out
+        # Header column order: severity first, ranked report style.
+        assert out.splitlines()[0].startswith(
+            "severity,severity_score,ioc_match,category,reasons"
+        )
+        assert "CRITICAL,180,True,persistence-privesc" in out
+
+    def test_parse_iocs_empty_and_malformed(self):
+        assert dredge_cli._parse_iocs(None) == ([], [])
+        assert dredge_cli._parse_iocs("") == ([], [])
+        assert dredge_cli._parse_iocs("garbage-no-equals") == ([], [])
+        # Aliases and stray whitespace tolerated; unknown keys ignored.
+        assert dredge_cli._parse_iocs(" ip = 1.1.1.1 ; foo=x ; user=bob ") == (
+            ["1.1.1.1"], ["bob"],
+        )
+
+
 class TestAwsHuntCloudtrailSourceIpFullScan:
     def test_source_ip_alone_auto_enables_full_scan_and_warns(self, monkeypatch, capsys):
         mock_dredge_class = MagicMock()

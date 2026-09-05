@@ -9,7 +9,7 @@ import sys
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Library imports – adjust if your package paths differ
 from dredge import Dredge, DredgeConfig
@@ -108,6 +108,55 @@ def print_table(headers: tuple, rows: list) -> None:
     print("    ".join(str(h).ljust(w) for h, w in zip(headers, widths)))
     for row in rows:
         print("    ".join(str(c).ljust(w) for c, w in zip(row, widths)))
+
+
+# Column order for the incident report CSV — severity first so the report
+# reads top-down by priority; the generic print_result would sort columns
+# alphabetically, which buries the ranking.
+_INCIDENT_CSV_COLUMNS = (
+    "severity", "severity_score", "ioc_match", "category", "reasons",
+    "eventTime", "eventName", "eventSource", "awsRegion",
+    "arn", "userName", "accessKeyId", "sourceIPAddress",
+    "errorCode", "userAgent",
+)
+
+
+def print_incident_report_csv(result) -> None:
+    """Render incident_local_cloudtrail_logs() output as a severity-ranked
+    CSV. Findings are already sorted highest-severity-first by the library."""
+    try:
+        data = asdict(result)
+    except TypeError:
+        data = result
+    details = data.get("details", {}) if isinstance(data, dict) else {}
+    findings = details.get("findings", []) or []
+
+    # Summary banner on stderr so piping the CSV to a file stays clean.
+    counts = details.get("severity_counts", {}) or {}
+    stats = details.get("statistics", {}) or {}
+    iocs = details.get("iocs", {}) or {}
+    summary = ", ".join(
+        f"{lbl}={counts[lbl]}"
+        for lbl in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+        if counts.get(lbl)
+    ) or "no findings"
+    print(
+        f"# incident report: {len(findings)} finding(s) [{summary}] "
+        f"from {stats.get('records_scanned', 0)} record(s) in "
+        f"{stats.get('files_scanned', 0)} file(s); "
+        f"iocs: {len(iocs.get('ips', []))} ip / {len(iocs.get('users', []))} user",
+        file=sys.stderr,
+    )
+    for err in data.get("errors", []) if isinstance(data, dict) else []:
+        print(f"# warning: {err}", file=sys.stderr)
+
+    writer = csv.DictWriter(
+        sys.stdout, fieldnames=list(_INCIDENT_CSV_COLUMNS), extrasaction="ignore"
+    )
+    writer.writeheader()
+    for f in findings:
+        if isinstance(f, dict):
+            writer.writerow(f)
 
 
 
@@ -859,12 +908,58 @@ def handle_aws_download_s3_logs(args: argparse.Namespace) -> None:
     print_result(res, output=getattr(args, "output", "json"))
 
 
+def _parse_iocs(raw: Optional[str]) -> Tuple[List[str], List[str]]:
+    """Parse the --iocs value into (ips, users).
+
+    Format: semicolon-separated key=value groups, each value a comma-separated
+    list. Recognised keys: ips (alias ip) and users (alias user). E.g.
+        "ips=1.2.3.4,10.0.0.0/24;users=alice,arn:aws:iam::111:role/foo"
+    Order and whitespace are forgiving; unknown keys are ignored.
+    """
+    ips: List[str] = []
+    users: List[str] = []
+    if not raw:
+        return ips, users
+    for group in raw.split(";"):
+        group = group.strip()
+        if not group or "=" not in group:
+            continue
+        key, _, value = group.partition("=")
+        key = key.strip().lower()
+        items = [v.strip() for v in value.split(",") if v.strip()]
+        if key in ("ips", "ip"):
+            ips.extend(items)
+        elif key in ("users", "user"):
+            users.extend(items)
+    return ips, users
+
+
 def handle_aws_query_cloudtrail_logs(args: argparse.Namespace) -> None:
     auth = build_aws_auth_from_args(args)
     dredge = Dredge(
         auth=auth,
         config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
     )
+
+    if args.incident or args.iocs:
+        ioc_ips, ioc_users = _parse_iocs(args.iocs)
+        res = dredge.aws_ir.hunt.incident_local_cloudtrail_logs(
+            args.path,
+            ioc_ips=ioc_ips,
+            ioc_users=ioc_users,
+            start_time=parse_iso_datetime(args.start_time),
+            end_time=parse_iso_datetime(args.end_time),
+            max_findings=args.max_events,
+        )
+        # The incident report is a severity-ranked table; default it to CSV
+        # (the "report" the responder wants) unless JSON was asked for.
+        output = args.output or "csv"
+        if output == "csv":
+            print_incident_report_csv(res)
+        else:
+            print_result(res, output=output)
+        return
+
     res = dredge.aws_ir.hunt.query_local_cloudtrail_logs(
         args.path,
         source_ip=args.source_ip,
@@ -880,7 +975,7 @@ def handle_aws_query_cloudtrail_logs(args: argparse.Namespace) -> None:
         max_events=args.max_events,
         ir=args.ir,
     )
-    print_result(res, output=getattr(args, "output", "json"))
+    print_result(res, output=args.output or "json")
 
 
 _SG_DIRECTION_ARG_TO_LIB = {"inbound": "ingress", "outbound": "egress", "both": "both"}
@@ -1855,6 +1950,27 @@ def build_parser() -> argparse.ArgumentParser:
         "on an incident timeline. Combines with the other filters (e.g. "
         "--start-time/--end-time, --user).",
     )
+    p.add_argument(
+        "--incident",
+        action="store_true",
+        help="Incident report mode: sweep the logs for the curated dangerous "
+        "eventNames and emit findings RANKED BY SEVERITY (CRITICAL/HIGH/"
+        "MEDIUM/LOW), highest first. Defaults to CSV output. Pair with "
+        "--iocs to also pull IOC-attributable activity and float dangerous+IOC "
+        "overlaps to the top. Honours --start-time/--end-time; --max-events "
+        "caps the findings kept.",
+    )
+    p.add_argument(
+        "--iocs",
+        default=None,
+        help="Indicators of compromise to correlate (implies --incident). "
+        "Format: 'ips=<csv>;users=<csv>', e.g. "
+        "'ips=1.2.3.4,10.0.0.0/24;users=alice,arn:aws:iam::111:role/foo'. "
+        "IPs match sourceIPAddress (exact or CIDR); users match userName / "
+        "accessKeyId / principalId exactly or as an ARN substring. A dangerous "
+        "event by a flagged IOC is scored highest; non-dangerous IOC activity "
+        "is still reported as lower-priority context.",
+    )
     p.add_argument("--event-source", default=None, help="Exact match on eventSource (e.g. s3.amazonaws.com)")
     p.add_argument("--region", default=None, help="Exact match on awsRegion")
     p.add_argument("--account-id", default=None, help="Match userIdentity.accountId or recipientAccountId")
@@ -1868,8 +1984,13 @@ def build_parser() -> argparse.ArgumentParser:
         "Default: eventTime,userIdentity.accountId,userIdentity.arn,"
         "userIdentity.accessKeyId,eventSource,eventName,awsRegion,userAgent",
     )
-    p.add_argument("--max-events", type=int, default=None, dest="max_events", help="Cap on matched records returned (default: unlimited)")
-    p.add_argument("--output", choices=["json", "csv"], default="json")
+    p.add_argument("--max-events", type=int, default=None, dest="max_events", help="Cap on matched records returned / incident findings kept (default: unlimited)")
+    p.add_argument(
+        "--output",
+        choices=["json", "csv"],
+        default=None,
+        help="Output format. Default: json for a plain query, csv for --incident.",
+    )
     p.set_defaults(func=handle_aws_query_cloudtrail_logs)
 
     p = subparsers.command("aws", "hunt", "security-groups-by-ip",
