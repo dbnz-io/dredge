@@ -754,6 +754,100 @@ class TestDownloadS3Logs:
         written = sorted(os.listdir(tmp_path))
         assert written == ["a_b_c.json", "a_b_c__1.json"]
 
+    @pytest.mark.parametrize("failure", ["write", "stream", "gzip"])
+    def test_worker_failures_reported_while_other_downloads_finish(self, tmp_path, failure):
+        bad_key = "bad.json.gz" if failure == "gzip" else "bad.json"
+        objects = {bad_key: gzip.compress(b"{}")[:-4] if failure == "gzip" else b"bad",
+                   "good.json": b"good"}
+        services = make_services()
+        services.s3 = self._make_s3(
+            [{"Contents": [{"Key": k} for k in objects]}], objects,
+        )
+        if failure == "write":
+            (tmp_path / bad_key).mkdir()
+        elif failure == "stream":
+            get_object = services.s3.get_object.side_effect
+
+            def failing_stream(Bucket, Key):
+                if Key == bad_key:
+                    return {"Body": MagicMock(read=MagicMock(side_effect=OSError("stream failed")))}
+                return get_object(Bucket, Key)
+
+            services.s3.get_object.side_effect = failing_stream
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "bucket", destination=str(tmp_path),
+        )
+
+        assert result.success is False
+        assert bad_key in result.details["failed"]
+        assert result.details["downloaded"] == 1
+        assert (tmp_path / "good.json").read_bytes() == b"good"
+        assert set(os.listdir(tmp_path)) == ({"good.json", bad_key} if failure == "write" else {"good.json"})
+
+    @pytest.mark.parametrize("target_exists", [True, False])
+    def test_download_rejects_symlink_without_touching_target(self, tmp_path, target_exists):
+        destination = tmp_path / "work"
+        destination.mkdir()
+        outside = tmp_path / "outside.json"
+        if target_exists:
+            outside.write_bytes(b"original")
+        (destination / "log.json").symlink_to(outside)
+        services = make_services()
+        services.s3 = self._make_s3(
+            [{"Contents": [{"Key": "log.json"}]}], {"log.json": b"replacement"},
+        )
+
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "bucket", destination=str(destination),
+        )
+
+        assert result.success is False
+        assert "symlink" in result.details["failed"]["log.json"]
+        assert result.details["downloaded"] == 0
+        assert outside.exists() == target_exists
+        if target_exists:
+            assert outside.read_bytes() == b"original"
+
+    def test_symlink_created_during_download_is_not_followed(self, tmp_path, monkeypatch):
+        destination = tmp_path / "work"
+        destination.mkdir()
+        outside = tmp_path / "outside.json"
+        outside.write_bytes(b"original")
+        replace = os.replace
+
+        def introduce_symlink(source, target):
+            os.symlink(outside, target)
+            replace(source, target)
+
+        monkeypatch.setattr(os, "replace", introduce_symlink)
+        services = make_services()
+        services.s3 = self._make_s3(
+            [{"Contents": [{"Key": "log.json"}]}], {"log.json": b"replacement"},
+        )
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "bucket", destination=str(destination),
+        )
+
+        assert result.success is True
+        assert outside.read_bytes() == b"original"
+        assert not (destination / "log.json").is_symlink()
+        assert (destination / "log.json").read_bytes() == b"replacement"
+
+    def test_download_replaces_existing_regular_file(self, tmp_path):
+        (tmp_path / "log.json").write_bytes(b"old")
+        services = make_services()
+        services.s3 = self._make_s3(
+            [{"Contents": [{"Key": "log.json"}]}], {"log.json": b"new"},
+        )
+        result = AwsIRForensics(services, DredgeConfig()).download_s3_logs(
+            "bucket", destination=str(tmp_path),
+        )
+
+        assert result.success is True
+        assert (tmp_path / "log.json").read_bytes() == b"new"
+        assert os.listdir(tmp_path) == ["log.json"]
+
     def test_max_objects_stops_mid_page(self, tmp_path):
         services = make_services()
         objects = {"logs/one.json": b"1", "logs/two.json": b"2"}

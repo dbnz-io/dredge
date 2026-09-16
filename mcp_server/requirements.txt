@@ -1,0 +1,9 @@
+# Dredge MCP server dependencies.
+#
+# Pinned below 2.0: mcp 2.0 restructured the SDK (no more
+# mcp.server.fastmcp.FastMCP). This server is small and stdio-only; the 1.x
+# FastMCP API is all it needs. Revisit 2.x only if a feature here requires it.
+mcp>=1.2.0,<2.0.0
+
+# The MCP server imports the dredge package itself (hunt/review/forensics).
+# Install dredge from the repo root: `pip install -e .`

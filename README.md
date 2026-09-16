@@ -217,6 +217,52 @@ Every action returns an `OperationResult` (`success`, `details`, `errors`).
 
 ---
 
+## MCP server — chat with Dredge
+
+Drive Dredge's **read-only** surface from an MCP client (e.g. Claude): ask *how
+to use the tool*, download logs, hunt, capture forensic evidence, and correlate
+across AWS, Kubernetes, GitHub, and GCP — in plain language.
+
+> 🔒 **No containment is wired.** Not one tool reaches Dredge's `response`
+> surface (disable/delete IAM, isolate EC2, delete pods, quarantine…). Those
+> wrappers don't exist in the server process, so the client can't discover or
+> call them.
+
+```bash
+# 1. Install the server's dependency (the dredge package provides the rest)
+pip install -r mcp_server/requirements.txt
+
+# 2. Register it (stdio). Runs with your AWS creds — use READ-ONLY ones.
+claude mcp add dredge \
+  --env AWS_PROFILE=ir --env AWS_REGION=us-east-1 \
+  -- python /abs/path/to/mcp_server/server.py
+```
+
+Then ask the client to run **`dredge_capabilities`** (what's enabled) and
+**`dredge_guide`** (how-to docs), then any hunt/forensic tool.
+
+**Capability profiles** (`DREDGE_MCP_PROFILE`):
+
+| Profile | Tools |
+|---|---|
+| `analyst` *(default)* | 100% read-only: how-to, log download (to a local sandbox), every hunt, the posture review, all read forensics. Never mutates cloud state. |
+| `forensic` | `analyst` **+** additive EBS volume snapshotting (opt-in; writes to the cloud but destroys nothing). |
+
+**Provider gating** — AWS is always on; others register only when configured:
+`DREDGE_GITHUB_ORG`/`DREDGE_GITHUB_ENTERPRISE` (+ `GITHUB_TOKEN`),
+`DREDGE_GCP_PROJECT`, `DREDGE_ENABLE_K8S=1`. AWS-only shows 32 tools; fully
+configured, 61.
+
+**Safety model** — the tool set is a *capability reduction*, not the security
+boundary: run the server under read-only cloud credentials (AWS
+`SecurityAudit`/`ReadOnlyAccess`, read-only K8s RBAC, a read-scoped GitHub token,
+GCP `logging.viewer`). Local file tools are confined to `DREDGE_MCP_WORKDIR`
+(default `./dredge-mcp-workdir`); path escapes are rejected.
+
+👉 Full setup, tool list, and security notes: [docs/mcp.md](docs/mcp.md).
+
+---
+
 ## Documentation
 
 | | |
@@ -226,6 +272,7 @@ Every action returns an `OperationResult` (`success`, `details`, `errors`).
 | [Authentication](docs/authentication.md) | AWS · GitHub · Kubernetes · GCP |
 | [CLI](docs/cli/README.md) | [AWS](docs/cli/aws.md) · [GitHub](docs/cli/github.md) · [Kubernetes](docs/cli/kubernetes.md) |
 | [Library](docs/library/README.md) | [AWS](docs/library/aws.md) · [GitHub](docs/library/github.md) · [Kubernetes](docs/library/kubernetes.md) |
+| [MCP server](docs/mcp.md) | Chat with Dredge's read-only surface from an MCP client |
 | [Command reference](docs/reference.md) | Every command, generated from the CLI |
 | [Roadmap](docs/roadmap.md) · [Contributing](docs/contributing.md) | |
 

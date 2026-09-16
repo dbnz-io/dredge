@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import os
 import re
+import tempfile
 import threading
 from calendar import monthrange
 from concurrent.futures import ThreadPoolExecutor
@@ -992,7 +993,7 @@ class AwsIRForensics:
                                     target=result.target, key=key, error=str(exc)))
                 return
 
-            local_name = key.replace("/", "_")
+            local_name = key.replace("/", "_").replace("\\", "_")
             if decompress_gzip and local_name.lower().endswith(".gz"):
                 try:
                     body = gzip.decompress(body)
@@ -1004,15 +1005,30 @@ class AwsIRForensics:
 
             with state_lock:
                 local_name = _dedupe_locked(local_name)
+            if local_name in {"", ".", ".."} or os.path.splitdrive(local_name)[0]:
+                raise ValueError(f"Invalid output filename: {local_name!r}")
             local_path = os.path.join(destination, local_name)
-            with open(local_path, "wb") as fh:
-                fh.write(body)
+            if os.path.islink(local_path):
+                raise ValueError(f"Refusing to overwrite symlink: {local_path}")
+            # Write a new file and replace the directory entry atomically.
+            # Never open the existing output: a symlink introduced after the
+            # check above is replaced, rather than followed to its target.
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=destination, delete=False) as fh:
+                    temp_path = fh.name
+                    fh.write(body)
+                os.replace(temp_path, local_path)
+            finally:
+                if temp_path is not None and os.path.exists(temp_path):
+                    os.unlink(temp_path)
             with state_lock:
                 local_files.append(local_path)
 
         # Number of download tasks submitted so far -- bounds max_objects.
         # Listing is serial on the main thread, so a plain int is safe here.
         submitted = [0]
+        download_futures = {}
 
         def _submit_matching_under_prefix(executor, list_prefix: Optional[str]):
             """List one prefix (Contents, no delimiter) and submit a download
@@ -1038,7 +1054,9 @@ class AwsIRForensics:
                     if max_objects is not None and submitted[0] >= max_objects:
                         return futures, True
 
-                    futures.append(executor.submit(_download_one, key))
+                    future = executor.submit(_download_one, key)
+                    futures.append(future)
+                    download_futures[future] = key
                     submitted[0] += 1
             return futures, (max_objects is not None and submitted[0] >= max_objects)
 
@@ -1064,7 +1082,16 @@ class AwsIRForensics:
             result.add_error(f"Failed to list objects in s3://{bucket}: {exc}")
             _log.error(event("aws_ir_forensics", "download_s3_logs.list_error",
                              target=result.target, error=str(exc)))
-            return result
+
+        # Executor shutdown waits, but does not propagate worker exceptions.
+        # Inspect every submitted task, including those preceding a list error.
+        for future, key in download_futures.items():
+            try:
+                future.result()
+            except Exception as exc:
+                failed[key] = str(exc)
+                _log.warning(event("aws_ir_forensics", "download_s3_logs.object_error",
+                                   target=result.target, key=key, error=str(exc)))
 
         result.details["destination"] = destination
         result.details["downloaded"] = len(local_files)
