@@ -5,6 +5,7 @@ import argparse
 import json
 import csv
 import os
+import re
 import sys
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 # Library imports – adjust if your package paths differ
 from dredge import Dredge, DredgeConfig
 from dredge.auth import AwsAuthConfig
+from dredge.aws_ir.hunt import EMUDHRA_2026_CERT_SHA256
 from dredge.github_ir.config import GitHubIRConfig
 from dredge.k8s_ir.config import K8sAuthConfig
 
@@ -426,6 +428,92 @@ def handle_aws_hunt_cloudtrail(args: argparse.Namespace) -> None:
             allow_full_scan=full_scan,
         )
     print_result(res, output=getattr(args, "output", "json"))
+
+
+def _read_certificate_iocs(path: str) -> Tuple[List[str], List[str]]:
+    """Read `sha256:<hash>`, `ca:<name>`, bare hashes, or bare CA names."""
+    fingerprints: List[str] = []
+    ca_names: List[str] = []
+    for value in _read_list_file(path):
+        kind, separator, payload = value.partition(":")
+        if separator and kind.casefold() in {"sha256", "fingerprint"}:
+            fingerprints.append(payload.strip())
+        elif separator and kind.casefold() in {"ca", "issuer"}:
+            ca_names.append(payload.strip())
+        elif re.fullmatch(r"(?:[a-fA-F0-9]{2}:){31}[a-fA-F0-9]{2}|[a-fA-F0-9]{64}", value):
+            fingerprints.append(value)
+        else:
+            ca_names.append(value)
+    return fingerprints, ca_names
+
+
+def print_certificate_hunt(result) -> None:
+    """Render CA totals for inventory mode and IOC matches for hunt mode."""
+    details = result.details
+    if details.get("mode") == "inventory":
+        rows = [
+            (item["certificate_authority"], item["certificate_count"])
+            for item in details.get("ca_summary", [])
+        ]
+        print_table(("Certificate authority", "Certificates"), rows)
+    else:
+        rows = []
+        for item in details.get("matches", []):
+            matched = item.get("matched_sha256_fingerprints", []) + item.get("matched_ca_names", [])
+            rows.append((
+                item.get("region", ""), item.get("domain_name", ""),
+                item.get("issuer", ""), ", ".join(matched),
+            ))
+        print_table(("Region", "Domain", "Certificate authority", "Matched IOC"), rows)
+
+    stats = details.get("statistics", {})
+    print(
+        f"\n{stats.get('certificates_scanned', 0)} certificate(s), "
+        f"{stats.get('certificate_authorities', 0)} CA(s), "
+        f"{stats.get('matches', 0)} IOC match(es), "
+        f"{stats.get('errors', 0)} error(s)",
+        file=sys.stderr,
+    )
+
+
+def handle_aws_hunt_certificates(args: argparse.Namespace) -> None:
+    auth = build_aws_auth_from_args(args)
+    dredge = Dredge(
+        auth=auth,
+        config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
+    )
+    fingerprints = _flatten_csv(args.fingerprint)
+    ca_names = _flatten_csv(args.ca_name)
+    if args.iocs_file:
+        try:
+            file_fingerprints, file_ca_names = _read_certificate_iocs(args.iocs_file)
+        except OSError as exc:
+            print(f"error: unable to read IOC file: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        fingerprints.extend(file_fingerprints)
+        ca_names.extend(file_ca_names)
+    if args.preset == "emudhra-2026":
+        fingerprints.extend(EMUDHRA_2026_CERT_SHA256)
+        ca_names.extend(["eMudhra", "emSign"])
+
+    regions = _flatten_csv(args.regions) if args.regions else "all"
+    if isinstance(regions, list) and "all" in regions:
+        regions = "all"
+    try:
+        res = dredge.aws_ir.hunt.hunt_certificates(
+            fingerprints=list(dict.fromkeys(fingerprints)),
+            ca_names=list(dict.fromkeys(ca_names)),
+            regions=regions,
+            max_workers=args.max_workers,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+    if args.output == "json":
+        print_result(res, output="json")
+    else:
+        print_certificate_hunt(res)
 
 
 def _read_list_file(path: str) -> List[str]:
@@ -2127,6 +2215,51 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.set_defaults(func=handle_aws_hunt_cloudtrail)
 
+    p = subparsers.command(
+        "aws", "hunt", "certificates",
+        help="Inventory ACM certificates or hunt certificate fingerprints and CA names",
+    )
+    p.add_argument(
+        "--fingerprint",
+        action="append",
+        default=[],
+        help="SHA-256 certificate fingerprint (DER hash), comma-separated and/or repeatable",
+    )
+    p.add_argument(
+        "--ca-name",
+        action="append",
+        default=[],
+        help="Case-insensitive issuer substring, comma-separated and/or repeatable",
+    )
+    p.add_argument(
+        "--iocs-file",
+        help="IOC file: one sha256:<hash>, ca:<name>, bare hash, or bare CA name per line",
+    )
+    p.add_argument(
+        "--preset",
+        choices=["emudhra-2026"],
+        help="Add a built-in incident IOC set",
+    )
+    p.add_argument(
+        "--regions",
+        action="append",
+        default=None,
+        help="Regions to scan, comma-separated and/or repeatable (default: all enabled regions)",
+    )
+    p.add_argument(
+        "--max-workers",
+        type=int,
+        default=12,
+        help="Maximum concurrent regional scans (1-64, default: 12)",
+    )
+    p.add_argument(
+        "--output",
+        choices=["table", "json"],
+        default="table",
+        help="Terminal output format (default: table)",
+    )
+    p.set_defaults(func=handle_aws_hunt_certificates)
+
     # --- AWS hunt (CloudTrail, multiple users) ---
 
     p = subparsers.command("aws", "hunt", "cloudtrail-multi-user",
@@ -2621,4 +2754,3 @@ def main():
 
 if __name__ == "__main__":  # pragma: no cover -- only executes via `python -m dredge.cli`, not on import; exercising it needs a different (subprocess) test mechanism for 1 line of value
     main()
-

@@ -225,6 +225,36 @@ dredge --aws-profile ir --region us-east-1 \
 Other hunts: `aws hunt security-groups-by-ip --ip 203.0.113.50`,
 `aws hunt exposed-secrets`. Run `dredge aws hunt --help` for the full list.
 
+### Certificate IOC hunt and CA inventory
+
+With no IOCs, `certificates` inventories ACM in every enabled AWS Region and
+prints the number of certificates issued by each CA:
+
+```bash
+dredge --aws-profile ir aws hunt certificates
+dredge --aws-profile ir aws hunt certificates --output json
+```
+
+Supply exact SHA-256 certificate fingerprints (hashes of DER certificates,
+not SPKI hashes) and/or issuer-name substrings to switch to IOC hunt mode.
+The fingerprint check covers every retrievable ACM leaf and chain certificate:
+
+```bash
+dredge --aws-profile ir aws hunt certificates \
+  --fingerprint 'AA:BB:...' --ca-name 'Example CA'
+
+# Built-in fingerprints and issuer leads for the October 2026 eMudhra incident
+dredge --aws-profile ir aws hunt certificates --preset emudhra-2026
+
+# One sha256:<hash>, ca:<name>, bare hash, or bare CA name per line
+dredge --aws-profile ir aws hunt certificates --iocs-file incident-iocs.txt \
+  --regions us-east-1,eu-west-1 --output json
+```
+
+Issuer-name hits are investigative leads; exact fingerprint hits provide the
+stronger certificate-material match. Regional API failures appear in the JSON
+result and do not stop scans of other Regions.
+
 ---
 
 ## Forensics

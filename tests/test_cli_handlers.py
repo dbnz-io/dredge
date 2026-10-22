@@ -1237,6 +1237,7 @@ class TestAwsHuntSecurityGroupsByIpTable:
         # No raw JSON leakage in the default table view
         assert '"success"' not in out
 
+
     def test_match_type_shown_as_wildcard_for_open_rules(self, monkeypatch, capsys):
         mock_dredge_class = MagicMock()
         mock_instance = mock_dredge_class.return_value
@@ -1363,6 +1364,56 @@ class TestAwsHuntSecurityGroupsByIpTable:
         out = capsys.readouterr().out
         assert '"success": true' in out
         assert '"matched_rules"' in out
+
+
+class TestAwsHuntCertificates:
+    def test_inventory_default_renders_ca_table(self, monkeypatch, capsys):
+        mock_dredge_class = MagicMock()
+        mock_instance = mock_dredge_class.return_value
+        monkeypatch.setattr(dredge_cli, "Dredge", mock_dredge_class)
+        target = mock_instance.aws_ir.hunt.hunt_certificates
+        target.return_value = OperationResult(
+            operation="hunt_certificates", target="aws-acm", success=True,
+            details={
+                "mode": "inventory",
+                "ca_summary": [{"certificate_authority": "Example CA", "certificate_count": 3}],
+                "statistics": {"certificates_scanned": 3, "certificate_authorities": 1, "matches": 0, "errors": 0},
+            },
+        )
+
+        args = dredge_cli.build_parser().parse_args(["aws", "hunt", "certificates"])
+        args.func(args)
+
+        out = capsys.readouterr().out
+        assert "Certificate authority" in out
+        assert "Example CA" in out
+        target.assert_called_once_with(fingerprints=[], ca_names=[], regions="all", max_workers=12)
+
+    def test_ioc_file_and_preset_are_forwarded(self, tmp_path, monkeypatch, capsys):
+        ioc_file = tmp_path / "iocs.txt"
+        ioc_file.write_text("# incident\nca:Custom CA\n" + "ab" * 32 + "\n")
+        mock_dredge_class = MagicMock()
+        mock_instance = mock_dredge_class.return_value
+        monkeypatch.setattr(dredge_cli, "Dredge", mock_dredge_class)
+        target = mock_instance.aws_ir.hunt.hunt_certificates
+        target.return_value = OperationResult(
+            operation="hunt_certificates", target="aws-acm", success=True,
+            details={"mode": "ioc_hunt", "matches": [], "statistics": {}},
+        )
+
+        args = dredge_cli.build_parser().parse_args([
+            "aws", "hunt", "certificates", "--iocs-file", str(ioc_file),
+            "--preset", "emudhra-2026", "--output", "json",
+        ])
+        args.func(args)
+
+        kwargs = target.call_args.kwargs
+        assert "custom ca" not in kwargs["ca_names"]
+        assert "Custom CA" in kwargs["ca_names"]
+        assert "eMudhra" in kwargs["ca_names"]
+        assert "ab" * 32 in kwargs["fingerprints"]
+        assert len(kwargs["fingerprints"]) == 17
+        assert '"operation": "hunt_certificates"' in capsys.readouterr().out
 
 
 class TestAwsHuntExposedSecretsUnredacted:

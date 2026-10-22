@@ -2,6 +2,8 @@ import os
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
 import json
+import base64
+import hashlib
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch, call
 import pytest
@@ -33,6 +35,84 @@ def make_event(event_name="ConsoleLogin", username="alice", source_ip="1.1.1.1")
         "Resources": [],
         "CloudTrailEvent": json.dumps({"sourceIPAddress": source_ip}),
     }
+
+
+class TestCertificateHunt:
+    @staticmethod
+    def _services(certificates_by_region):
+        services = MagicMock()
+        services.resolve_enabled_regions.return_value = sorted(certificates_by_region)
+        regional_clients = {}
+        for region, certificates in certificates_by_region.items():
+            client = MagicMock()
+            summaries = [{"CertificateArn": cert["CertificateArn"]} for cert in certificates]
+            client.get_paginator.return_value.paginate.return_value = [
+                {"CertificateSummaryList": summaries}
+            ]
+            by_arn = {cert["CertificateArn"]: cert for cert in certificates}
+            client.describe_certificate.side_effect = lambda CertificateArn, values=by_arn: {
+                "Certificate": values[CertificateArn]
+            }
+            regional = MagicMock()
+            regional.acm = client
+            regional_clients[region] = (regional, client)
+        services.regional.side_effect = lambda region: regional_clients[region][0]
+        return services, regional_clients
+
+    def test_no_iocs_returns_inventory_grouped_by_ca(self):
+        certs = {
+            "us-east-1": [
+                {"CertificateArn": "arn:1", "DomainName": "one.example", "Issuer": "Example CA", "Status": "ISSUED"},
+                {"CertificateArn": "arn:2", "DomainName": "two.example", "Issuer": "Example CA", "Status": "EXPIRED"},
+                {"CertificateArn": "arn:3", "DomainName": "three.example", "Issuer": "Other CA", "Status": "ISSUED"},
+            ]
+        }
+        services, clients = self._services(certs)
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_certificates()
+
+        assert result.success is True
+        assert result.details["mode"] == "inventory"
+        assert result.details["ca_summary"] == [
+            {"certificate_authority": "Example CA", "certificate_count": 2},
+            {"certificate_authority": "Other CA", "certificate_count": 1},
+        ]
+        clients["us-east-1"][1].get_certificate.assert_not_called()
+
+    def test_fingerprint_ioc_checks_leaf_and_chain_material(self):
+        der = b"affected certificate DER"
+        fingerprint = hashlib.sha256(der).hexdigest()
+        pem = "-----BEGIN CERTIFICATE-----\n" + base64.b64encode(der).decode() + "\n-----END CERTIFICATE-----"
+        certs = {"eu-west-1": [{
+            "CertificateArn": "arn:affected", "DomainName": "affected.example",
+            "Issuer": "Ordinary CA", "Status": "ISSUED",
+        }]}
+        services, clients = self._services(certs)
+        clients["eu-west-1"][1].get_certificate.return_value = {
+            "Certificate": "", "CertificateChain": pem,
+        }
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_certificates(
+            fingerprints=[fingerprint.upper()]
+        )
+
+        assert result.details["mode"] == "ioc_hunt"
+        assert result.details["statistics"]["matches"] == 1
+        assert result.details["matches"][0]["matched_sha256_fingerprints"] == [fingerprint]
+
+    def test_ca_name_ioc_is_case_insensitive(self):
+        certs = {"us-east-1": [{
+            "CertificateArn": "arn:em", "DomainName": "example.test",
+            "Issuer": "CN=eMudhra TLS CA", "Status": "ISSUED",
+        }]}
+        services, _ = self._services(certs)
+        result = AwsIRHunt(services, DredgeConfig()).hunt_certificates(ca_names=["EMUDHRA"])
+        assert result.details["matches"][0]["matched_ca_names"] == ["emudhra"]
+
+    @pytest.mark.parametrize("value", ["short", "z" * 64])
+    def test_invalid_fingerprint_rejected(self, value):
+        with pytest.raises(ValueError, match="Invalid SHA-256"):
+            AwsIRHunt(make_services(), DredgeConfig()).hunt_certificates(fingerprints=[value])
 
 
 class TestBuildLookupAttributes:

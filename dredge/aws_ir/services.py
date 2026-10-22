@@ -36,6 +36,7 @@ class AwsServiceRegistry:
         self._sts = None
         self._ecr = None
         self._codebuild = None
+        self._acm = None
 
     def _client(self, name: str, **kw):
         """Create a boto3 client, defaulting its region to this registry's
@@ -98,11 +99,12 @@ class AwsServiceRegistry:
             )
         return self._cloudtrail_by_region[region]
 
-    def resolve_enabled_regions(self):
-        """Regions actually usable by this account for CloudTrail. Uses EC2
+    def resolve_enabled_regions(self, service_name: str = "cloudtrail"):
+        """Regions actually usable by this account. Uses EC2
         DescribeRegions (enabled / opt-in-not-required regions only) so we don't
         fan out to disabled regions that would just error; falls back to
-        botocore's static CloudTrail region list if DescribeRegions is denied."""
+        botocore's static region list for the requested service if
+        DescribeRegions is denied."""
         import botocore.exceptions
         try:
             resp = self.ec2.describe_regions(
@@ -113,7 +115,13 @@ class AwsServiceRegistry:
                 return regions
         except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError):
             pass
-        return sorted(self._session.get_available_regions("cloudtrail"))
+        return sorted(self._session.get_available_regions(service_name))
+
+    @property
+    def acm(self):
+        if self._acm is None:
+            self._acm = self._client("acm")
+        return self._acm
 
     @property
     def kms(self):

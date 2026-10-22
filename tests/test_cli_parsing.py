@@ -57,6 +57,24 @@ def test_cli_parses_nested_aws_hunt_cloudtrail_args():
     assert args.aws_profile == "backdoor"
 
 
+def test_cli_parses_certificate_hunt_and_inventory_defaults():
+    parser = dredge_cli.build_parser()
+    inventory = parser.parse_args(["aws", "hunt", "certificates"])
+    assert inventory.func is dredge_cli.handle_aws_hunt_certificates
+    assert inventory.output == "table"
+    assert inventory.fingerprint == []
+    assert inventory.ca_name == []
+
+    hunt = parser.parse_args([
+        "aws", "hunt", "certificates", "--preset", "emudhra-2026",
+        "--fingerprint", "aa" * 32, "--ca-name", "Example CA",
+        "--regions", "us-east-1,eu-west-1", "--output", "json",
+    ])
+    assert hunt.preset == "emudhra-2026"
+    assert hunt.regions == ["us-east-1,eu-west-1"]
+    assert hunt.output == "json"
+
+
 def test_cli_flat_invocation_is_rejected():
     # The old flat form is gone: there is exactly one way to invoke a command.
     parser = dredge_cli.build_parser()

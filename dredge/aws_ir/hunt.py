@@ -31,6 +31,32 @@ _THROTTLE_ERROR_CODES = {
     "TooManyRequestsException",
 }
 
+# Eight affected eMudhra subordinate CA certificates and their eight Sectigo
+# cross-certificates. Kept as an opt-in preset: calling the certificate hunt
+# without IOCs is deliberately an inventory operation.
+EMUDHRA_2026_CERT_SHA256: FrozenSet[str] = frozenset({
+    "e7568fe6e12331f4fd7de61da4c7559d0f8eb192a218d4741a3ba75184333838",
+    "98b896625c0c230adeec3eb2cf6aad5001ecf9156a68644e82374ce5833bc25b",
+    "42c4accd12c4f59597925e1a08a7a90102608543809308d50ec427e118ba1493",
+    "432ec25f0d28de9006d97bf752f17bbb2cd41f669933fcb072d9a1148d0261f3",
+    "cb6e15165ac802e9b3f993f16c25d41f4e81c21ebde71ae1b012ac00bf9c7c3f",
+    "0164d7ceae5bb909c272af151ff44b1177ae9b47d9424b94f1d9558c30934d19",
+    "9e39de2881273acc225a149c72ba3e0f51424963669ab633ee1dc7df5db067b4",
+    "4b2460a466f95fd40113bcdcca2ceb29b3b093921de45474da7df48874c630b1",
+    "579480aea166290bd3c643589e795fc0d0e54e86505d180f1dff99efd3199512",
+    "5f1ded4dd590af74631290cf073b122a2aac6a1fa479778a0bd43579bd832699",
+    "45a883f349aedfd5f3a649b5498ffb121712ba8b448f3f2a91dbc5a766fcddbe",
+    "fd9d5c2dbbd4995ab69b8d50c439d9527b00529199c2fd01b2174eb58f07021f",
+    "7485b51c0ed192878fa1d2f948fb529ae1842cc5086c4b67f7be5b2039de9489",
+    "62b7f9868263f72f6911fc78ceaf72c1979158b7368bf648683bb2aa39b02e72",
+    "a496e23ac0cab8155fc9b117b97eae368efcbb9041aec8804d5a308d2d01c2d8",
+    "84112972b8e59d14560ae7e7119654474aad119990cf3722bfc1e3b91615e1fd",
+})
+
+_PEM_CERT_RE = re.compile(
+    r"-----BEGIN CERTIFICATE-----\s*(.*?)\s*-----END CERTIFICATE-----", re.S
+)
+
 
 # =====================
 # Exposed-secret detection engine
@@ -1601,6 +1627,185 @@ class AwsIRHunt:
             "exposed_count": len(exposed),
         }
         _log.info(event("aws_ir_hunt", "hunt_exposed_s3_buckets.complete", total=len(findings), exposed=len(exposed)))
+        return result
+
+    # =====================
+    # ACM: certificate IOC hunt / inventory
+    # =====================
+
+    @staticmethod
+    def normalize_certificate_fingerprint(value: str) -> str:
+        """Normalize a colon/whitespace-separated SHA-256 certificate hash."""
+        fingerprint = re.sub(r"[:\s]", "", value).lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
+            raise ValueError(f"Invalid SHA-256 certificate fingerprint: {value}")
+        return fingerprint
+
+    @staticmethod
+    def _pem_sha256_fingerprints(pem: str) -> List[str]:
+        """Hash DER certificate objects from a PEM bundle using stdlib only."""
+        fingerprints = []
+        for body in _PEM_CERT_RE.findall(pem or ""):
+            try:
+                der = base64.b64decode(re.sub(r"\s", "", body), validate=True)
+            except (ValueError, TypeError):
+                continue
+            fingerprints.append(hashlib.sha256(der).hexdigest())
+        return fingerprints
+
+    def hunt_certificates(
+        self,
+        *,
+        fingerprints: Optional[List[str]] = None,
+        ca_names: Optional[List[str]] = None,
+        regions: Any = "all",
+        max_workers: int = 12,
+    ) -> OperationResult:
+        """Inventory ACM certificates or search them for certificate IOCs.
+
+        Fingerprints are SHA-256 hashes of complete DER certificate objects,
+        not SPKI hashes. Each retrievable ACM leaf and chain certificate is
+        checked. CA-name IOCs are case-insensitive substrings of ACM's issuer
+        metadata. With no IOCs this is an inventory grouped by issuer.
+        """
+        normalized_fingerprints = {
+            self.normalize_certificate_fingerprint(value)
+            for value in (fingerprints or [])
+            if value and value.strip()
+        }
+        normalized_ca_names = {
+            value.strip().casefold() for value in (ca_names or []) if value.strip()
+        }
+        if not 1 <= max_workers <= 64:
+            raise ValueError("max_workers must be between 1 and 64")
+
+        if regions == "all" or regions is None:
+            selected_regions = self._services.resolve_enabled_regions("acm")
+        elif isinstance(regions, str):
+            selected_regions = [regions]
+        else:
+            selected_regions = list(dict.fromkeys(regions))
+        if not selected_regions:
+            raise ValueError("At least one AWS region is required")
+
+        has_iocs = bool(normalized_fingerprints or normalized_ca_names)
+        result = OperationResult(
+            operation="hunt_certificates",
+            target="aws-acm",
+            success=True,
+            details={
+                "mode": "ioc_hunt" if has_iocs else "inventory",
+                "iocs": {
+                    "sha256_fingerprints": sorted(normalized_fingerprints),
+                    "ca_names": sorted(normalized_ca_names),
+                },
+            },
+        )
+
+        key_types = [
+            "RSA_1024", "RSA_2048", "RSA_3072", "RSA_4096",
+            "EC_prime256v1", "EC_secp384r1", "EC_secp521r1",
+        ]
+
+        def scan_region(region: str):
+            client = self._services.regional(region).acm
+            certificates: List[Dict[str, Any]] = []
+            errors: List[str] = []
+            try:
+                pages = client.get_paginator("list_certificates").paginate(
+                    Includes={"keyTypes": key_types}
+                )
+                summaries = [item for page in pages for item in page.get("CertificateSummaryList", [])]
+            except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+                return certificates, [f"{region}: unable to list ACM certificates: {exc}"]
+
+            for summary in summaries:
+                arn = summary.get("CertificateArn")
+                try:
+                    cert = client.describe_certificate(CertificateArn=arn).get("Certificate", {})
+                except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+                    errors.append(f"{region}: unable to describe {arn}: {exc}")
+                    continue
+
+                issuer = cert.get("Issuer") or "(unknown issuer)"
+                entry: Dict[str, Any] = {
+                    "certificate_arn": arn,
+                    "region": region,
+                    "domain_name": cert.get("DomainName"),
+                    "issuer": issuer,
+                    "status": cert.get("Status"),
+                    "type": cert.get("Type"),
+                    "serial": cert.get("Serial"),
+                    "not_before": cert.get("NotBefore"),
+                    "not_after": cert.get("NotAfter"),
+                    "in_use_by": cert.get("InUseBy", []),
+                    "certificate_authority_arn": cert.get("CertificateAuthorityArn"),
+                }
+                matched_ca_names = sorted(
+                    name for name in normalized_ca_names if name in issuer.casefold()
+                )
+                material_fingerprints: List[str] = []
+                if normalized_fingerprints:
+                    try:
+                        material = client.get_certificate(CertificateArn=arn)
+                        pem = "\n".join([
+                            material.get("Certificate") or "",
+                            material.get("CertificateChain") or "",
+                        ])
+                        material_fingerprints = self._pem_sha256_fingerprints(pem)
+                    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+                        errors.append(f"{region}: unable to retrieve certificate material for {arn}: {exc}")
+                matched_fingerprints = sorted(normalized_fingerprints.intersection(material_fingerprints))
+                entry["matched_ca_names"] = matched_ca_names
+                entry["matched_sha256_fingerprints"] = matched_fingerprints
+                entry["ioc_match"] = bool(matched_ca_names or matched_fingerprints)
+                certificates.append(entry)
+            return certificates, errors
+
+        certificates: List[Dict[str, Any]] = []
+        by_region: Dict[str, Dict[str, Any]] = {}
+        workers = min(max_workers, len(selected_regions))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_regions = {executor.submit(scan_region, region): region for region in selected_regions}
+            for future in as_completed(future_regions):
+                region = future_regions[future]
+                try:
+                    regional_certificates, regional_errors = future.result()
+                except Exception as exc:  # defensive: one region must not abort the account inventory
+                    regional_certificates, regional_errors = [], [f"{region}: unexpected error: {exc}"]
+                certificates.extend(regional_certificates)
+                by_region[region] = {
+                    "certificate_count": len(regional_certificates),
+                    "errors": regional_errors,
+                }
+                result.errors.extend(regional_errors)
+
+        certificates.sort(key=lambda item: (item["issuer"].casefold(), item["region"], item["certificate_arn"] or ""))
+        matches = [item for item in certificates if item["ioc_match"]]
+        ca_counts: Dict[str, int] = {}
+        for item in certificates:
+            ca_counts[item["issuer"]] = ca_counts.get(item["issuer"], 0) + 1
+        ca_summary = [
+            {"certificate_authority": issuer, "certificate_count": count}
+            for issuer, count in sorted(ca_counts.items(), key=lambda pair: (-pair[1], pair[0].casefold()))
+        ]
+
+        result.details.update({
+            "certificates": certificates,
+            "matches": matches,
+            "ca_summary": ca_summary,
+            "by_region": {region: by_region[region] for region in sorted(by_region)},
+            "statistics": {
+                "regions_scanned": len(selected_regions),
+                "certificates_scanned": len(certificates),
+                "certificate_authorities": len(ca_summary),
+                "matches": len(matches),
+                "errors": len(result.errors),
+            },
+        })
+        if result.errors:
+            result.success = False
+        _log.info(event("aws_ir_hunt", "hunt_certificates.complete", **result.details["statistics"]))
         return result
 
     # =====================
