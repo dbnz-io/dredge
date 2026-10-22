@@ -1,7 +1,7 @@
 <div align="center">
  <p>
   <h1>
-    Dredge - 1.1.4
+    Dredge - 1.1.5
   </h1>
  </p>
 </div>
