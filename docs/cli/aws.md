@@ -228,7 +228,9 @@ Other hunts: `aws hunt security-groups-by-ip --ip 203.0.113.50`,
 ### Certificate IOC hunt and CA inventory
 
 With no IOCs, `certificates` inventories ACM in every enabled AWS Region and
-prints the number of certificates issued by each CA:
+prints the number of certificates issued by each CA. The JSON result also
+includes certificate attachments discovered on ELBv2 listeners, API Gateway
+v1/v2 custom domains, and CloudFront distributions:
 
 ```bash
 dredge --aws-profile ir aws hunt certificates
@@ -254,6 +256,25 @@ dredge --aws-profile ir aws hunt certificates --iocs-file incident-iocs.txt \
 Issuer-name hits are investigative leads; exact fingerprint hits provide the
 stronger certificate-material match. Regional API failures appear in the JSON
 result and do not stop scans of other Regions.
+
+For the strongest exposure audit, inspect legacy IAM server certificates and
+AWS Private CA chains, then probe the TLS chains currently served by discovered
+endpoints:
+
+```bash
+dredge --aws-profile incident-readonly aws hunt certificates \
+  --preset emudhra-2026 --strong --output json
+
+# Internal or otherwise undiscoverable endpoints can be supplied explicitly.
+dredge --aws-profile incident-readonly aws hunt certificates \
+  --preset emudhra-2026 --runtime \
+  --runtime-endpoint internal-api.example.net:8443 --output json
+```
+
+`--strong` enables both `--deep` (IAM server certificates and Private CA) and
+`--runtime` (served TLS). Runtime probes make outbound TLS connections and may
+appear in network or service logs. The audit remains read-only and does not
+export private keys, modify listeners, replace certificates, or revoke them.
 
 ---
 

@@ -37,6 +37,11 @@ class AwsServiceRegistry:
         self._ecr = None
         self._codebuild = None
         self._acm = None
+        self._acmpca = None
+        self._elbv2 = None
+        self._apigateway = None
+        self._apigatewayv2 = None
+        self._cloudfront = None
 
     def _client(self, name: str, **kw):
         """Create a boto3 client, defaulting its region to this registry's
@@ -122,6 +127,37 @@ class AwsServiceRegistry:
         if self._acm is None:
             self._acm = self._client("acm")
         return self._acm
+
+    @property
+    def acmpca(self):
+        if self._acmpca is None:
+            self._acmpca = self._client("acm-pca")
+        return self._acmpca
+
+    @property
+    def elbv2(self):
+        if self._elbv2 is None:
+            self._elbv2 = self._client("elbv2")
+        return self._elbv2
+
+    @property
+    def apigateway(self):
+        if self._apigateway is None:
+            self._apigateway = self._client("apigateway")
+        return self._apigateway
+
+    @property
+    def apigatewayv2(self):
+        if self._apigatewayv2 is None:
+            self._apigatewayv2 = self._client("apigatewayv2")
+        return self._apigatewayv2
+
+    @property
+    def cloudfront(self):
+        if self._cloudfront is None:
+            # CloudFront is global but its API endpoint is in us-east-1.
+            self._cloudfront = self._client("cloudfront", region_name="us-east-1")
+        return self._cloudfront
 
     @property
     def kms(self):

@@ -114,6 +114,62 @@ class TestCertificateHunt:
         with pytest.raises(ValueError, match="Invalid SHA-256"):
             AwsIRHunt(make_services(), DredgeConfig()).hunt_certificates(fingerprints=[value])
 
+    def test_inventories_elb_certificate_attachments(self):
+        cert = {
+            "CertificateArn": "arn:aws:acm:us-east-1:123:certificate/one",
+            "DomainName": "app.example", "Issuer": "Example CA", "Status": "ISSUED",
+        }
+        services, clients = self._services({"us-east-1": [cert]})
+        regional = clients["us-east-1"][0]
+        elb_pages = {
+            "describe_load_balancers": [{"LoadBalancers": [{
+                "LoadBalancerArn": "arn:lb", "DNSName": "lb.example",
+            }]}],
+            "describe_listeners": [{"Listeners": [{
+                "ListenerArn": "arn:listener", "Protocol": "HTTPS", "Port": 443,
+                "Certificates": [{"CertificateArn": cert["CertificateArn"]}],
+            }]}],
+            "describe_listener_certificates": [{"Certificates": [{
+                "CertificateArn": cert["CertificateArn"], "IsDefault": True,
+            }]}],
+        }
+        regional.elbv2.get_paginator.side_effect = lambda operation: MagicMock(
+            paginate=MagicMock(return_value=elb_pages[operation])
+        )
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_certificates()
+
+        refs = [r for r in result.details["records"] if r["kind"] == "load_balancer_listener_certificate"]
+        assert refs == [{
+            "kind": "load_balancer_listener_certificate", "region": "us-east-1",
+            "resource": "arn:listener", "load_balancer": "arn:lb",
+            "dns_name": "lb.example", "port": 443,
+            "certificate_arn": cert["CertificateArn"], "is_default": None,
+            "certificate_issuer": "Example CA",
+        }]
+
+    def test_deep_inspects_iam_server_certificate_chain(self):
+        der = b"legacy certificate"
+        fingerprint = hashlib.sha256(der).hexdigest()
+        pem = "-----BEGIN CERTIFICATE-----\n" + base64.b64encode(der).decode() + "\n-----END CERTIFICATE-----"
+        services, _ = self._services({"us-east-1": []})
+        services.iam.get_paginator.return_value.paginate.return_value = [{
+            "ServerCertificateMetadataList": [{"ServerCertificateName": "legacy"}]
+        }]
+        services.iam.get_server_certificate.return_value = {"ServerCertificate": {
+            "ServerCertificateMetadata": {"Arn": "arn:iam-cert", "Path": "/"},
+            "CertificateBody": pem,
+        }}
+
+        result = AwsIRHunt(services, DredgeConfig()).hunt_certificates(
+            fingerprints=[fingerprint], deep=True,
+        )
+
+        assert any(
+            match.get("kind") == "iam_server_certificate_match"
+            for match in result.details["potential_matches"]
+        )
+
 
 class TestBuildLookupAttributes:
     def test_access_key_id_takes_priority(self):

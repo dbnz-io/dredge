@@ -500,12 +500,25 @@ def handle_aws_hunt_certificates(args: argparse.Namespace) -> None:
     if isinstance(regions, list) and "all" in regions:
         regions = "all"
     try:
-        res = dredge.aws_ir.hunt.hunt_certificates(
+        hunt_kwargs = dict(
             fingerprints=list(dict.fromkeys(fingerprints)),
             ca_names=list(dict.fromkeys(ca_names)),
             regions=regions,
             max_workers=args.max_workers,
         )
+        # Keep the long-standing default call shape stable for API wrappers
+        # while forwarding the expanded audit controls when they are used.
+        if args.deep or args.strong:
+            hunt_kwargs["deep"] = True
+        if args.runtime or args.strong:
+            hunt_kwargs["runtime"] = True
+        if args.runtime_endpoint:
+            hunt_kwargs["runtime_endpoints"] = args.runtime_endpoint
+        if args.runtime_timeout != 5.0:
+            hunt_kwargs["runtime_timeout"] = args.runtime_timeout
+        if args.runtime_workers != 8:
+            hunt_kwargs["runtime_workers"] = args.runtime_workers
+        res = dredge.aws_ir.hunt.hunt_certificates(**hunt_kwargs)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2)
@@ -2251,6 +2264,42 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=12,
         help="Maximum concurrent regional scans (1-64, default: 12)",
+    )
+    p.add_argument(
+        "--deep",
+        action="store_true",
+        help="Also inspect IAM server certificates and AWS Private CA chains",
+    )
+    p.add_argument(
+        "--runtime",
+        action="store_true",
+        help="Probe TLS chains currently served by discovered endpoints",
+    )
+    p.add_argument(
+        "--strong",
+        action="store_true",
+        help="Enable both --deep and --runtime analysis",
+    )
+    p.add_argument(
+        "--runtime-endpoint",
+        action="append",
+        default=[],
+        metavar="HOST[:PORT]",
+        help="Additional endpoint to probe in runtime mode (repeatable)",
+    )
+    p.add_argument(
+        "--runtime-timeout",
+        type=float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Per-connection timeout for runtime probes (default: 5)",
+    )
+    p.add_argument(
+        "--runtime-workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Concurrent endpoint probes (1-64, default: 8)",
     )
     p.add_argument(
         "--output",

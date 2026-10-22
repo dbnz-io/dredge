@@ -74,6 +74,13 @@ def test_cli_parses_certificate_hunt_and_inventory_defaults():
     assert hunt.regions == ["us-east-1,eu-west-1"]
     assert hunt.output == "json"
 
+    strong = parser.parse_args([
+        "aws", "hunt", "certificates", "--preset", "emudhra-2026",
+        "--strong", "--runtime-endpoint", "internal.example:8443",
+    ])
+    assert strong.strong is True
+    assert strong.runtime_endpoint == ["internal.example:8443"]
+
 
 def test_cli_flat_invocation_is_rejected():
     # The old flat form is gone: there is exactly one way to invoke a command.
