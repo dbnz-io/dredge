@@ -1950,10 +1950,11 @@ def _empty_paginator():
 
 def _make_hunt_with_empty_services():
     services = make_services()
-    for attr in ("lambda_", "ecs", "ssm", "ec2", "codebuild"):
+    for attr in ("lambda_", "ecs", "ssm", "ec2", "codebuild", "elasticbeanstalk", "batch", "glue", "amplify"):
         client = MagicMock()
         client.get_paginator.return_value = _empty_paginator()
         setattr(services, attr, client)
+    services.apprunner.list_services.return_value = {}
     return AwsIRHunt(services, DredgeConfig())
 
 
@@ -1970,7 +1971,10 @@ class TestHuntExposedSecrets:
         assert result.details["credentials"] == []
         assert result.details["statistics"]["scanned"] == {
             "lambda": 0, "ecs": 0, "ssm": 0, "ec2_user_data": 0, "codebuild": 0,
+            "elasticbeanstalk": 0, "apprunner": 0, "batch": 0, "glue": 0, "amplify": 0,
         }
+        hunt._services.s3.assert_not_called()
+        hunt._services.logs.assert_not_called()
 
     def test_lambda_akia_sak_pair_detected(self):
         services = make_services()
@@ -2086,7 +2090,7 @@ class TestHuntExposedSecrets:
         assert result.details["credentials"][0]["sources"][0]["resource_id"] == "i-123"
 
     def test_scan_error_recorded_but_does_not_abort(self):
-        services = make_services()
+        services = _make_hunt_with_empty_services()._services
         lam = MagicMock()
         lam.get_paginator.return_value.paginate.side_effect = make_client_error()
         services.lambda_ = lam

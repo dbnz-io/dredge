@@ -72,6 +72,11 @@ _REMAINING_PROPS = [
     ("awsconfig", "config"),
     ("sts", "sts"),
     ("ecr", "ecr"),
+    ("elasticbeanstalk", "elasticbeanstalk"),
+    ("apprunner", "apprunner"),
+    ("batch", "batch"),
+    ("glue", "glue"),
+    ("amplify", "amplify"),
 ]
 
 

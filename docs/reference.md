@@ -35,7 +35,7 @@ library pages: [AWS](library/aws.md) · [GitHub](library/github.md) ·
 | `dredge aws hunt cloudtrail-multi-user` | Hunt CloudTrail events for a list of users (repeatable --user and/or --users-file) |
 | `dredge aws hunt cloudwatch-logs` | Run a CloudWatch Logs Insights query |
 | `dredge aws hunt config-history` | Get AWS Config resource configuration history |
-| `dredge aws hunt exposed-secrets` | Scan Lambda/ECS/SSM/EC2 user-data/CodeBuild for plaintext secrets |
+| `dredge aws hunt exposed-secrets` | Scan ten AWS configuration sources for secrets; opt in to targeted S3/CloudWatch content |
 | `dredge aws hunt guardduty` | List GuardDuty findings |
 | `dredge aws hunt query-cloudtrail-logs` | Filter/project fields from CloudTrail log files already on disk (offline, no AWS calls) |
 | `dredge aws hunt security-groups-by-ip` | Find security groups with ingress/egress rules covering one or more IPs |

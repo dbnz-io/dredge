@@ -225,6 +225,94 @@ dredge --aws-profile ir --region us-east-1 \
 Other hunts: `aws hunt security-groups-by-ip --ip 203.0.113.50`,
 `aws hunt exposed-secrets`. Run `dredge aws hunt --help` for the full list.
 
+### Exposed secrets
+
+The default scan covers ten configuration sources in the selected region:
+Lambda environment variables, ECS task definitions, SSM `String` parameters,
+EC2 user data, CodeBuild, Elastic Beanstalk, App Runner, Batch, Glue, and Amplify.
+Use repeatable `--include` flags to restrict the configuration scan:
+
+```bash
+dredge --aws-profile ir --region us-east-1 aws hunt exposed-secrets \
+  --include elasticbeanstalk --include apprunner --include batch \
+  --include glue --include amplify
+```
+
+The new configuration sources inspect:
+
+| Source | Fields inspected |
+| --- | --- |
+| `elasticbeanstalk` | Environment properties in `aws:elasticbeanstalk:application:environment` |
+| `apprunner` | `RuntimeEnvironmentVariables` for image and code services |
+| `batch` | All active job definition revisions: parameters and container environment variables, including multi-node, ECS, and EKS layouts |
+| `glue` | Job `DefaultArguments` and `NonOverridableArguments` |
+| `amplify` | App, automatic branch creation, and branch environment variables |
+
+Secrets Manager / SSM references are not dereferenced. Findings are deduplicated
+and redacted by default. `--unredacted PATH` writes raw values to a file with mode
+0600; `--test` explicitly enables STS verification of detected AWS key pairs.
+Service access failures are reported while other sources continue.
+
+S3 and CloudWatch content are **off by default**, including when all configuration
+sources are scanned. Each has a separate, repeatable opt-in flag. `--content-only`
+skips configuration scanning and requires at least one content target:
+
+```bash
+# Small UTF-8 objects under an explicit prefix (no bucket-wide scan).
+dredge --aws-profile ir aws hunt exposed-secrets --content-only \
+  --scan-s3 s3://incident-artifacts/app/config/ --s3-max-objects 50
+
+# One log group, one hour, optionally narrowed to a stream prefix.
+dredge --aws-profile ir --region us-east-1 aws hunt exposed-secrets --content-only \
+  --scan-cloudwatch /aws/lambda/payments --cloudwatch-stream-prefix '2026/11/06/' \
+  --start-time 2026-11-06T08:00:00Z --end-time 2026-11-06T09:00:00Z \
+  --cloudwatch-max-events 500
+```
+
+S3 requires `s3://bucket/nonempty-prefix`; wildcards are rejected. Matching is a
+literal key prefix, so use a trailing `/` for a directory-like target. It examines
+at most 100 listed objects across all targets, including skipped objects. It skips
+objects larger than 1 MiB, archive storage classes that require restoration,
+compressed content, and binary/non-UTF-8 data. It does not decompress archives or
+scan previous object versions. Byte-range GETs bound downloads; available ETags
+prevent reading an object that changed after listing.
+
+CloudWatch requires explicit group names and both timestamps, with a window of
+at most 24 hours. It uses `FilterLogEvents`, with an optional server-side stream
+prefix, and examines at most 1,000 messages across all groups. It does not discover
+groups, start Logs Insights queries, or request unmasking. Masked values cannot
+be detected. Empty result pages still count toward the API budget.
+
+| Limit | Default | Scope |
+| --- | --- | --- |
+| `--s3-max-objects` | 100 | All S3 targets, including skipped/duplicate listed entries |
+| `--s3-max-object-bytes` | 1,048,576 (1 MiB) | Each S3 object |
+| `--cloudwatch-max-events` | 1,000 | All CloudWatch groups |
+| `--content-max-bytes` | 10,485,760 (10 MiB) | Separately for S3 and CloudWatch |
+| `--content-max-api-calls` | 100 | Separately for S3 and CloudWatch, including failed calls |
+| `--content-max-seconds` | 60 | Separately for S3 and CloudWatch |
+
+All limits must be positive. The S3 byte budget reserves bytes before each GET,
+including failed requests. The CloudWatch byte budget limits processed message
+bytes; one additional API page may already have been received. API counts exclude
+SDK retries, and time limits are checked before requests, so an in-flight request
+can finish after the deadline. These bounds control client work, not the exact
+AWS bill or CloudWatch's internal scanned bytes. Use narrow targets and windows.
+
+Inspect `details.content_scans` for counts, skipped objects, `truncated`, and
+`stop_reasons`. Hitting a limit retains findings and does not itself set
+`success=false`; API failures do. A clean partial result does not establish that
+the remaining content is secret-free. Detection covers credential patterns,
+JSON string fields, and key/value assignments; it does not decode arbitrary
+encodings or parse every file format.
+
+Additional read permissions for configuration scans are
+`elasticbeanstalk:DescribeEnvironments`, `elasticbeanstalk:DescribeConfigurationSettings`,
+`apprunner:ListServices`, `apprunner:DescribeService`, `batch:DescribeJobDefinitions`,
+`glue:GetJobs`, `amplify:ListApps`, and `amplify:ListBranches`. Targeted content scans
+use `s3:ListBucket`, `s3:GetObject` (and `kms:Decrypt` where required for encrypted
+objects), or `logs:FilterLogEvents`. Scope these permissions to the selected resources.
+
 ### Certificate IOC hunt and CA inventory
 
 With no IOCs, `certificates` inventories ACM in every enabled AWS Region and

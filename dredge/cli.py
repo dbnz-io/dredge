@@ -1121,16 +1121,31 @@ def handle_aws_hunt_security_groups_by_ip(args: argparse.Namespace) -> None:
 
 
 def handle_aws_hunt_exposed_secrets(args: argparse.Namespace) -> None:
+    if args.content_only and not (args.scan_s3 or args.scan_cloudwatch):
+        raise ValueError("--content-only requires --scan-s3 or --scan-cloudwatch")
+    if args.content_only and args.include:
+        raise ValueError("--content-only cannot be combined with --include")
     auth = build_aws_auth_from_args(args)
     dredge = Dredge(
         auth=auth,
         config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
     )
     res = dredge.aws_ir.hunt.hunt_exposed_secrets(
-        include=args.include or None,
+        include=[] if args.content_only else args.include or None,
         keep_raw=bool(args.unredacted),
         test_pairs=args.test,
         max_ec2_instances=args.max_ec2_instances,
+        scan_s3=args.scan_s3,
+        scan_cloudwatch=args.scan_cloudwatch,
+        start_time=parse_iso_datetime(args.start_time),
+        end_time=parse_iso_datetime(args.end_time),
+        cloudwatch_stream_prefix=args.cloudwatch_stream_prefix,
+        s3_max_objects=args.s3_max_objects,
+        s3_max_object_bytes=args.s3_max_object_bytes,
+        cloudwatch_max_events=args.cloudwatch_max_events,
+        content_max_bytes=args.content_max_bytes,
+        content_max_api_calls=args.content_max_api_calls,
+        content_max_seconds=args.content_max_seconds,
     )
     if args.unredacted:
         raw_values = res.details.pop("raw_values", {})
@@ -2120,15 +2135,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=handle_aws_hunt_security_groups_by_ip)
 
     p = subparsers.command("aws", "hunt", "exposed-secrets",
-        help="Scan Lambda/ECS/SSM/EC2 user-data/CodeBuild for plaintext secrets",
+        help="Scan AWS configuration for secrets; opt in to targeted S3/CloudWatch content",
     )
     p.add_argument(
         "--include",
         action="append",
-        choices=["lambda", "ecs", "ssm", "ec2_user_data", "codebuild"],
+        choices=["lambda", "ecs", "ssm", "ec2_user_data", "codebuild",
+                 "elasticbeanstalk", "apprunner", "batch", "glue", "amplify"],
         default=None,
-        help="Restrict scan to these source(s) (repeatable). Default: scan all five.",
+        help="Restrict configuration sources (repeatable). Default: all ten; excludes S3/CloudWatch content.",
     )
+    p.add_argument("--scan-s3", action="append", metavar="S3_URI",
+                   help="Opt in to object content under s3://bucket/nonempty-prefix (repeatable; no wildcards)")
+    p.add_argument("--scan-cloudwatch", action="append", metavar="LOG_GROUP",
+                   help="Opt in to messages in this log group (repeatable); requires --start-time and --end-time")
+    p.add_argument("--content-only", action="store_true", help="Skip configuration scans; requires a content target")
+    p.add_argument("--start-time", help="CloudWatch window start (ISO 8601; window must be <=24 hours)")
+    p.add_argument("--end-time", help="CloudWatch window end (ISO 8601)")
+    p.add_argument("--cloudwatch-stream-prefix", help="Restrict CloudWatch to log stream names with this prefix")
+    p.add_argument("--s3-max-objects", type=int, default=100,
+                   help="Total S3 objects examined, including skipped objects (default: 100)")
+    p.add_argument("--s3-max-object-bytes", type=int, default=1048576,
+                   help="Skip larger S3 objects (default: 1 MiB); no archive decompression")
+    p.add_argument("--cloudwatch-max-events", type=int, default=1000,
+                   help="Total CloudWatch messages examined across groups (default: 1000)")
+    p.add_argument("--content-max-bytes", type=int, default=10485760,
+                   help="Per-source byte budget (default: 10 MiB); CloudWatch may receive one extra page")
+    p.add_argument("--content-max-api-calls", type=int, default=100,
+                   help="Per-source SDK call cap, including empty pages (default: 100; excludes SDK retries)")
+    p.add_argument("--content-max-seconds", type=int, default=60,
+                   help="Per-source time budget checked before calls (default: 60; in-flight calls may finish later)")
     p.add_argument(
         "--test",
         action="store_true",

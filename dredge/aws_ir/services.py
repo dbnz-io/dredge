@@ -42,6 +42,11 @@ class AwsServiceRegistry:
         self._apigateway = None
         self._apigatewayv2 = None
         self._cloudfront = None
+        self._elasticbeanstalk = None
+        self._apprunner = None
+        self._batch = None
+        self._glue = None
+        self._amplify = None
 
     def _client(self, name: str, **kw):
         """Create a boto3 client, defaulting its region to this registry's
@@ -248,3 +253,33 @@ class AwsServiceRegistry:
         if self._codebuild is None:
             self._codebuild = self._client("codebuild")
         return self._codebuild
+
+    @property
+    def elasticbeanstalk(self):
+        if self._elasticbeanstalk is None:
+            self._elasticbeanstalk = self._client("elasticbeanstalk")
+        return self._elasticbeanstalk
+
+    @property
+    def apprunner(self):
+        if self._apprunner is None:
+            self._apprunner = self._client("apprunner")
+        return self._apprunner
+
+    @property
+    def batch(self):
+        if self._batch is None:
+            self._batch = self._client("batch")
+        return self._batch
+
+    @property
+    def glue(self):
+        if self._glue is None:
+            self._glue = self._client("glue")
+        return self._glue
+
+    @property
+    def amplify(self):
+        if self._amplify is None:
+            self._amplify = self._client("amplify")
+        return self._amplify

@@ -21,6 +21,11 @@ from ..config import DredgeConfig
 from ..log import get_logger, event
 from .services import AwsServiceRegistry
 from .models import OperationResult
+from .secret_sources import (
+    CONFIG_SCANNERS, ConfigurationScanner, ContentBudget,
+    scan_s3 as scan_s3_content, scan_cloudwatch as scan_cloudwatch_content,
+    validate_content_options,
+)
 
 _log = get_logger(__name__)
 
@@ -139,16 +144,20 @@ def _redact_secret(value: str) -> str:
     m = _SECRET_URL_RE.match(value)
     if m:
         prefix, tail = m.group(1), m.group(2)
-        if not tail or tail in ("/", "?"):
-            return f"{prefix} ({n} chars)"
-        return f"{prefix}/[…{len(tail)} chars] ({n} chars)"
+        # Content scans can find tokens in URL userinfo or hostnames. Only
+        # preserve a prefix when it carries no credentials or token pattern.
+        if "@" not in prefix and not any(d.pattern.search(prefix) for d in _SECRET_DETECTORS):
+            if not tail or tail in ("/", "?"):
+                return f"{prefix} ({n} chars)"
+            return f"{prefix}/[…{len(tail)} chars] ({n} chars)"
 
     m = _SECRET_ARN_RE.match(value)
     if m:
         prefix, tail = m.group(1), m.group(2)
-        if not tail:
-            return f"{prefix} ({n} chars)"
-        return f"{prefix}/[…{len(tail)} chars] ({n} chars)"
+        if not any(d.pattern.search(prefix) for d in _SECRET_DETECTORS):
+            if not tail:
+                return f"{prefix} ({n} chars)"
+            return f"{prefix}/[…{len(tail)} chars] ({n} chars)"
 
     return f"{value[:4]}{'*' * max(4, n - 8)}{value[-4:]} ({n} chars)"
 
@@ -247,6 +256,65 @@ class _SecretBucket:
 def _emit_aws_pair(bag: Dict[str, str], make_source, bucket: "_SecretBucket") -> None:
     for key_name, value, category, severity, method in _detect_aws_pair_in_bag(bag):
         bucket.add_explicit(str(value), make_source(key_name), category, severity, method)
+
+
+def _emit_secret_bag(bag, source, bucket):
+    def make_source(key):
+        return {**source, "key_name": key}
+
+    _emit_aws_pair(bag, make_source, bucket)
+    for key, value in bag.items():
+        bucket.add(value, make_source(key), key_name=key)
+
+
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r'''(?<![\w./-])["']?([\w./-]{1,256})["']?\s*[:=]\s*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s,;}]+))'''
+)
+_SECRET_PEM_RE = re.compile(
+    r"-----BEGIN ([A-Z ]*PRIVATE KEY)-----.*?-----END \1-----", re.S,
+)
+
+
+def _emit_secret_text(text, source, bucket):
+    """Inspect JSON / assignments and extract tokens without returning log lines."""
+    def walk(value, path=""):
+        pending = [(value, path)]
+        while pending:
+            value, path = pending.pop()
+            if isinstance(value, dict):
+                bag = {k: v for k, v in value.items() if isinstance(v, str)}
+                _emit_secret_bag(bag, {**source, "scope": path}, bucket)
+                pending.extend((child, f"{path}.{key}".lstrip("."))
+                               for key, child in value.items() if isinstance(child, (dict, list)))
+            elif isinstance(value, list):
+                pending.extend((child, f"{path}[{i}]") for i, child in enumerate(value))
+
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError):
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        walk(parsed)
+    else:
+        bag = {}
+        for match in _SECRET_ASSIGNMENT_RE.finditer(text):
+            key = match.group(1)
+            value = next(v for v in match.groups()[1:] if v is not None)
+            # Inspect every occurrence, even repeated names in a text log.
+            bucket.add(value, {**source, "key_name": key}, key_name=key)
+            bag[key] = value
+        _emit_aws_pair(bag, lambda k: {**source, "key_name": k}, bucket)
+
+    for detector in _SECRET_DETECTORS:
+        if detector.name == "private_key_block":
+            continue
+        for match in detector.pattern.finditer(text):
+            value = match.group(1) if detector.name == "aws_secret_with_context" else match.group(0)
+            bucket.add_explicit(value, {**source, "key_name": "content"}, detector.category,
+                                detector.severity, f"regex:{detector.name}")
+    for match in _SECRET_PEM_RE.finditer(text):
+        bucket.add_explicit(match.group(0), {**source, "key_name": "content"},
+                            "Private Key Block", "CRITICAL", "regex:private_key_block")
 
 
 def verify_aws_key_pair(
@@ -2253,10 +2321,10 @@ class AwsIRHunt:
         return matched
 
     # =====================
-    # Exposed secrets: Lambda / ECS / SSM / EC2 user-data / CodeBuild
+    # Exposed secrets: configuration sources and opt-in targeted content scans
     # =====================
 
-    _SECRET_SCANNERS = ("lambda", "ecs", "ssm", "ec2_user_data", "codebuild")
+    _SECRET_SCANNERS = ("lambda", "ecs", "ssm", "ec2_user_data", "codebuild") + CONFIG_SCANNERS
 
     def _scan_lambda_secrets(self, bucket: "_SecretBucket", errors: List[str]) -> int:
         lambda_ = self._services.lambda_
@@ -2452,10 +2520,10 @@ class AwsIRHunt:
         unique (AKIA, SAK) pair once via sts:GetCallerIdentity, and attach
         the outcome to every finding built from that pair."""
 
-        def _source_key(s: Dict[str, Any]) -> Tuple[str, str]:
-            return (s.get("location_type", ""), s.get("resource_arn") or s.get("resource_id", ""))
+        def _source_key(s: Dict[str, Any]) -> Tuple[str, str, str]:
+            return (s.get("location_type", ""), s.get("resource_arn") or s.get("resource_id", ""), s.get("scope", ""))
 
-        grouped: Dict[Tuple[str, str], Dict[str, list]] = {}
+        grouped: Dict[Tuple[str, str, str], Dict[str, list]] = {}
         for finding in bucket.values():
             if finding["category"] not in ("AWS Access Key", "AWS Secret Access Key"):
                 continue
@@ -2502,11 +2570,24 @@ class AwsIRHunt:
         keep_raw: bool = False,
         test_pairs: bool = False,
         max_ec2_instances: int = 500,
+        scan_s3: Optional[List[str]] = None,
+        scan_cloudwatch: Optional[List[str]] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        cloudwatch_stream_prefix: Optional[str] = None,
+        s3_max_objects: int = 100,
+        s3_max_object_bytes: int = 1048576,
+        cloudwatch_max_events: int = 1000,
+        content_max_bytes: int = 10485760,
+        content_max_api_calls: int = 100,
+        content_max_seconds: int = 60,
     ) -> OperationResult:
         """
         Scan common plaintext-secret hiding spots across the account/region:
         Lambda env vars, ECS task-definition env vars, SSM String
-        parameters, EC2 instance user-data, and CodeBuild project env vars.
+        parameters, EC2 instance user-data, CodeBuild, Elastic Beanstalk,
+        App Runner, Batch, Glue, and Amplify configuration. S3 object content
+        and CloudWatch log messages are scanned only with explicit targets.
 
         Detection runs two layers: regex matchers for well-known credential
         shapes (AWS access-key pairs, GitHub/Slack/Stripe tokens, JWTs, PEM
@@ -2521,8 +2602,8 @@ class AwsIRHunt:
         secret key is found in the same env-var/parameter bag.
 
         Args:
-            include: Subset of {"lambda", "ecs", "ssm", "ec2_user_data",
-                "codebuild"} to scan. Defaults to all five.
+            include: Subset of configuration scanners (see _SECRET_SCANNERS).
+                Defaults to all ten; [] runs only explicitly targeted content.
             keep_raw: If True, details["raw_values"] maps hash -> the
                 plaintext value (e.g. to build a rotation worklist).
                 Treat the result as sensitive when set.
@@ -2536,6 +2617,23 @@ class AwsIRHunt:
                 authenticated calls using the discovered credentials.
             max_ec2_instances: Cap on EC2 instances scanned for user-data
                 (one DescribeInstanceAttribute call per instance).
+            scan_s3: Explicit s3://bucket/nonempty-prefix targets. No bucket
+                discovery, wildcards, archive restores, or decompression.
+            scan_cloudwatch: Explicit log group names; no group discovery.
+            start_time: Required timezone-aware CloudWatch window start.
+            end_time: Required timezone-aware end, at most 24 hours after start.
+            cloudwatch_stream_prefix: Optional server-side log stream filter.
+            s3_max_objects: Maximum listed objects examined across S3 targets,
+                including skipped objects (default 100).
+            s3_max_object_bytes: Skip objects larger than this (default 1 MiB).
+            cloudwatch_max_events: Total messages examined (default 1,000).
+            content_max_bytes: Per-source byte budget (default 10 MiB). S3
+                reserves bytes before GET; CloudWatch caps processed message
+                bytes, with at most one additional API page received.
+            content_max_api_calls: Per-source SDK call budget (default 100);
+                includes failed calls and empty pages, excludes SDK retries.
+            content_max_seconds: Per-source time budget (default 60 seconds),
+                checked before calls; in-flight requests may finish later.
 
         Returns:
             OperationResult with:
@@ -2545,6 +2643,8 @@ class AwsIRHunt:
               - details["raw_values"]: hash -> plaintext, only if keep_raw.
               - details["statistics"]: per-source scan counts and total
                 findings.
+              - details["content_scans"]: opt-in source budgets, skipped counts,
+                and truncation reasons. A bounded scan is not exhaustive.
         """
         scanners = include if include is not None else list(self._SECRET_SCANNERS)
         unknown = sorted(set(scanners) - set(self._SECRET_SCANNERS))
@@ -2553,9 +2653,22 @@ class AwsIRHunt:
                 f"Unknown scanner(s): {unknown}. Valid: {list(self._SECRET_SCANNERS)}"
             )
 
+        scan_s3 = scan_s3 or []
+        scan_cloudwatch = scan_cloudwatch or []
+        if isinstance(scan_s3, str) or isinstance(scan_cloudwatch, str):
+            raise ValueError("scan_s3 and scan_cloudwatch must be lists of targets")
+        validate_content_options(
+            scan_s3, scan_cloudwatch, start_time, end_time,
+            s3_max_objects=s3_max_objects, s3_max_object_bytes=s3_max_object_bytes,
+            cloudwatch_max_events=cloudwatch_max_events, content_max_bytes=content_max_bytes,
+            content_max_api_calls=content_max_api_calls, content_max_seconds=content_max_seconds,
+        )
+        if cloudwatch_stream_prefix is not None and (not scan_cloudwatch or not cloudwatch_stream_prefix):
+            raise ValueError("cloudwatch_stream_prefix requires CloudWatch targets and a nonempty prefix")
+
         result = OperationResult(
             operation="hunt_exposed_secrets",
-            target=f"sources={','.join(scanners)}",
+            target=f"sources={','.join(list(scanners) + (['s3'] if scan_s3 else []) + (['cloudwatch'] if scan_cloudwatch else []))}",
             success=True,
         )
 
@@ -2575,6 +2688,42 @@ class AwsIRHunt:
             )
         if "codebuild" in scanners:
             scan_counts["codebuild"] = self._scan_codebuild_secrets(bucket, errors)
+
+        def emit_bag(values, source):
+            _emit_secret_bag(values, source, bucket)
+
+        def emit_text(text, source):
+            _emit_secret_text(text, source, bucket)
+
+        for name in CONFIG_SCANNERS:
+            if name in scanners:
+                scan_counts[name] = ConfigurationScanner(getattr(self._services, name), emit_bag, errors).scan(name)
+
+        content_scans = {}
+        if scan_s3:
+            budget = ContentBudget(content_max_api_calls, content_max_bytes, content_max_seconds)
+            scan_s3_content(self._services.s3, scan_s3, emit_text, errors, budget,
+                            s3_max_objects, s3_max_object_bytes)
+            scan_counts["s3"] = budget.scanned
+            content_scans["s3"] = budget.summary()
+            content_scans["s3"]["targets"] = list(dict.fromkeys(scan_s3))
+            content_scans["s3"]["limits"].update({
+                "max_objects": s3_max_objects, "max_object_bytes": s3_max_object_bytes,
+            })
+        if scan_cloudwatch:
+            budget = ContentBudget(content_max_api_calls, content_max_bytes, content_max_seconds)
+            scan_cloudwatch_content(self._services.logs, scan_cloudwatch, start_time, end_time,
+                                    cloudwatch_stream_prefix, emit_text, errors, budget, cloudwatch_max_events)
+            scan_counts["cloudwatch"] = budget.scanned
+            content_scans["cloudwatch"] = budget.summary()
+            content_scans["cloudwatch"].update({
+                "targets": list(dict.fromkeys(scan_cloudwatch)),
+                "start_time": start_time.isoformat(), "end_time": end_time.isoformat(),
+                "stream_prefix": cloudwatch_stream_prefix,
+            })
+            content_scans["cloudwatch"]["limits"]["max_events"] = cloudwatch_max_events
+        if content_scans:
+            result.details["content_scans"] = content_scans
 
         if test_pairs:
             self._verify_secret_pairs(bucket)

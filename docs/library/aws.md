@@ -76,6 +76,44 @@ res = d.aws_ir.hunt.hunt_cloudtrail_multi_user(
 res.details["per_user"]
 ```
 
+## Exposed secrets
+
+```python
+from datetime import datetime, timezone
+
+# All ten configuration sources by default; content sources remain off.
+res = d.aws_ir.hunt.hunt_exposed_secrets()
+
+res = d.aws_ir.hunt.hunt_exposed_secrets(
+    include=["elasticbeanstalk", "apprunner", "batch", "glue", "amplify"],
+)
+
+# include=[] skips configuration scans. Explicit targets enable content scans.
+res = d.aws_ir.hunt.hunt_exposed_secrets(
+    include=[],
+    scan_s3=["s3://incident-artifacts/app/config/"],
+    scan_cloudwatch=["/aws/lambda/payments"],
+    start_time=datetime(2026, 11, 6, 8, tzinfo=timezone.utc),
+    end_time=datetime(2026, 11, 6, 9, tzinfo=timezone.utc),
+    s3_max_objects=50,
+    cloudwatch_max_events=500,
+    content_max_bytes=5 * 1024 * 1024,
+    content_max_api_calls=50,
+    content_max_seconds=30,
+)
+res.details["credentials"]     # Deduplicated, redacted findings with locations
+res.details["content_scans"]    # Counts, skipped content, truncation, stop reasons
+```
+
+S3 requires a nonempty prefix; CloudWatch requires timezone-aware start/end times
+spanning at most 24 hours. Budgets apply across all targets **per content source**.
+Only small UTF-8 S3 objects are scanned; archive contents are not decompressed.
+CloudWatch processes bounded messages through `FilterLogEvents`. Results may be
+partial even when `success=True`; check truncation and skipped counts.
+See the [CLI guide](../cli/aws.md#exposed-secrets) for defaults, precise budget
+semantics, coverage, and required permissions. `keep_raw=True` returns raw values;
+`test_pairs=True` opts in to live STS checks of detected AWS credential pairs.
+
 ## Security review (posture)
 
 A read-only posture review — prioritized findings across IAM, EC2, S3, RDS,

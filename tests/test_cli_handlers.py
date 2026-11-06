@@ -379,7 +379,11 @@ CLI_HANDLER_CASES = [
         ["aws", "hunt", "exposed-secrets"],
         "aws_ir.hunt.hunt_exposed_secrets",
         (),
-        {"include": None, "keep_raw": False, "test_pairs": False, "max_ec2_instances": 500},
+        {"include": None, "keep_raw": False, "test_pairs": False, "max_ec2_instances": 500,
+         "scan_s3": None, "scan_cloudwatch": None, "start_time": None, "end_time": None,
+         "cloudwatch_stream_prefix": None, "s3_max_objects": 100, "s3_max_object_bytes": 1048576,
+         "cloudwatch_max_events": 1000, "content_max_bytes": 10485760,
+         "content_max_api_calls": 100, "content_max_seconds": 60},
     ),
     (
         "aws-hunt-cloudwatch-logs",
@@ -1414,6 +1418,47 @@ class TestAwsHuntCertificates:
         assert "ab" * 32 in kwargs["fingerprints"]
         assert len(kwargs["fingerprints"]) == 17
         assert '"operation": "hunt_certificates"' in capsys.readouterr().out
+
+
+class TestAwsHuntExposedSecretsContent:
+    def test_targeted_flags_and_budgets_reach_library(self, monkeypatch, capsys):
+        target, _ = _run_handler(monkeypatch, capsys, [
+            "aws", "hunt", "exposed-secrets", "--content-only",
+            "--scan-s3", "s3://bucket/config/", "--scan-s3", "s3://bucket/artifacts/",
+            "--scan-cloudwatch", "/aws/one", "--scan-cloudwatch", "/aws/two",
+            "--start-time", "2026-11-06T08:00:00Z", "--end-time", "2026-11-06T09:00:00Z",
+            "--cloudwatch-stream-prefix", "prod/", "--s3-max-objects", "5",
+            "--s3-max-object-bytes", "1024", "--cloudwatch-max-events", "20",
+            "--content-max-bytes", "4096", "--content-max-api-calls", "10",
+            "--content-max-seconds", "15",
+        ], "aws_ir.hunt.hunt_exposed_secrets")
+        kwargs = target.call_args.kwargs
+        assert kwargs["include"] == []
+        assert kwargs["scan_s3"] == ["s3://bucket/config/", "s3://bucket/artifacts/"]
+        assert kwargs["scan_cloudwatch"] == ["/aws/one", "/aws/two"]
+        assert kwargs["start_time"].isoformat() == "2026-11-06T08:00:00+00:00"
+        assert kwargs["end_time"].isoformat() == "2026-11-06T09:00:00+00:00"
+        assert kwargs["cloudwatch_stream_prefix"] == "prod/"
+        assert [kwargs[k] for k in ("s3_max_objects", "s3_max_object_bytes", "cloudwatch_max_events",
+                                    "content_max_bytes", "content_max_api_calls", "content_max_seconds")] == [5, 1024, 20, 4096, 10, 15]
+
+    @pytest.mark.parametrize("source", ["elasticbeanstalk", "apprunner", "batch", "glue", "amplify"])
+    def test_configuration_selection(self, monkeypatch, capsys, source):
+        target, _ = _run_handler(monkeypatch, capsys, [
+            "aws", "hunt", "exposed-secrets", "--include", source,
+        ], "aws_ir.hunt.hunt_exposed_secrets")
+        assert target.call_args.kwargs["include"] == [source]
+        assert target.call_args.kwargs["scan_s3"] is None
+        assert target.call_args.kwargs["scan_cloudwatch"] is None
+
+    @pytest.mark.parametrize("extra", [[], ["--include", "lambda", "--scan-s3", "s3://bucket/path"]])
+    def test_invalid_content_only_combinations(self, monkeypatch, extra):
+        mocked = MagicMock()
+        monkeypatch.setattr(dredge_cli, "Dredge", mocked)
+        args = dredge_cli.build_parser().parse_args(["aws", "hunt", "exposed-secrets", "--content-only", *extra])
+        with pytest.raises(ValueError, match="--content-only"):
+            args.func(args)
+        mocked.assert_not_called()
 
 
 class TestAwsHuntExposedSecretsUnredacted:
