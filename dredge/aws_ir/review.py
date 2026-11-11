@@ -69,7 +69,10 @@ def _error_detail(exc):
     detail = {"type": type(exc).__name__}
     if isinstance(exc, _HuntCheckFailed):
         detail["message"] = str(exc)
-        detail["causes"] = exc.errors
+        # Composed hunts can return raw service response bodies. Keep the
+        # fact that the sub-check failed without copying potentially sensitive
+        # error text into review output.
+        detail["cause_count"] = len(exc.errors)
         return detail
     if isinstance(exc, botocore.exceptions.ClientError):
         response = exc.response or {}
@@ -77,20 +80,20 @@ def _error_detail(exc):
         metadata = response.get("ResponseMetadata") or {}
         detail.update(
             code=error.get("Code"),
-            message=str(error.get("Message") or "AWS API request failed")[:500],
+            message="AWS API request failed",
             request_id=metadata.get("RequestId"),
             http_status=metadata.get("HTTPStatusCode"),
         )
         return {key: value for key, value in detail.items() if value is not None}
-    message = str(exc).replace("\n", " ")
-    detail["message"] = message[:500] if message else "AWS API request failed"
+    detail["message"] = "AWS API request failed"
     return detail
 
 
 def _error_text(detail):
     code = detail.get("code")
-    message = detail.get("message") or "AWS API request failed"
-    return f"{code}: {message}" if code else message
+    if code:
+        return f"{detail.get('type', 'AWS error')} ({code})"
+    return detail.get("message") or "AWS API request failed"
 
 
 @dataclass

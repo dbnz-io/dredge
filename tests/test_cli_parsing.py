@@ -201,26 +201,19 @@ class TestPrintResult:
         assert lines[0] == "id,name"
         assert "1,a" in lines[1]
 
-    def test_csv_falls_back_to_json_when_no_list_found(self, capsys):
+    def test_csv_keeps_csv_format_when_no_list_found(self, capsys):
         data = {"details": {"status": "ok"}}
         dredge_cli.print_result(data, output="csv")
         out = capsys.readouterr().out
-        assert '"status": "ok"' in out
+        assert out.splitlines() == ["status", "ok"]
 
-    def test_csv_non_dict_list_item_raises_value_error(self):
-        # Characterizes a real bug, not the intended behavior: fieldnames is
-        # only ever populated from dict items' own keys (`if isinstance(ev,
-        # dict): fieldnames.update(ev.keys())`) -- "value" (the column name
-        # the non-dict fallback branch writes to) is never added to
-        # fieldnames itself. So ANY non-dict item in the list -- whether
-        # it's the only item or mixed in with real dicts -- makes
-        # writerow({"value": ...}) fail with "dict contains fields not in
-        # fieldnames: 'value'", crashing --output csv entirely instead of
-        # producing the documented single-"value"-column fallback row.
-        # Confirmed for both the all-scalar and dict+scalar-mixed case.
-        for details in ({"results": ["a", "b"]}, {"results": [{"id": 1}, "a"]}):
-            with pytest.raises(ValueError, match="fieldnames"):
-                dredge_cli.print_result({"details": details}, output="csv")
+    def test_csv_non_dict_list_items_are_written(self, capsys):
+        for details, expected in (
+            ({"results": ["a", "b"]}, ["value", "a", "b"]),
+            ({"results": [{"id": 1}, "a"]}, ["id,value", "1,", ",a"]),
+        ):
+            dredge_cli.print_result({"details": details}, output="csv")
+            assert capsys.readouterr().out.strip().splitlines() == expected
 
     def test_unknown_output_format_falls_back_to_json(self, capsys):
         dredge_cli.print_result({"operation": "op"}, output="xml")
