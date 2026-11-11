@@ -3,7 +3,7 @@ Dredge MCP server -- a READ-ONLY investigation plane for the Dredge cloud-IR
 library. It lets an MCP client (e.g. Claude) *chat about how to use Dredge* and
 drive its non-destructive surface: log download, hunting, forensic evidence
 capture, and cross-source investigation/correlation across AWS, Kubernetes,
-GitHub and GCP.
+GitHub, GCP, and Huawei Cloud.
 
 Run: python mcp_server/server.py   (stdio transport)
 Register with Claude Code:
@@ -21,7 +21,8 @@ Design goals (mirrors the OpenCDR MCP server's safety model):
     the security boundary. The real boundary is the cloud credentials this
     server runs under -- run it with READ-ONLY credentials (AWS
     SecurityAudit/ReadOnlyAccess, read-only Kubernetes RBAC, a read-scoped
-    GitHub token, GCP Logs Viewer). A read-only key with the `forensic` profile
+    GitHub token, GCP Logs Viewer, or read-only Huawei IAM/service permissions).
+    A read-only key with the `forensic` profile
     still cannot snapshot; the `analyst` profile with an admin key still cannot
     mutate, because the mutating tools are never registered.
 
@@ -42,7 +43,7 @@ no-op. `forensic` runs with dry_run=False so snapshots actually execute.
 
 Provider gating
 ---------------
-AWS is always available (default credential chain). Kubernetes, GitHub and GCP
+AWS is always available (default credential chain). Kubernetes, GitHub, GCP and Huawei
 tools are only registered when their provider is configured via env (see
 `_enabled_providers`), so an AWS-only deployment shows a clean AWS-only tool set.
 
@@ -91,10 +92,12 @@ class DredgeMCPConfigError(Exception):
 # they reach a cloud SDK.
 # ---------------------------------------------------------------------------
 
-Provider = Literal["aws", "k8s", "github", "gcp", "meta"]
+Provider = Literal["aws", "k8s", "github", "gcp", "huawei", "meta"]
 SGDirection = Literal["ingress", "egress", "both"]
 MultiUserMode = Literal["per_user", "batch"]
 ReviewService = Literal["iam", "ec2", "s3", "rds", "lambda", "ecs", "org", "recent"]
+HuaweiReviewService = Literal["iam", "obs", "vpc", "ecs", "evs", "rds", "cce", "functiongraph", "cts", "lts", "hss", "secmaster", "recent"]
+HuaweiProfileSource = Literal["sdk", "koocli"]
 Severity = Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"]
 
 _ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
@@ -147,6 +150,9 @@ def _enabled_providers() -> set[str]:
         providers.add("gcp")
     if _env_truthy("DREDGE_ENABLE_K8S"):
         providers.add("k8s")
+    if (_env_truthy("DREDGE_ENABLE_HUAWEI") or os.getenv("HUAWEICLOUD_SDK_REGION")
+            or os.getenv("DREDGE_HUAWEI_REGION")):
+        providers.add("huawei")
     return providers
 
 
@@ -165,7 +171,7 @@ def allowed_tools(profile: str, providers: set[str] | None = None) -> set[str]:
     so the profile axis can be tested independently of env.
     """
     caps = _PROFILE_CAPS.get(profile, _ANALYST_CAPS)
-    provs = providers if providers is not None else {"meta", "aws", "k8s", "github", "gcp"}
+    provs = providers if providers is not None else {"meta", "aws", "k8s", "github", "gcp", "huawei"}
     return {
         name
         for name, cap in _TOOL_CAPS.items()
@@ -280,6 +286,13 @@ def _validate_ips(ips: Optional[list[str]], *, name: str) -> Optional[list[str]]
     return ips
 
 
+def _selection_arg(value, *, default_all: bool = False):
+    """Translate MCP's list-shaped selector into library 'all' syntax."""
+    if value is None and default_all:
+        return "all"
+    return "all" if value == ["all"] else value
+
+
 def _require_account_id(value: str, *, name: str = "account_id") -> str:
     if not isinstance(value, str) or not _ACCOUNT_ID_RE.match(value):
         raise ValueError(f"{name} must be a 12-digit AWS account ID")
@@ -367,12 +380,28 @@ def _build_dredge() -> Dredge:
             namespace=os.getenv("DREDGE_K8S_NAMESPACE") or None,
         )
 
+    huawei_config = None
+    if "huawei" in ENABLED_PROVIDERS:
+        from dredge.huawei_ir.config import HuaweiAuthConfig
+
+        huawei_config = HuaweiAuthConfig(
+            region_name=os.getenv("DREDGE_HUAWEI_REGION") or os.getenv("HUAWEICLOUD_SDK_REGION"),
+            project_id=os.getenv("DREDGE_HUAWEI_PROJECT_ID") or os.getenv("HUAWEICLOUD_SDK_PROJECT_ID"),
+            access_key_id=os.getenv("HUAWEICLOUD_SDK_AK") or None,
+            secret_access_key=os.getenv("HUAWEICLOUD_SDK_SK") or None,
+            security_token=os.getenv("HUAWEICLOUD_SDK_SECURITY_TOKEN") or None,
+            profile_name=os.getenv("DREDGE_HUAWEI_PROFILE") or None,
+            enterprise_project_id=os.getenv("DREDGE_HUAWEI_ENTERPRISE_PROJECT_ID") or "0",
+            timeout=int(os.getenv("DREDGE_HUAWEI_TIMEOUT") or "20"),
+        )
+
     return Dredge(
         auth=AwsAuthConfig(region_name=region),
         config=config,
         github_config=github_config,
         gcp_config=gcp_config,
         k8s_config=k8s_config,
+        huawei_config=huawei_config,
     )
 
 
@@ -411,6 +440,16 @@ def _gcp():
     ns = _d().gcp_ir
     if ns is None:
         raise DredgeMCPConfigError("GCP is not configured. Set DREDGE_GCP_PROJECT.")
+    return ns
+
+
+def _huawei():
+    ns = _d().huawei_ir
+    if ns is None:
+        raise DredgeMCPConfigError(
+            "Huawei Cloud is not configured. Set DREDGE_ENABLE_HUAWEI=1 and "
+            "HUAWEICLOUD_SDK_REGION, then configure SDK profile/AK-SK credentials."
+        )
     return ns
 
 
@@ -458,7 +497,8 @@ def dredge_capabilities() -> dict:
             "Local file tools are confined to the workdir; set DREDGE_MCP_WORKDIR "
             "to change it.",
             "Enable providers: DREDGE_GITHUB_ORG/ENTERPRISE (+GITHUB_TOKEN), "
-            "DREDGE_GCP_PROJECT, DREDGE_ENABLE_K8S=1.",
+            "DREDGE_GCP_PROJECT, DREDGE_ENABLE_K8S=1, or DREDGE_ENABLE_HUAWEI=1 "
+            "with HUAWEICLOUD_SDK_REGION.",
             "Set DREDGE_MCP_PROFILE=forensic to add additive EBS snapshotting.",
         ],
         "guide_topics": sorted(set(_GUIDE_TOPICS)),
@@ -817,6 +857,61 @@ def aws_hunt_local_cloudtrail(
     return _result(r)
 
 
+@_tool(CAP_READ, "aws", annotations=_READ_ONLY)
+def aws_hunt_exposed_secrets(
+    include: Optional[list[str]] = None, scan_s3: Optional[list[str]] = None,
+    scan_cloudwatch: Optional[list[str]] = None, start_time: Optional[str] = None,
+    end_time: Optional[str] = None, max_ec2_instances: int = 500,
+    content_max_bytes: int = 10485760, content_max_api_calls: int = 100,
+    content_max_seconds: int = 60, s3_max_objects: int = 100,
+    s3_max_object_bytes: int = 1048576, cloudwatch_max_events: int = 1000,
+    cloudwatch_stream_prefix: Optional[str] = None,
+) -> dict:
+    """Scan common AWS configuration sources for exposed secrets. S3 and
+    CloudWatch are opt-in through explicit targets and bounded budgets. Values
+    are redacted by default."""
+    result = _aws().hunt.hunt_exposed_secrets(
+        include=include, scan_s3=scan_s3, scan_cloudwatch=scan_cloudwatch,
+        start_time=_parse_time(start_time, name="start_time"),
+        end_time=_parse_time(end_time, name="end_time"),
+        max_ec2_instances=max_ec2_instances, content_max_bytes=content_max_bytes,
+        content_max_api_calls=content_max_api_calls, content_max_seconds=content_max_seconds,
+        s3_max_objects=s3_max_objects, s3_max_object_bytes=s3_max_object_bytes,
+        cloudwatch_max_events=cloudwatch_max_events,
+        cloudwatch_stream_prefix=cloudwatch_stream_prefix,
+    )
+    return _result(result)
+
+
+@_tool(CAP_READ, "aws", annotations=_READ_ONLY)
+def aws_hunt_exposed_secrets_profiles(
+    profiles: Optional[list[str]] = None, regions: Optional[list[str]] = None,
+    max_workers: int = 12, include: Optional[list[str]] = None,
+    scan_s3: Optional[list[str]] = None, scan_cloudwatch: Optional[list[str]] = None,
+    start_time: Optional[str] = None, end_time: Optional[str] = None,
+    max_ec2_instances: int = 500, content_max_bytes: int = 10485760,
+    content_max_api_calls: int = 100, content_max_seconds: int = 60,
+    s3_max_objects: int = 100, s3_max_object_bytes: int = 1048576,
+    cloudwatch_max_events: int = 1000,
+) -> dict:
+    """Run bounded AWS secret hunts across selected local profiles and regions.
+    Use ["all"] selectors to discover profiles/regions. SSO login, when needed,
+    is performed only if DREDGE_AWS_SSO_LOGIN=1 is explicitly set."""
+    from dredge.aws_ir.secret_sweep import hunt_exposed_secrets_multi_profile
+    auth = AwsAuthConfig(region_name=os.getenv("DREDGE_AWS_REGION") or os.getenv("AWS_REGION")
+                         or os.getenv("AWS_DEFAULT_REGION"))
+    result = hunt_exposed_secrets_multi_profile(auth=auth, profiles=_selection_arg(profiles, default_all=True), regions=_selection_arg(regions),
+        max_workers=max_workers, sso_login=_env_truthy("DREDGE_AWS_SSO_LOGIN"),
+        include=include, scan_s3=scan_s3, scan_cloudwatch=scan_cloudwatch,
+        start_time=_parse_time(start_time, name="start_time"),
+        end_time=_parse_time(end_time, name="end_time"),
+        max_ec2_instances=max_ec2_instances, content_max_bytes=content_max_bytes,
+        content_max_api_calls=content_max_api_calls, content_max_seconds=content_max_seconds,
+        s3_max_objects=s3_max_objects, s3_max_object_bytes=s3_max_object_bytes,
+        cloudwatch_max_events=cloudwatch_max_events)
+    return _result(result)
+
+
 @_tool(CAP_READ, "aws", annotations=_LOCAL_READ_ONLY)
 def aws_incident_local_cloudtrail(
     path: str,
@@ -882,6 +977,29 @@ def aws_review(
         (review.to_csv if export == "csv" else review.to_html)(result, dest)
         out["exported_to"] = dest
     return out
+
+
+@_tool(CAP_READ, "aws", annotations=_READ_ONLY)
+def aws_review_profiles(
+    profiles: Optional[list[str]] = None, regions: Optional[list[str]] = None,
+    max_workers: int = 12,
+    services: Optional[list[ReviewService]] = None, deep: bool = False,
+    incident_start: Optional[str] = None, ips: Optional[list[str]] = None,
+    include: Optional[list[str]] = None, exclude: Optional[list[str]] = None,
+) -> dict:
+    """Run a posture review across selected AWS profiles and regions. Use
+    ["all"] selectors for discovery. SSO refresh is opt-in via
+    DREDGE_AWS_SSO_LOGIN=1."""
+    from dredge.aws_ir.review_sweep import review_multi_profile
+    _validate_ips(ips, name="ips")
+    auth = AwsAuthConfig(region_name=os.getenv("DREDGE_AWS_REGION") or os.getenv("AWS_REGION")
+                         or os.getenv("AWS_DEFAULT_REGION"))
+    result = review_multi_profile(auth=auth, profiles=_selection_arg(profiles, default_all=True), regions=_selection_arg(regions),
+        max_workers=max_workers, sso_login=_env_truthy("DREDGE_AWS_SSO_LOGIN"),
+        services=services, tiers=(1, 2) if deep else (1,),
+        incident_start=_parse_time(incident_start, name="incident_start"),
+        ips=ips, include=include, exclude=exclude)
+    return _result(result)
 
 
 # ===========================================================================
@@ -1289,6 +1407,104 @@ def github_forensics_file_at_commit(repo: str, path: str, ref: str) -> dict:
 
 
 # ===========================================================================
+# HUAWEI -- read-only review and secret hunting
+# ===========================================================================
+
+
+@_tool(CAP_READ, "huawei", annotations=_READ_ONLY)
+def huawei_review(services: Optional[list[HuaweiReviewService]] = None, deep: bool = False,
+                  include: Optional[list[str]] = None, exclude: Optional[list[str]] = None,
+                  incident_start: Optional[str] = None, ips: Optional[list[str]] = None,
+                  max_resources: int = 1000, max_api_calls: int = 2000, max_seconds: int = 120,
+                  export: Optional[Literal["csv", "html"]] = None,
+                  output_name: Optional[str] = None) -> dict:
+    """Run Huawei metadata posture checks for the configured region/project.
+    `deep=True` includes tier-2 checks. Exports stay inside the MCP workdir."""
+    _validate_ips(ips, name="ips")
+    review = _huawei().review
+    result = review.review(services=services, tiers=(1, 2) if deep else (1,),
+        include=include, exclude=exclude,
+        incident_start=_parse_time(incident_start, name="incident_start"), ips=ips,
+        max_resources=max_resources, max_api_calls=max_api_calls, max_seconds=max_seconds)
+    out = _result(result)
+    if export:
+        name = output_name or f"dredge-huawei-review.{export}"
+        if not name.endswith(f".{export}"):
+            name = f"{name}.{export}"
+        dest = _safe_path(name, create_parent=True)
+        (review.to_csv if export == "csv" else review.to_html)(result, dest)
+        out["exported_to"] = dest
+    return out
+
+
+@_tool(CAP_READ, "huawei", annotations=_READ_ONLY)
+def huawei_review_profiles(profiles: Optional[list[str]] = None, regions: Optional[list[str]] = None,
+                           project_id: Optional[str] = None, profile_source: HuaweiProfileSource = "sdk",
+                           services: Optional[list[HuaweiReviewService]] = None, deep: bool = False,
+                           include: Optional[list[str]] = None, exclude: Optional[list[str]] = None,
+                           ips: Optional[list[str]] = None, max_workers: int = 4,
+                           max_resources: int = 1000, max_api_calls: int = 2000,
+                           max_seconds: int = 120) -> dict:
+    """Review configured Huawei profiles and regions; ["all"] selects all.
+    SSO must already be authorized/cached because MCP cannot relay its interactive prompt."""
+    from dredge.huawei_ir.review_sweep import review_multi_profile
+    _validate_ips(ips, name="ips")
+    result = review_multi_profile(profiles=_selection_arg(profiles, default_all=True), regions=_selection_arg(regions), project_id=project_id,
+        profile_source=profile_source, max_workers=max_workers,
+        timeout=int(os.getenv("DREDGE_HUAWEI_TIMEOUT") or "20"),
+        enterprise_project_id=os.getenv("DREDGE_HUAWEI_ENTERPRISE_PROJECT_ID") or "0",
+        services=services, tiers=(1, 2) if deep else (1,), include=include,
+        exclude=exclude, ips=ips, max_resources=max_resources,
+        max_api_calls=max_api_calls, max_seconds=max_seconds)
+    return _result(result)
+
+
+@_tool(CAP_READ, "huawei", annotations=_READ_ONLY)
+def huawei_hunt_exposed_secrets(include: Optional[list[str]] = None,
+        scan_obs: Optional[list[str]] = None, scan_lts: Optional[list[str]] = None,
+        scan_csms: Optional[list[str]] = None, start_time: Optional[str] = None,
+        end_time: Optional[str] = None, max_resources: int = 500,
+        content_max_bytes: int = 10485760, content_max_api_calls: int = 100,
+        content_max_seconds: int = 60, obs_max_objects: int = 100,
+        obs_max_object_bytes: int = 1048576, lts_max_events: int = 1000,
+        scan_k8s_secrets: bool = False, k8s_namespace: Optional[str] = None) -> dict:
+    """Scan Huawei configuration for exposed secrets. Defaults to FunctionGraph,
+    ECS user data and CAE. Content targets are explicit/bounded; raw values are omitted."""
+    result = _huawei().hunt.hunt_exposed_secrets(include=include, scan_obs=scan_obs,
+        scan_lts=scan_lts, scan_csms=scan_csms,
+        start_time=_parse_time(start_time, name="start_time"),
+        end_time=_parse_time(end_time, name="end_time"), max_resources=max_resources,
+        content_max_bytes=content_max_bytes, content_max_api_calls=content_max_api_calls,
+        content_max_seconds=content_max_seconds, obs_max_objects=obs_max_objects,
+        obs_max_object_bytes=obs_max_object_bytes, lts_max_events=lts_max_events,
+        scan_k8s_secrets=scan_k8s_secrets, k8s_namespace=k8s_namespace)
+    return _result(result)
+
+
+@_tool(CAP_READ, "huawei", annotations=_READ_ONLY)
+def huawei_hunt_exposed_secrets_profiles(profiles: Optional[list[str]] = None,
+        regions: Optional[list[str]] = None, project_id: Optional[str] = None,
+        profile_source: HuaweiProfileSource = "sdk", max_workers: int = 4,
+        include: Optional[list[str]] = None, scan_obs: Optional[list[str]] = None,
+        scan_lts: Optional[list[str]] = None, scan_csms: Optional[list[str]] = None,
+        start_time: Optional[str] = None, end_time: Optional[str] = None,
+        max_resources: int = 500, content_max_bytes: int = 10485760,
+        content_max_api_calls: int = 100, content_max_seconds: int = 60) -> dict:
+    """Run bounded secret scans across configured profiles/regions. ["all"]
+    selects all; SSO sessions must be cached. CCE requires the single-profile tool."""
+    from dredge.huawei_ir.secret_sweep import hunt_exposed_secrets_multi_profile
+    result = hunt_exposed_secrets_multi_profile(profiles=_selection_arg(profiles, default_all=True), regions=_selection_arg(regions),
+        project_id=project_id, profile_source=profile_source, max_workers=max_workers,
+        timeout=int(os.getenv("DREDGE_HUAWEI_TIMEOUT") or "20"),
+        enterprise_project_id=os.getenv("DREDGE_HUAWEI_ENTERPRISE_PROJECT_ID") or "0",
+        include=include, scan_obs=scan_obs, scan_lts=scan_lts, scan_csms=scan_csms,
+        start_time=_parse_time(start_time, name="start_time"),
+        end_time=_parse_time(end_time, name="end_time"), max_resources=max_resources,
+        content_max_bytes=content_max_bytes, content_max_api_calls=content_max_api_calls,
+        content_max_seconds=content_max_seconds)
+    return _result(result)
+
+
 # GCP -- HUNT (Cloud Logging; module is in-progress upstream)
 # ===========================================================================
 

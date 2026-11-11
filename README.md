@@ -229,7 +229,7 @@ Every action returns an `OperationResult` (`success`, `details`, `errors`).
 
 Drive Dredge's **read-only** surface from an MCP client (e.g. Claude): ask *how
 to use the tool*, download logs, hunt, capture forensic evidence, and correlate
-across AWS, Kubernetes, GitHub, and GCP — in plain language.
+across AWS, Kubernetes, GitHub, GCP, and Huawei Cloud — in plain language.
 
 > 🔒 **No containment is wired.** Not one tool reaches Dredge's `response`
 > surface (disable/delete IAM, isolate EC2, delete pods, quarantine…). Those
@@ -258,8 +258,11 @@ Then ask the client to run **`dredge_capabilities`** (what's enabled) and
 
 **Provider gating** — AWS is always on; others register only when configured:
 `DREDGE_GITHUB_ORG`/`DREDGE_GITHUB_ENTERPRISE` (+ `GITHUB_TOKEN`),
-`DREDGE_GCP_PROJECT`, `DREDGE_ENABLE_K8S=1`. AWS-only shows 32 tools; fully
-configured, 61.
+`DREDGE_GCP_PROJECT`, `DREDGE_ENABLE_K8S=1`, or
+`DREDGE_ENABLE_HUAWEI=1` with `HUAWEICLOUD_SDK_REGION`. Huawei MCP tools include
+posture review, secret scanning, and multi-profile/region sweeps. Complete any
+interactive Huawei SSO authorization before invoking MCP; the stdio server
+cannot relay the device authorization prompt.
 
 **Safety model** — the tool set is a *capability reduction*, not the security
 boundary: run the server under read-only cloud credentials (AWS
