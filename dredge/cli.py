@@ -340,16 +340,17 @@ def print_review_table(result) -> None:
     for item in findings or []:
         if not isinstance(item, dict):
             continue
-        row = (
+        finding_type = str(item.get("check_id") or item.get("title") or "-")
+        key = (
             item.get("account_id") or item.get("profile") or "-",
             item.get("service") or "-",
             item.get("severity") or "-",
             item.get("region") or "-",
-            item.get("title") or item.get("check_id") or "-",
+            finding_type,
             item.get("recommendation") or "-",
         )
-        grouped[row] = grouped.get(row, 0) + 1
-    rows = [(*values[:5], count, values[5]) for values, count in grouped.items()]
+        grouped[key] = grouped.get(key, 0) + 1
+    rows = [(*key[:5], count, key[5]) for key, count in grouped.items()]
     print_table(headers, rows)
 
 
