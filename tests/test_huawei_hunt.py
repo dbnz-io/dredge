@@ -46,10 +46,29 @@ def test_functiongraph_masking_pagination_and_dedup(services):
 
 
 def test_default_scanners_and_partial_failures(services):
-    services.call.side_effect = [HuaweiServiceError("functiongraph failed (HTTP 403)"), {"servers": []}, {"items": []}]
+    def call(service, operation, **kwargs):
+        if service == "functiongraph":
+            raise HuaweiServiceError("functiongraph failed (HTTP 403)")
+        if service == "ecs":
+            return {"servers": []}
+        if service == "cae":
+            return {"items": []}
+        if service == "codearts":
+            return {"pipeline_variable_groups": []}
+        if service == "modelarts":
+            return {"items": []} if operation == "list_training_jobs" else {"data": []}
+        if service == "servicestage":
+            return {"environments": []} if operation == "show_environments" else {"applications": []}
+        if service == "dataartsstudio":
+            return {"data": {"value": {"records": []}}}
+        raise AssertionError(f"unexpected service call: {service}.{operation}")
+
+    services.call.side_effect = call
     result = HuaweiIRHunt(services).hunt_exposed_secrets()
     assert not result.success
-    assert set(result.details["scanners"]) == {"functiongraph", "ecs_user_data", "cae"}
+    assert set(result.details["scanners"]) == {
+        "functiongraph", "ecs_user_data", "cae", "codearts", "modelarts", "servicestage", "dataartsstudio"
+    }
     services.obs_call.assert_not_called()
 
 

@@ -71,7 +71,9 @@ def test_koocli_metadata_only_and_no_login():
 
 
 def test_koocli_missing_and_errors_sanitized():
-    with patch("dredge.huawei_ir.profiles.shutil.which", return_value=None):
+    with patch("dredge.huawei_ir.profiles.shutil.which", return_value=None), patch(
+        "dredge.huawei_ir.profiles.Path.is_file", return_value=False
+    ):
         with pytest.raises(HuaweiAuthError, match="hcloud on PATH"):
             load_profiles("koocli")
     with patch("dredge.huawei_ir.profiles.shutil.which", return_value="/opt/hcloud"), patch(

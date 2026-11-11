@@ -73,7 +73,7 @@ def test_every_tool_is_classified_with_cap_and_provider():
     assert set(server._TOOL_CAPS) == set(server._TOOL_PROVIDERS)
     for name, cap in server._TOOL_CAPS.items():
         assert cap in {server.CAP_READ, server.CAP_FORENSIC_CAPTURE}, name
-        assert server._TOOL_PROVIDERS[name] in {"meta", "aws", "k8s", "github", "gcp"}, name
+        assert server._TOOL_PROVIDERS[name] in {"meta", "aws", "k8s", "github", "gcp", "huawei"}, name
 
 
 def test_only_snapshot_tools_need_capture_capability():

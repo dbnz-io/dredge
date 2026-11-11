@@ -113,6 +113,10 @@ def print_result(result, output: str = "json") -> None:
         for ev in events:
             if isinstance(ev, dict):
                 fieldnames.update(ev.keys())
+            else:
+                # The scalar-row fallback below writes this field. Add it
+                # even when the result also contains dictionary rows.
+                fieldnames.add("value")
 
         fieldnames = sorted(fieldnames)
 
@@ -886,12 +890,13 @@ def handle_aws_review(args: argparse.Namespace) -> None:
     review_options = dict(
         services=services,
         tiers=tiers,
-        check_permissions=bool(args.check_permissions),
         incident_start=parse_iso_datetime(getattr(args, "incident_start", None)),
         ips=_flatten_csv(getattr(args, "ip", None)) or None,
         include=_flatten_csv(getattr(args, "include", None)) or None,
         exclude=_flatten_csv(getattr(args, "exclude", None)) or None,
     )
+    if getattr(args, "check_permissions", False):
+        review_options["check_permissions"] = True
     max_workers = getattr(args, "max_workers", 12)
     if args.aws_profile == "all" or args.aws_region == "all" or getattr(args, "sso_login", False):
         from dredge.aws_ir.review_sweep import review_multi_profile
@@ -1410,10 +1415,10 @@ def handle_aws_hunt_exposed_secrets(args: argparse.Namespace) -> None:
         with open(args.unredacted, "w") as fh:
             json.dump(raw_values, fh, indent=2)
         os.chmod(args.unredacted, 0o600)
-    if args.simple:
-        print_simple_secret_result(res, provider="aws", permission_check=args.check_permissions)
+    if getattr(args, "simple", False):
+        print_simple_secret_result(res, provider="aws", permission_check=getattr(args, "check_permissions", False))
     else:
-        if args.check_permissions:
+        if getattr(args, "check_permissions", False):
             res.details["permission_check"] = _simple_secret_result(
                 res, provider="aws", permission_check=True,
             )["permission_check"]
@@ -1476,7 +1481,7 @@ def handle_huawei_hunt_exposed_secrets(args: argparse.Namespace) -> None:
 
     if args.content_only and args.include:
         raise ValueError("--content-only cannot be combined with --include")
-    if args.check_permissions:
+    if getattr(args, "check_permissions", False):
         from dredge.huawei_ir.secret_sweep import check_exposed_secrets_permissions_multi_profile
         if (args.scan_obs or args.scan_lts or args.scan_csms or args.scan_k8s_secrets or args.unredacted
                 or set(args.include or []) & {"cce", "cci"}):
@@ -1487,7 +1492,7 @@ def handle_huawei_hunt_exposed_secrets(args: argparse.Namespace) -> None:
             timeout=args.huawei_timeout, enterprise_project_id=args.huawei_enterprise_project_id,
             include=args.include,
         )
-        if args.simple:
+        if getattr(args, "simple", False):
             print_simple_secret_result(result, provider="huawei")
         else:
             print_result(result)
@@ -1540,10 +1545,10 @@ def handle_huawei_hunt_exposed_secrets(args: argparse.Namespace) -> None:
                 json.dump(raw, output, indent=2)
         except OSError:
             raise ValueError("Unable to create --unredacted output; choose a new writable file") from None
-    if args.simple:
-        print_simple_secret_result(result, provider="huawei", permission_check=args.check_permissions)
+    if getattr(args, "simple", False):
+        print_simple_secret_result(result, provider="huawei", permission_check=getattr(args, "check_permissions", False))
     else:
-        if args.check_permissions:
+        if getattr(args, "check_permissions", False):
             result.details["permission_check"] = _simple_secret_result(
                 result, provider="huawei", permission_check=True,
             )["permission_check"]
@@ -1654,10 +1659,10 @@ def handle_github_hunt_secret_scanning(args: argparse.Namespace) -> None:
         state=args.state,
         max_alerts=args.max_alerts,
     )
-    if args.simple:
-        print_simple_secret_result(result, provider="github", permission_check=args.check_permissions)
+    if getattr(args, "simple", False):
+        print_simple_secret_result(result, provider="github", permission_check=getattr(args, "check_permissions", False))
     else:
-        if args.check_permissions:
+        if getattr(args, "check_permissions", False):
             result.details["permission_check"] = _simple_secret_result(
                 result, provider="github", permission_check=True,
             )["permission_check"]

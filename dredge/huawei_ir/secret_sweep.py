@@ -168,7 +168,8 @@ def _probe_identity(identity, profile, regions, project_id, scanners, timeout, e
                 try:
                     registry.close()
                 except Exception:
-                    pass
+                    # Closing a failed probe client must not hide its scan result.
+                    pass  # nosec B110
         results.append(({**scope, "agency_urn": identity["agency_urn"]}, probe_results))
     return results, skipped
 
