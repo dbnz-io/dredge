@@ -23,6 +23,13 @@ def load_profiles(source="sdk"):
     if source == "koocli":
         executable = shutil.which("hcloud")
         if not executable:
+            # User-local installs are common (and avoid requiring root). Codex
+            # or another parent process may have started before ~/.local/bin
+            # was added to PATH, so look there explicitly as a fallback.
+            candidate = Path.home() / ".local" / "bin" / "hcloud"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                executable = str(candidate)
+        if not executable:
             raise HuaweiAuthError("KooCLI profile import requires hcloud on PATH")
         try:
             # Only a read-only configuration query. Capture all output so even
@@ -30,7 +37,16 @@ def load_profiles(source="sdk"):
             response = subprocess.run(  # nosec B603
                 [executable, "configure", "list", "--cli-output=json"],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20, check=True)
-            entries = json.loads(response.stdout)["profiles"]
+            # Some KooCLI builds print log-permission diagnostics before the
+            # requested JSON on stdout. Parse the JSON document after that
+            # preamble; never surface the raw output, which may contain config.
+            json_start = response.stdout.find("{")
+            if json_start < 0:
+                raise ValueError("KooCLI returned no JSON configuration")
+            payload = json.loads(response.stdout[json_start:])
+            entries = payload.get("profiles") if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                raise ValueError("KooCLI returned an unsupported profile list")
             catalog = {}
             for entry in entries:
                 if entry.get("mode") != "SSO":

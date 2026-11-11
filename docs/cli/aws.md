@@ -277,6 +277,16 @@ and redacted by default. `--unredacted PATH` writes raw values to a file with mo
 0600; `--test` explicitly enables STS verification of detected AWS key pairs.
 Service access failures are reported while other sources continue.
 
+Add `--simple` to print only success/completeness, redacted finding type and
+preview, and source locations. Add `--check-permissions` to report services
+that returned an access-denied response during the scan. This checks APIs the
+selected scan actually called; no denials means none were observed, not proof
+of every possible IAM permission.
+
+```bash
+dredge aws hunt exposed-secrets --simple --check-permissions
+```
+
 #### All configured profiles and enabled regions
 
 ```bash

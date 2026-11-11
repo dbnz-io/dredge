@@ -96,6 +96,83 @@ def print_result(result, output: str = "json") -> None:
     print(json.dumps(data, indent=2, default=str))
 
 
+def _simple_secret_result(result, *, provider: str, permission_check: bool = False) -> dict:
+    """Return a compact, redacted summary shared by provider secret hunts."""
+    try:
+        data = asdict(result)
+    except TypeError:
+        data = result
+    details = data.get("details", {}) if isinstance(data, dict) else {}
+    finding_key = "credentials" if provider == "aws" else "findings"
+    findings = []
+    for finding in details.get(finding_key, details.get("alerts", [])) or []:
+        sources = finding.get("sources", []) if isinstance(finding, dict) else []
+        locations = []
+        if isinstance(finding, dict) and provider == "github":
+            locations = [{k: loc[k] for k in ("type", "details") if loc.get(k) is not None}
+                         for loc in finding.get("locations", []) if isinstance(loc, dict)]
+            if finding.get("repository"):
+                locations.append({"repository": finding["repository"].get("full_name", finding["repository"])
+                                  if isinstance(finding["repository"], dict) else finding["repository"]})
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            locations.append({k: source[k] for k in (
+                "profile", "account_id", "region", "project_id", "resource_id",
+                "location_type", "service", "repo", "path", "url", "line",
+            ) if source.get(k) is not None})
+        if not locations:
+            for key in ("repository", "secret_type", "secret_type_display_name", "html_url", "resolution"):
+                if finding.get(key) is not None:
+                    locations.append({key: finding[key]})
+        findings.append({k: finding[k] for k in (
+            "category", "secret_type", "secret_type_display_name", "severity", "redacted_value",
+        ) if finding.get(k) is not None} | {"where": locations})
+
+    summary = {
+        "provider": provider,
+        "success": bool(data.get("success")),
+        "complete": bool(details.get("complete", data.get("success") and not data.get("errors")
+                                    and not details.get("scan_errors"))),
+        "findings": findings,
+    }
+    if not summary["success"] and data.get("errors"):
+        summary["errors"] = data["errors"]
+    if permission_check:
+        errors = []
+        def collect(value):
+            if isinstance(value, str):
+                errors.append(value)
+            elif isinstance(value, dict):
+                for item in value.values(): collect(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value: collect(item)
+        collect(data.get("errors", []))
+        collect(details.get("scan_errors", []))
+        collect(details.get("profiles", {}))
+        collect(details.get("scopes", []))
+        denied = [e for e in errors if re.search(
+            r"access.?denied|unauthorized|forbidden|\b403\b|not.?authorized|permission.?denied", e, re.I,
+        )]
+        services = set()
+        for error in denied:
+            match = re.search(r"\b(lambda|ecs|ssm|ec2|codebuild|elasticbeanstalk|apprunner|batch|glue|amplify|s3|cloudwatch|functiongraph|cae|obs|lts|csms|iam|cce|github)\b", error, re.I)
+            if match:
+                services.add(match.group(1).lower())
+        summary["permission_check"] = {
+            "status": "access_denied" if denied else "no_denials_observed",
+            "services_needing_access": sorted(services),
+            "message": ("You need extra permissions to access: " + ", ".join(sorted(services))) if services else
+                       ("Access was denied, but the affected service could not be identified." if denied else
+                        "No access-denied responses were observed in the services this scan called."),
+        }
+    return summary
+
+
+def print_simple_secret_result(result, *, provider: str, permission_check: bool = False) -> None:
+    print(json.dumps(_simple_secret_result(result, provider=provider, permission_check=permission_check), indent=2, default=str))
+
+
 def print_table(headers: tuple, rows: list) -> None:
     """Print a simple space-aligned table. Falls back to a plain message
     when there are no rows."""
@@ -1168,7 +1245,14 @@ def handle_aws_hunt_exposed_secrets(args: argparse.Namespace) -> None:
         with open(args.unredacted, "w") as fh:
             json.dump(raw_values, fh, indent=2)
         os.chmod(args.unredacted, 0o600)
-    print_result(res, output=getattr(args, "output", "json"))
+    if args.simple:
+        print_simple_secret_result(res, provider="aws", permission_check=args.check_permissions)
+    else:
+        if args.check_permissions:
+            res.details["permission_check"] = _simple_secret_result(
+                res, provider="aws", permission_check=True,
+            )["permission_check"]
+        print_result(res, output=getattr(args, "output", "json"))
 
 
 def handle_aws_hunt_cloudwatch_logs(args: argparse.Namespace) -> None:
@@ -1271,7 +1355,14 @@ def handle_huawei_hunt_exposed_secrets(args: argparse.Namespace) -> None:
                 json.dump(raw, output, indent=2)
         except OSError:
             raise ValueError("Unable to create --unredacted output; choose a new writable file") from None
-    print_result(result)
+    if args.simple:
+        print_simple_secret_result(result, provider="huawei", permission_check=args.check_permissions)
+    else:
+        if args.check_permissions:
+            result.details["permission_check"] = _simple_secret_result(
+                result, provider="huawei", permission_check=True,
+            )["permission_check"]
+        print_result(result)
 
 
 # ------------- GitHub command handlers -------------
@@ -1373,11 +1464,19 @@ def handle_github_archive_repository(args: argparse.Namespace) -> None:
 
 def handle_github_hunt_secret_scanning(args: argparse.Namespace) -> None:
     d = _github_dredge(args)
-    print_result(d.github_ir.hunt.hunt_secret_scanning_alerts(
+    result = d.github_ir.hunt.hunt_secret_scanning_alerts(
         getattr(args, "repo", None) or None,
         state=args.state,
         max_alerts=args.max_alerts,
-    ), output=getattr(args, "output", "json"))
+    )
+    if args.simple:
+        print_simple_secret_result(result, provider="github", permission_check=args.check_permissions)
+    else:
+        if args.check_permissions:
+            result.details["permission_check"] = _simple_secret_result(
+                result, provider="github", permission_check=True,
+            )["permission_check"]
+        print_result(result, output=getattr(args, "output", "json"))
 
 
 def handle_github_hunt_code_scanning(args: argparse.Namespace) -> None:
@@ -1928,6 +2027,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--content-max-api-calls", type=int, default=100)
     p.add_argument("--content-max-seconds", type=int, default=60)
     p.add_argument("--unredacted", metavar="NEW_FILE", help="Write raw exposure values to a new mode-0600 file")
+    p.add_argument("--simple", action="store_true", help="Print only success, completeness, findings, and source locations")
+    p.add_argument("--check-permissions", action="store_true",
+                   help="Report services where this scan received an access-denied response")
     p.set_defaults(func=handle_huawei_hunt_exposed_secrets)
 
     # --- AWS response subcommands ---
@@ -2363,6 +2465,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="max_ec2_instances",
         help="Cap on EC2 instances scanned for user-data",
     )
+    p.add_argument("--simple", action="store_true", help="Print only success, completeness, findings, and source locations")
+    p.add_argument("--check-permissions", action="store_true",
+                   help="Report services where this scan received an access-denied response")
     p.add_argument("--output", choices=["json", "csv"], default="json")
     p.set_defaults(func=handle_aws_hunt_exposed_secrets)
 
@@ -2753,6 +2858,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", default=None, help="Repository name (omit for all org repos)")
     p.add_argument("--state", default="open", choices=["open", "resolved"], help="Alert state (default: open)")
     p.add_argument("--max-alerts", dest="max_alerts", type=int, default=100)
+    p.add_argument("--simple", action="store_true", help="Print a compact alert summary")
+    p.add_argument("--check-permissions", action="store_true",
+                   help="Report access-denied responses from GitHub")
     p.add_argument("--output", choices=["json", "csv"], default="json")
     p.set_defaults(func=handle_github_hunt_secret_scanning)
 

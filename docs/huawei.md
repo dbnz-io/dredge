@@ -35,6 +35,16 @@ export HUAWEICLOUD_SDK_PROJECT_ID=YOUR_REGIONAL_PROJECT_ID
 dredge huawei hunt exposed-secrets
 ```
 
+Use `--simple` for a compact result with success/completeness, redacted
+findings, and their locations. `--check-permissions` reports services where
+the selected scan received an access-denied response. This is based on the
+read-only calls made by that scan and does not prove permissions for APIs it
+did not call.
+
+```bash
+dredge huawei hunt exposed-secrets --simple --check-permissions
+```
+
 For the single-project SDK path, the project ID must be present in the config,
 `HUAWEICLOUD_SDK_PROJECT_ID`, or resolved credentials. SSO and multi-profile sweeps
 discover projects through IAM. Auth flags work before or immediately after
