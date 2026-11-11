@@ -10,11 +10,61 @@ import re
 from ..secret_scanning import _SEVERITY_ORDER
 from .auth import HuaweiAuthError
 from .config import HuaweiAuthConfig
-from .hunt import HuaweiIRHunt, validate_scan_options
+from .hunt import CONFIG_SCANNERS, HuaweiIRHunt, validate_scan_options
 from .models import OperationResult
 from .profiles import IamDiscovery, load_profiles
 from .services import HuaweiServiceRegistry
 from .profile_sweep import _identities, _safe_error, _selection
+
+
+_PERMISSION_ACTIONS = {
+    ("functiongraph", "list_functions"): "functiongraph:function:listFunctions",
+    ("functiongraph", "show_function_config"): "functiongraph:function:getFunctionConfig",
+    ("ecs", "list_servers_details"): "ecs:cloudServers:listServersDetails",
+    ("ecs", "show_server"): "ecs:cloudServers:showServer",
+    ("cae", "list_environments"): "cae:environment:listEnvironments",
+    ("cae", "list_applications"): "cae:application:listApplications",
+    ("cae", "list_components"): "cae:component:listComponents",
+    ("cae", "list_component_configurations"): "cae:component:listConfigurations",
+    ("modelarts", "list_training_jobs"): "modelarts:trainJob:list",
+    ("modelarts", "show_training_job_details"): "modelarts:trainJob:get",
+    ("modelarts", "list_infer_services"): "modelarts:service:list",
+    ("servicestage", "show_environments"): "servicestage:environment:list",
+    ("servicestage", "show_applications"): "servicestage:app:listApplication",
+    ("servicestage", "show_application_configuration"): "servicestage:app:getConfiguration",
+    ("servicestage", "show_components_in_application"): "servicestage:app:listComponent",
+    ("servicestage", "show_component_info"): "servicestage:app:getComponent",
+    ("dataartsstudio", "list_workspaces"): "DataArts Studio workspace list permission",
+    ("dataartsstudio", "show_factory_env"): "DataArts Studio environment read permission",
+    ("dataartsstudio", "list_dataconnections"): "DataArts Studio connection list permission",
+    ("dataartsstudio", "show_dataconnection"): "DataArts Studio connection read permission",
+}
+
+
+def _permission_diagnostics(profile, scope):
+    """Translate sanitized Huawei 403 operation errors to IAM v5 actions."""
+    diagnostics = []
+    context = ", ".join(f"{key}={scope[key]}" for key in ("region", "project_id") if scope.get(key))
+    for error in scope.get("errors", []):
+        match = re.search(r"([a-z_]+)\.([a-z_]+) failed \(HTTP (\d+)\)", error, re.I)
+        if not match or match.group(3) != "403":
+            continue
+        service, operation = match.group(1).lower(), match.group(2).lower()
+        action = _PERMISSION_ACTIONS.get((service, operation))
+        if service == "codeartspipeline" and not action:
+            action = f"CodeArts Pipeline project permission for {operation}"
+        elif not action:
+            continue
+        label = {"functiongraph": "FunctionGraph", "ecs": "ECS", "cae": "CAE",
+                 "codeartspipeline": "CodeArts Pipeline"}.get(service, service)
+        guidance = ("Check CodeArts project access." if service == "codeartspipeline" else
+                    "Check the agency's IAM v5 policy and resource/enterprise-project scope.")
+        diagnostics.append(
+            f"Profile {profile!r}: {label} denied {operation} ({action})"
+            + (f" in {context}" if context else "")
+            + f". {guidance}"
+        )
+    return diagnostics
 
 
 def _scan_identity(identity, profile, regions, project_id, options, timeout, enterprise_project_id):
@@ -60,6 +110,136 @@ def _scan_identity(identity, profile, regions, project_id, options, timeout, ent
             attribution["project_id"] = None  # OBS is not a regional IAM-project scan.
         outcomes.append((attribution, outcome))
     return outcomes, skipped
+
+
+def _probe_identity(identity, profile, regions, project_id, scanners, timeout, enterprise_project_id):
+    """Check list-endpoint access only; never fetch resource configurations or values."""
+    selected_regions = regions
+    if selected_regions is None:
+        region = profile.get("region") or os.getenv("HUAWEICLOUD_SDK_REGION")
+        selected_regions = [region] if region else None
+    selected_project = project_id or (profile.get("project_id") if regions != "all" else None)
+    if selected_regions is None and not selected_project:
+        raise HuaweiAuthError("Set a Huawei region/project in the profile or select --huawei-region all")
+    discovery = IamDiscovery(identity["credentials"], timeout)
+    scopes, skipped = discovery.scopes(regions=selected_regions, project_id=selected_project,
+                                       account_id=identity["account_id"])
+    probes = {
+        "functiongraph": ("functiongraph", "list_functions", {"marker": "0", "maxitems": "1"}),
+        "ecs_user_data": ("ecs", "list_servers_details", {"limit": 1}),
+        "cae": ("cae", "list_environments", {"x_enterprise_project_id": enterprise_project_id}),
+        "codearts": ("codeartspipeline", "list_variable_groups",
+                     {"project_id": "", "body": {"offset": 0, "limit": 1, "name": ""}}),
+        "modelarts": [
+            ("modelarts", "list_training_jobs", {"body": {"offset": 0, "limit": 1}}),
+            ("modelarts", "list_infer_services", {"limit": 1, "offset": 0}),
+        ],
+        "servicestage": ("servicestage", "show_environments", {"limit": 1, "offset": 0}),
+        "dataartsstudio": ("dataartsstudio", "list_workspaces", {"x_project_id": "", "limit": 1, "offset": 0}),
+    }
+    results = []
+    for scope in scopes:
+        registry = None
+        probe_results = []
+        try:
+            def credentials():
+                return identity["credentials"]().with_project_id(scope["project_id"])
+            registry = HuaweiServiceRegistry(HuaweiAuthConfig(
+                region_name=scope["region"], project_id=scope["project_id"], credential_provider=credentials,
+                timeout=timeout, enterprise_project_id=enterprise_project_id))
+            for scanner in scanners:
+                selected_probes = probes[scanner]
+                if selected_probes and isinstance(selected_probes[0], str):
+                    selected_probes = [selected_probes]
+                for service, operation, params in selected_probes:
+                    if scanner == "codearts":
+                        params = {**params, "project_id": scope["project_id"]}
+                    elif scanner == "dataartsstudio":
+                        params = {**params, "x_project_id": scope["project_id"]}
+                    try:
+                        registry.call(service, operation, **params)
+                        probe_results.append({"scanner": scanner, "service": service, "operation": operation,
+                                              "accessible": True})
+                    except Exception as exc:
+                        probe_results.append({"scanner": scanner, "service": service, "operation": operation,
+                                              "accessible": False, "error": str(exc) if isinstance(exc, Exception) else "Huawei operation failed"})
+        finally:
+            if registry is not None:
+                try:
+                    registry.close()
+                except Exception:
+                    pass
+        results.append(({**scope, "agency_urn": identity["agency_urn"]}, probe_results))
+    return results, skipped
+
+
+def check_exposed_secrets_permissions_multi_profile(
+    *, profiles="all", regions=None, project_id=None, profile_source="sdk", max_workers=4,
+    sso_login=False, timeout=20, enterprise_project_id="0", cache_dir=None, notify=None,
+    include=None,
+):
+    """Read-only access preflight for default Huawei secret-scan list APIs."""
+    scanners = list(CONFIG_SCANNERS) if include is None else list(include)
+    if any(scanner not in set(CONFIG_SCANNERS) for scanner in scanners):
+        raise ValueError("Permission-only checks support the default Huawei configuration scanners")
+    profiles, regions = _selection(profiles, "profiles"), _selection(regions, "regions")
+    if not isinstance(max_workers, int) or isinstance(max_workers, bool) or not 1 <= max_workers <= 32:
+        raise ValueError("max_workers must be between 1 and 32")
+    if profiles is None:
+        if profile_source != "sdk":
+            raise ValueError("KooCLI import requires a named --huawei-profile or all")
+        selected, catalog = ["default-chain"], {"default-chain": {"kind": "chain"}}
+    else:
+        catalog = load_profiles(profile_source)
+        selected = sorted(catalog) if profiles == "all" else profiles
+        if not selected or any(name not in catalog for name in selected):
+            raise ValueError("No matching Huawei profiles; configure SDK/SSO profiles or select the KooCLI source")
+    result = OperationResult("check_exposed_secrets_permissions", "configured Huawei profiles", True,
+                             {"permission_checks": [], "complete": True})
+    sessions, jobs = {}, []
+    for label in selected:
+        try:
+            profile_errors = []
+            identities = list(_identities(label, catalog[label], sessions, sso_login, timeout, cache_dir,
+                                          notify, profile_errors))
+            for error in profile_errors:
+                result.add_error(f"Profile {label!r}: {error}")
+                result.details["complete"] = False
+            if not identities and not profile_errors:
+                result.add_error(f"Profile {label!r}: no account/agencies were available to check")
+                result.details["complete"] = False
+            jobs.extend((label, identity) for identity in identities)
+        except Exception as exc:
+            result.add_error(f"Profile {label!r}: {_safe_error(exc)}")
+            result.details["complete"] = False
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_probe_identity, identity, catalog[label], regions, project_id,
+                                   scanners, timeout, enterprise_project_id): (label, identity)
+                   for label, identity in jobs}
+        for future in as_completed(futures):
+            label, identity = futures[future]
+            try:
+                outcomes, skipped = future.result()
+                for scope, probes in outcomes:
+                    for probe in probes:
+                        item = {"profile": label, **scope, **probe}
+                        result.details["permission_checks"].append(item)
+                        if not probe["accessible"]:
+                            result.details["complete"] = False
+                            error = probe.get("error", "")
+                            diagnostic = _permission_diagnostics(label, {**scope, "errors": [error]})
+                            result.add_error(diagnostic[0] if diagnostic else
+                                             f"Profile {label!r}: {probe['service']} {probe['operation']} failed; see permission_checks")
+                if skipped:
+                    result.details["complete"] = False
+                    for item in skipped:
+                        result.add_error(f"Profile {label!r}: project discovery skipped a scope; see permission_checks")
+            except Exception as exc:
+                result.details["complete"] = False
+                result.add_error(f"Profile {label!r}: {_safe_error(exc)}")
+    result.details["permission_checks"].sort(key=lambda p: tuple(str(p.get(k) or "") for k in
+        ("profile", "account_id", "agency_urn", "region", "project_id", "scanner")))
+    return result
 
 
 def hunt_exposed_secrets_multi_profile(
@@ -158,12 +338,20 @@ def hunt_exposed_secrets_multi_profile(
                                     existing[key] = incoming[key]
                 if options["keep_raw"]:
                     raw.update(details.get("raw_values", {}))
+    permission_errors = set()
     for label, record in result.details["profiles"].items():
         record["scopes"].sort(key=lambda s: tuple(str(s.get(k) or "") for k in ("account_id", "agency_urn", "region", "project_id", "scope")))
         if record["errors"] or any(not s["success"] for s in record["scopes"]):
-            result.add_error(f"Profile {label!r} was incomplete; see details.profiles")
+            profile_diagnostics = set()
+            for scope in record["scopes"]:
+                profile_diagnostics.update(_permission_diagnostics(label, scope))
+            permission_errors.update(profile_diagnostics)
+            if record["errors"] or (any(not s["success"] for s in record["scopes"]) and not profile_diagnostics):
+                result.add_error(f"Profile {label!r} was incomplete; see details.profiles")
         if not record["scopes"] or any(not s["complete"] for s in record["scopes"]):
             result.details["complete"] = False
+    for message in sorted(permission_errors):
+        result.add_error(message)
     result.details["complete"] = result.details["complete"] and result.success and not result.details["uninspected"]
     result.details["findings"] = sorted(findings.values(), key=lambda f: (_SEVERITY_ORDER.get(f["severity"], 9), f["hash"]))
     for finding in result.details["findings"]:

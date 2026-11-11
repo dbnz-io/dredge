@@ -37,7 +37,6 @@ from ..log import get_logger, event
 from .services import AwsServiceRegistry
 from .hunt import AwsIRHunt
 from .models import OperationResult
-from .profile_sweep import _safe_error
 
 _log = get_logger(__name__)
 
@@ -55,11 +54,43 @@ SERVICES = ["iam", "ec2", "s3", "rds", "lambda", "ecs", "org", "recent"]
 class _HuntCheckFailed(Exception):
     """A composed hunt returned an incomplete result instead of raising."""
 
+    def __init__(self, result):
+        self.errors = list(result.errors)
+        super().__init__("Underlying hunt was incomplete")
+
 
 def _require_hunt_success(result):
     if not result.success:
         # Hunt error strings can contain raw AWS response bodies.
-        raise _HuntCheckFailed("Underlying hunt was incomplete; check permissions and API availability")
+        raise _HuntCheckFailed(result)
+
+
+def _error_detail(exc):
+    detail = {"type": type(exc).__name__}
+    if isinstance(exc, _HuntCheckFailed):
+        detail["message"] = str(exc)
+        detail["causes"] = exc.errors
+        return detail
+    if isinstance(exc, botocore.exceptions.ClientError):
+        response = exc.response or {}
+        error = response.get("Error") or {}
+        metadata = response.get("ResponseMetadata") or {}
+        detail.update(
+            code=error.get("Code"),
+            message=str(error.get("Message") or "AWS API request failed")[:500],
+            request_id=metadata.get("RequestId"),
+            http_status=metadata.get("HTTPStatusCode"),
+        )
+        return {key: value for key, value in detail.items() if value is not None}
+    message = str(exc).replace("\n", " ")
+    detail["message"] = message[:500] if message else "AWS API request failed"
+    return detail
+
+
+def _error_text(detail):
+    code = detail.get("code")
+    message = detail.get("message") or "AWS API request failed"
+    return f"{code}: {message}" if code else message
 
 
 @dataclass
@@ -123,6 +154,7 @@ class AwsIRReview:
         exclude: Optional[List[str]] = None,
         regions=None,
         max_workers: int = 12,
+        check_permissions: bool = False,
     ) -> OperationResult:
         """
         Run the review.
@@ -190,9 +222,9 @@ class AwsIRReview:
                         f.region = region
                 return produced, None
             except _HuntCheckFailed as exc:
-                return [], str(exc)
+                return [], _error_detail(exc)
             except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
-                return [], _safe_error(exc)
+                return [], _error_detail(exc)
 
         # Global checks: once, against the base services.
         for check_id, service, tier, method_name, scope in selected:
@@ -201,9 +233,9 @@ class AwsIRReview:
             produced, error = _run(self, check_id, method_name, service, tier, None)
             findings.extend(produced)
             checks_status[check_id] = {"status": "ran", "count": len(produced)} if error is None \
-                else {"status": "failed", "count": 0, "error": error}
+                else {"status": "failed", "count": 0, "error": _error_text(error), "error_detail": error}
             if error:
-                result.add_error(f"{check_id}: {error}")
+                result.add_error(f"{check_id}: {_error_text(error)}")
 
         regional_selected = [c for c in selected if c[4] == "regional"]
         if regional_selected:
@@ -213,22 +245,26 @@ class AwsIRReview:
                     produced, error = _run(self, check_id, method_name, service, tier, None)
                     findings.extend(produced)
                     checks_status[check_id] = {"status": "ran", "count": len(produced)} if error is None \
-                        else {"status": "failed", "count": 0, "error": error}
+                        else {"status": "failed", "count": 0, "error": _error_text(error), "error_detail": error}
                     if error:
-                        result.add_error(f"{check_id}: {error}")
+                        result.add_error(f"{check_id}: {_error_text(error)}")
             else:
                 # Multi-region fan-out: one region-scoped review per region.
                 def _region_worker(region):
                     try:
                         robj = AwsIRReview(self._services.regional(region), self._config)
                     except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
-                        return region, [], {c[0]: {"error": _safe_error(exc)} for c in regional_selected}
+                        detail = _error_detail(exc)
+                        return region, [], {c[0]: {"error": _error_text(detail), "error_detail": detail}
+                                            for c in regional_selected}
                     per = {}
                     got: List[Finding] = []
                     for check_id, service, tier, method_name, _s in regional_selected:
                         produced, error = _run(robj, check_id, method_name, service, tier, region)
                         got.extend(produced)
-                        per[check_id] = {"count": len(produced)} if error is None else {"error": error}
+                        per[check_id] = {"count": len(produced)} if error is None else {
+                            "error": _error_text(error), "error_detail": error,
+                        }
                     return region, got, per
 
                 agg: Dict[str, Dict[str, Any]] = {c[0]: {"by_region": {}} for c in regional_selected}
@@ -253,7 +289,8 @@ class AwsIRReview:
                     info["status"] = "failed" if errors and len(errors) == len(region_list) else ("partial" if errors else "ran")
                     info["count"] = total
                     if errors:
-                        result.add_error(f"{cid}: failed in {len(errors)} region(s)")
+                        for region, error in errors.items():
+                            result.add_error(f"{cid} ({region}): {error}")
                     checks_status[cid] = info
 
         findings.sort(key=lambda f: (_SEVERITY_RANK.get(f.severity, 9), f.service, f.check_id,
@@ -276,6 +313,44 @@ class AwsIRReview:
             "incident_start": incident_start.isoformat() if incident_start else None,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
+        if check_permissions:
+            permission_checks = []
+            denied_codes = {
+                "AccessDenied", "AccessDeniedException", "UnauthorizedOperation",
+                "AuthorizationError", "Forbidden", "403",
+            }
+
+            def permission_status(check):
+                if check.get("status") == "skipped":
+                    return "skipped"
+                detail = check.get("error_detail") or {}
+                code = str(detail.get("code") or "")
+                message = str(check.get("error") or detail.get("message") or "")
+                if code in denied_codes or any(token in message.casefold() for token in
+                        ("accessdenied", "access denied", "unauthorized", "not authorized", "forbidden")):
+                    return "access_denied"
+                return "api_error" if check.get("error") else "accessible"
+
+            for check_id, check in checks_status.items():
+                if "by_region" in check:
+                    for region, status in check["by_region"].items():
+                        permission_checks.append({"check_id": check_id, "region": region,
+                            "status": permission_status(status),
+                            **({"error": status["error"], "error_detail": status.get("error_detail")}
+                               if status.get("error") else {})})
+                else:
+                    permission_checks.append({"check_id": check_id,
+                        "status": permission_status(check),
+                        **({"error": check["error"], "error_detail": check.get("error_detail")}
+                           if check.get("error") else {})})
+            result.details["permission_checks"] = permission_checks
+            result.details["findings"] = []
+            result.details["summary"] = {"checks": len(permission_checks),
+                "accessible": sum(p["status"] == "accessible" for p in permission_checks),
+                "skipped": sum(p["status"] == "skipped" for p in permission_checks),
+                "denied": sum(p["status"] == "access_denied" for p in permission_checks),
+                "errors": sum(p["status"] == "api_error" for p in permission_checks)}
+            result.details["total_findings"] = 0
         _log.info(event("aws_ir_review", "complete", total=len(findings), regions=len(region_list or []), **summary))
         return result
 

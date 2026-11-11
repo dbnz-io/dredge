@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
 import time
@@ -14,7 +15,8 @@ from .models import OperationResult
 from .services import HuaweiServiceError
 
 API_ERRORS = (HuaweiAuthError, HuaweiServiceError)
-CONFIG_SCANNERS = ("functiongraph", "ecs_user_data", "cae")
+CONFIG_SCANNERS = ("functiongraph", "ecs_user_data", "cae", "codearts", "modelarts",
+                   "servicestage", "dataartsstudio")
 
 
 def _positive(**values):
@@ -205,6 +207,382 @@ def _cae(scan):
                     break
 
 
+def _codearts(scan):
+    """Inspect readable, non-private CodeArts Pipeline parameter groups."""
+    project_id = scan.services.config.project_id
+    if not project_id:
+        scan.result.add_error("codearts: a regional project ID is required")
+        return
+    offset, seen = 0, set()
+    while not scan.budget.reasons:
+        page = scan.call("list_variable_groups", project_id=project_id,
+                         body={"offset": offset, "limit": 100, "name": ""})
+        if page is None:
+            return
+        groups = page.get("pipeline_variable_groups") or []
+        for group in groups:
+            if not scan.resource():
+                return
+            group_id = group.get("id")
+            if not group_id or group_id in seen:
+                scan.budget.stop("pagination_stalled")
+                return
+            seen.add(group_id)
+            detail = scan.call("show_variable_group_detail", project_id=project_id, id=group_id)
+            if detail is None:
+                continue
+            visible = {}
+            has_private = False
+            for variable in detail.get("variables") or []:
+                name = variable.get("name")
+                if not name:
+                    continue
+                if variable.get("is_secret") is True:
+                    has_private = True
+                elif variable.get("is_secret") is False and variable.get("value") is not None:
+                    visible[name] = variable["value"]
+                else:
+                    has_private = True
+            resource = f"{project_id}/{group_id}"
+            if has_private:
+                scan.uninspected(resource, "private_or_masked_pipeline_variables")
+            scan.emit(visible, resource, "codearts_pipeline_variable_group")
+        offset += len(groups)
+        total = page.get("total")
+        if not groups or (total is not None and offset >= total):
+            return
+
+
+def _modelarts(scan):
+    """Inspect retrievable ModelArts training-job environment settings."""
+    offset, seen = 0, set()
+    while not scan.budget.reasons:
+        page = scan.call("list_training_jobs", body={"offset": offset, "limit": 100})
+        if page is None:
+            return
+        items = page.get("items") or []
+        for item in items:
+            metadata = item.get("metadata") or {}
+            job_id = metadata.get("id")
+            if not job_id:
+                scan.uninspected("unknown", "training_job_id_not_returned")
+                continue
+            if job_id in seen:
+                scan.budget.stop("pagination_stalled")
+                return
+            seen.add(job_id)
+            if not scan.resource():
+                return
+            detail = scan.call("show_training_job_details", training_job_id=job_id)
+            if detail is None:
+                continue
+            spec = detail.get("spec") or {}
+            envs = spec.get("environments") or []
+            if isinstance(envs, list):
+                for index, env in enumerate(envs):
+                    if isinstance(env, dict):
+                        scan.emit(env, f"{job_id}/environment/{index}", "modelarts_training_environment")
+            elif isinstance(envs, dict):
+                scan.emit(envs, job_id, "modelarts_training_environment")
+            else:
+                scan.uninspected(job_id, "unrecognized_training_environment_shape")
+        offset += len(items)
+        total = page.get("total")
+        if not items or (total is not None and offset >= total) or len(items) < 100:
+            break
+
+    # ModelArts real-time deployment unit environments and startup commands
+    # are also returned by the management API, independently of training jobs.
+    offset, seen_services = 0, set()
+    while not scan.budget.reasons:
+        page = scan.call("list_infer_services", limit=100, offset=offset)
+        if page is None:
+            return
+        services = page.get("data") or []
+        for service in services:
+            service_id = service.get("id")
+            if not service_id or service_id in seen_services:
+                continue
+            seen_services.add(service_id)
+            deployment_offset, seen_deployments = 0, set()
+            while not scan.budget.reasons:
+                deployments = scan.call("list_infer_deployments", service_id=service_id,
+                                        limit=100, offset=deployment_offset)
+                if deployments is None:
+                    break
+                deployment_items = deployments.get("data") or []
+                for deployment in deployment_items:
+                    deployment_id = deployment.get("id")
+                    if not deployment_id or deployment_id in seen_deployments:
+                        continue
+                    seen_deployments.add(deployment_id)
+                    if not scan.resource():
+                        return
+                    detail = scan.call("show_infer_deployment", service_id=service_id,
+                                       deployment_id=deployment_id)
+                    if detail is None:
+                        continue
+                    for unit in detail.get("unit_configs") or []:
+                        if unit.get("envs"):
+                            scan.emit(unit["envs"], f"{service_id}/{deployment_id}/{unit.get('name', '?')}",
+                                      "modelarts_inference_environment")
+                        if unit.get("cmd"):
+                            scan.emit(unit["cmd"], f"{service_id}/{deployment_id}/{unit.get('name', '?')}",
+                                      "modelarts_inference_command")
+                deployment_offset += len(deployment_items)
+                total_deployments = deployments.get("total")
+                if (not deployment_items or (total_deployments is not None
+                        and deployment_offset >= total_deployments) or len(deployment_items) < 100):
+                    break
+        offset += len(services)
+        total_services = page.get("total")
+        if not services or (total_services is not None and offset >= total_services) or len(services) < 100:
+            return
+
+
+def _servicestage(scan):
+    """Inspect ServiceStage application, environment, and component variables."""
+    offset = 0
+    envs = []
+    while not scan.budget.reasons:
+        page = scan.call("show_environments", limit=100, offset=offset)
+        if page is None:
+            return
+        items = page.get("environments") or []
+        envs.extend(items)
+        offset += len(items)
+        total = page.get("count")
+        if not items or (total is not None and offset >= total) or len(items) < 100:
+            break
+    offset = 0
+    applications = []
+    while not scan.budget.reasons:
+        page = scan.call("show_applications", limit=100, offset=offset)
+        if page is None:
+            return
+        items = page.get("applications") or []
+        applications.extend(items)
+        offset += len(items)
+        total = page.get("count")
+        if not items or (total is not None and offset >= total) or len(items) < 100:
+            break
+    for app in applications:
+        app_id = app.get("id")
+        if not app_id:
+            continue
+        for env in envs:
+            env_id = env.get("id")
+            if not env_id:
+                continue
+            if not scan.resource():
+                return
+            config = scan.call("show_application_configuration", application_id=app_id,
+                               environment_id=env_id)
+            if config is None:
+                continue
+            values = config.get("configuration") or []
+            for entry in values:
+                if isinstance(entry, dict):
+                    scan.emit(entry, f"{app_id}/{env_id}", "servicestage_application_environment")
+            component_offset = 0
+            while not scan.budget.reasons:
+                components = scan.call("show_components_in_application", application_id=app_id,
+                                       limit=100, offset=component_offset)
+                if components is None:
+                    break
+                records = components.get("components") or []
+                for component in records:
+                    component_id = component.get("id")
+                    if not component_id:
+                        continue
+                    if not scan.resource():
+                        return
+                    detail = scan.call("show_component_info", application_id=app_id,
+                                       component_id=component_id, expect_fields="envs,command")
+                    if detail is None:
+                        continue
+                    if detail.get("envs"):
+                        scan.emit(detail["envs"], f"{app_id}/{component_id}",
+                                  "servicestage_component_environment")
+                    if detail.get("command"):
+                        scan.emit(detail["command"], f"{app_id}/{component_id}",
+                                  "servicestage_component_command")
+                component_offset += len(records)
+                total = components.get("count")
+                if not records or (total is not None and component_offset >= total) or len(records) < 100:
+                    break
+
+
+def _dataartsstudio(scan):
+    """Inspect workspace variables and retrievable connection configuration."""
+    offset = 0
+    workspaces = []
+    while not scan.budget.reasons:
+        page = scan.call("list_workspaces", x_project_id=scan.services.config.project_id,
+                         limit=100, offset=offset)
+        if page is None:
+            return
+        data = page.get("data") or {}
+        result = data.get("value") or {}
+        items = result.get("records") or []
+        workspaces.extend(items)
+        offset += len(items)
+        total = result.get("total")
+        if not items or (total is not None and offset >= total) or len(items) < 100:
+            break
+    for workspace in workspaces:
+        workspace_id = workspace.get("id")
+        if not workspace_id:
+            continue
+        if not scan.resource():
+            return
+        env = scan.call("show_factory_env", workspace=workspace_id)
+        if env is not None and env.get("params"):
+            scan.emit(env["params"], workspace_id, "dataarts_workspace_environment")
+        offset = 0
+        while not scan.budget.reasons:
+            page = scan.call("list_dataconnections", workspace=workspace_id,
+                             limit="100", offset=str(offset))
+            if page is None:
+                break
+            connections = page.get("data_connection_lists") or []
+            for connection in connections:
+                connection_id = connection.get("dw_id")
+                if not connection_id:
+                    continue
+                if not scan.resource():
+                    return
+                detail = scan.call("show_dataconnection", workspace=workspace_id,
+                                   data_connection_id=connection_id)
+                if detail is not None and detail.get("dw_config"):
+                    scan.emit(detail["dw_config"], f"{workspace_id}/{connection_id}",
+                              "dataarts_connection_configuration")
+            offset += len(connections)
+            total = page.get("total_size")
+            if not connections or (total is not None and offset >= total) or len(connections) < 100:
+                break
+
+
+def _cci(scan):
+    """Inventory readable CCI Secret objects by hashes, never findings/raw values."""
+    try:
+        if not scan.budget.request():
+            return
+        namespaces = scan.services.cci_call("/apis/cci/v2/namespaces")
+    except API_ERRORS as exc:
+        scan.result.add_error(str(exc))
+        return
+    for namespace_obj in namespaces.get("items") or []:
+        namespace = (namespace_obj.get("metadata") or {}).get("name")
+        if not namespace:
+            continue
+        if not scan.resource():
+            return
+        token, seen = None, set()
+        while not scan.budget.reasons:
+            try:
+                if not scan.budget.request():
+                    return
+                page = scan.services.cci_call(
+                    f"/apis/cci/v2/namespaces/{namespace}/secrets",
+                    params={"limit": 100, "continue": token},
+                )
+            except API_ERRORS as exc:
+                scan.result.add_error(str(exc))
+                break
+            for secret in page.get("items") or []:
+                metadata = secret.get("metadata") or {}
+                secret_name = metadata.get("name")
+                if not secret_name:
+                    continue
+                if not scan.resource():
+                    return
+                data = secret.get("data") or {}
+                hashes = {}
+                for key, encoded in data.items():
+                    if not isinstance(encoded, str):
+                        scan.uninspected(f"{namespace}/{secret_name}", "non_string_secret_value")
+                        continue
+                    try:
+                        decoded = base64.b64decode(encoded, validate=True)
+                    except (ValueError, binascii.Error):
+                        scan.uninspected(f"{namespace}/{secret_name}", "invalid_base64_secret_value")
+                        continue
+                    if len(decoded) > scan.budget.max_bytes - scan.budget.bytes_reserved:
+                        scan.budget.stop("max_bytes")
+                        return
+                    scan.budget.bytes_reserved += len(decoded)
+                    scan.budget.bytes_read += len(decoded)
+                    hashes[key] = hashlib.sha256(decoded).hexdigest()
+                scan.result.details["inventory"].append({
+                    **scan.source(f"{namespace}/{secret_name}", "cci_secret"),
+                    "type": secret.get("type"), "keys": hashes,
+                    "assessment": "intended_secret_storage",
+                })
+                scan.budget.scanned += 1
+            metadata = page.get("metadata") or {}
+            next_token = metadata.get("_continue") or metadata.get("continue")
+            if not next_token:
+                break
+            if next_token in seen:
+                scan.budget.stop("pagination_stalled")
+                return
+            seen.add(next_token)
+            token = next_token
+        if scan.budget.reasons:
+            return
+        for resource_name in ("pods", "deployments"):
+            token, seen = None, set()
+            while not scan.budget.reasons:
+                try:
+                    if not scan.budget.request():
+                        return
+                    page = scan.services.cci_call(
+                        f"/apis/cci/v2/namespaces/{namespace}/{resource_name}",
+                        params={"limit": 100, "continue": token},
+                    )
+                except API_ERRORS as exc:
+                    scan.result.add_error(str(exc))
+                    break
+                for workload in page.get("items") or []:
+                    metadata = workload.get("metadata") or {}
+                    name = metadata.get("name", "unknown")
+                    if not scan.resource():
+                        return
+                    spec = workload.get("spec") or {}
+                    if resource_name == "deployments":
+                        spec = ((spec.get("template") or {}).get("spec") or {})
+                    exposed, references = {}, False
+                    for container in (spec.get("initContainers") or []) + (spec.get("containers") or []):
+                        envs = container.get("env") or []
+                        for env in envs:
+                            key = env.get("name")
+                            if not key:
+                                continue
+                            if "value" in env:
+                                exposed[key] = env["value"]
+                            elif env.get("valueFrom"):
+                                references = True
+                        for field in ("command", "args"):
+                            values = container.get(field)
+                            if values:
+                                exposed[f"{container.get('name', 'container')}.{field}"] = values
+                    resource_id = f"{namespace}/{name}"
+                    if references:
+                        scan.uninspected(resource_id, "workload_secret_references_not_resolved")
+                    if exposed:
+                        scan.emit(exposed, resource_id, f"cci_{resource_name[:-1]}_configuration")
+                metadata = page.get("metadata") or {}
+                next_token = metadata.get("_continue") or metadata.get("continue")
+                if not next_token:
+                    break
+                if next_token in seen:
+                    scan.budget.stop("pagination_stalled")
+                    return
+                seen.add(next_token)
+                token = next_token
+
+
 def _obs(scan, targets, max_objects, max_object_bytes):
     seen_objects = set()
     for target in targets:
@@ -331,7 +709,7 @@ def validate_scan_options(*, include=None, scan_obs=None, scan_lts=None, scan_cs
                           scan_k8s_secrets=False, **options):
     """Shared validation, including before a multi-profile login starts."""
     selected = list(CONFIG_SCANNERS) if include is None else _targets(include, "include")
-    if set(selected) - {*CONFIG_SCANNERS, "cce"}:
+    if set(selected) - {*CONFIG_SCANNERS, "cce", "cci"}:
         raise ValueError("Unknown Huawei configuration scanner")
     obs, lts, csms = (_targets(scan_obs, "scan_obs"), _targets(scan_lts, "scan_lts"),
                       _targets(scan_csms, "scan_csms"))
@@ -373,8 +751,9 @@ class HuaweiIRHunt:
     ):
         """One Huawei region/project. Content and secret-store access are opt-in.
 
-        include defaults to FunctionGraph, ECS user data and CAE. Add ``cce``
-        with an authenticated K8sServiceRegistry for the selected CCE cluster.
+        include defaults to FunctionGraph, ECS user data, CAE, and readable
+        CodeArts Pipeline parameter groups. Add ``cce`` with an authenticated
+        K8sServiceRegistry for the selected CCE cluster.
         CSMS values and Kubernetes Secrets are inventory, not exposure findings.
         Budgets apply per scanner across its targets; time is checked between
         requests (an in-flight request can take the configured SDK timeout).
@@ -390,7 +769,10 @@ class HuaweiIRHunt:
         result = OperationResult("hunt_exposed_secrets", self.services.config.region_name, True,
                                  {"findings": [], "inventory": [], "uninspected": [], "scanners": {}})
         bucket = _SecretBucket(keep_raw=keep_raw)
-        tasks = [(name, {"functiongraph": _functiongraph, "ecs_user_data": _ecs, "cae": _cae}.get(name))
+        tasks = [(name, {"functiongraph": _functiongraph, "ecs_user_data": _ecs,
+                         "cae": _cae, "codearts": _codearts, "modelarts": _modelarts,
+                         "servicestage": _servicestage, "dataartsstudio": _dataartsstudio,
+                         "cci": _cci}.get(name))
                  for name in selected]
         if obs:
             tasks.append(("obs", lambda scan: _obs(scan, obs, obs_max_objects, obs_max_object_bytes)))
@@ -406,6 +788,8 @@ class HuaweiIRHunt:
             if name == "cce":
                 from ..k8s_ir.secret_sources import scan_cluster
                 scan_cluster(k8s_services, scan, k8s_namespace, scan_k8s_secrets)
+            elif name == "cci":
+                _cci(scan)
             else:
                 scanner(scan)
             result.details["scanners"][name] = {**budget.summary(), "errors": len(result.errors) - before}

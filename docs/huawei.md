@@ -36,10 +36,13 @@ dredge huawei hunt exposed-secrets
 ```
 
 Use `--simple` for a compact result with success/completeness, redacted
-findings, and their locations. `--check-permissions` reports services where
-the selected scan received an access-denied response. This is based on the
-read-only calls made by that scan and does not prove permissions for APIs it
-did not call.
+findings, and their locations. `--check-permissions` runs read-only list API
+probes and skips the secret scan. It checks access to the default configuration
+services (FunctionGraph, ECS, CAE, CodeArts Pipeline, ModelArts, ServiceStage,
+and DataArts Studio) and reports denied service actions. The probes do
+not fetch resource configurations, so they cannot verify detail-read actions;
+when a normal scan encounters a 403 on one of those calls, the error output
+also names the denied action.
 
 ```bash
 dredge huawei hunt exposed-secrets --simple --check-permissions
@@ -194,13 +197,47 @@ models; it has not been tested against a live Huawei Identity Center tenant.
 | `functiongraph` | Yes | Readable environment variables from function configuration |
 | `ecs_user_data` | Yes | Base64-decoded, UTF-8 ECS user data |
 | `cae` | Yes | Environment values in the latest effective component configuration |
+| `codearts` | Yes | Readable non-private variables in CodeArts Pipeline parameter groups |
+| `modelarts` | Yes | Training job and inference deployment environment variables/commands |
+| `servicestage` | Yes | Application/environment variables and component environment/command configuration |
+| `dataartsstudio` | Yes | Workspace environment variables and API-readable DataArts connection configuration |
+| CCI | Explicit `--include cci` | Pod/deployment environment and commands; Secret objects are hash-only inventory |
 | `cce` | Explicit `--include cce` | Pod/workload environment values and commands; ConfigMap text |
 | OBS | Explicit `--scan-obs` | Small UTF-8 objects beneath a nonempty prefix |
 | LTS | Explicit `--scan-lts` | Log messages in specified streams and a time window |
 | CSMS | Explicit `--scan-csms` | Hash inventory of a named secret's latest version |
 | Kubernetes Secrets | Explicit `--scan-k8s-secrets` with CCE | Hash inventory of decoded text values |
 
-Select configuration sources with `--include functiongraph ecs_user_data cae`.
+The default scans all seven supported configuration sources. Select one or more
+with `--include`; specifying it replaces the default set. CodeArts variables
+marked private are not emitted or inspected and are reported as uninspected.
+CodeArts access is project-scoped and requires the CodeArts Pipeline SDK, included
+in `dredge-ir[huawei]`.
+
+ModelArts, ServiceStage, and DataArts Studio scanners use their official Huawei
+SDKs, included in the same extra. DataArts connection records are scanned only
+when the API returns their configuration fields. Customer-owned data store
+contents (database rows, object contents, logs, backups, and similar payloads)
+remain outside automatic discovery; use explicit OBS/LTS targets for those
+content scans. Secret references are not dereferenced, and encrypted or masked
+values can remain unavailable to the API caller.
+CCI has no generated Python SDK in the Huawei SDK distribution, so Dredge uses
+the documented read-only CCI v2 API with Huawei request signing. Secret contents
+are hashed in memory and never written into findings or inventory. CCI scanning
+is opt-in because the list API returns secret values. Permission-only mode does
+not call the CCI Secret list API, since doing so would retrieve those values.
+
+```bash
+# Run every default configuration scanner
+dredge huawei hunt exposed-secrets
+
+# Run only FunctionGraph and CodeArts
+dredge huawei hunt exposed-secrets --include functiongraph codearts
+
+# Add targeted OBS content to the same configuration scan
+dredge huawei hunt exposed-secrets --scan-obs obs://audit-bucket/application/config/
+```
+
 CAE defaults to enterprise project `0`; select another with the global flag
 `--huawei-enterprise-project-id`. Secret references are not resolved automatically.
 Encrypted/masked fields, missing ECS user data, and skipped object content are

@@ -22,6 +22,9 @@ from dredge.k8s_ir.config import K8sAuthConfig
 from importlib.metadata import version, PackageNotFoundError
 # ------------- helpers -------------
 
+_SIMPLE_OUTPUT = False
+_CHECK_PERMISSIONS_OUTPUT = False
+
 
 def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
     if not value:
@@ -53,6 +56,16 @@ def print_result(result, output: str = "json") -> None:
     except TypeError:
         data = result
 
+    if _CHECK_PERMISSIONS_OUTPUT and isinstance(data, dict):
+        data = _with_permission_summary(data)
+        data = _permission_only_result(data)
+        if _SIMPLE_OUTPUT:
+            data = _compact_result(data)
+            print(json.dumps(data, indent=2, default=str))
+            return
+    elif _SIMPLE_OUTPUT and isinstance(data, dict):
+        data = _compact_result(data)
+
     if output == "json":
         print(json.dumps(data, indent=2, default=str))
         return
@@ -62,15 +75,37 @@ def print_result(result, output: str = "json") -> None:
         details = data.get("details", {}) if isinstance(data, dict) else {}
         events = None
 
-        # Common hunt payload keys
-        for key in ("events", "entries", "results"):
+        # Common hunt and review payload keys. Reviews expose their tabular
+        # records as `findings`, so omitting that key silently fell through to
+        # JSON even when the caller explicitly requested CSV.
+        for key in ("events", "entries", "results", "findings"):
             if isinstance(details.get(key), list):
                 events = details[key]
                 break
 
-        # If we don't have a sensible list, fall back to JSON
+        # Keep the requested format even for operations without a list payload.
+        # Emit one summary row instead of unexpectedly switching to JSON.
+        if events is None:
+            events = [{k: v for k, v in data.items() if k != "details"}]
+            if details:
+                events[0].update({k: v for k, v in details.items()
+                                  if not isinstance(v, (dict, list))})
+
+        # Include status columns for empty findings/results too.
         if not events:
-            print(json.dumps(data, indent=2, default=str))
+            events = [{k: v for k, v in data.items() if k != "details"}]
+            if details:
+                events[0].update({k: v for k, v in details.items()
+                                  if not isinstance(v, (dict, list))})
+
+        if events and not any(isinstance(ev, dict) for ev in events):
+            events = [{"value": ev} for ev in events]
+
+        if not events:
+            # Should be unreachable, but do not violate the requested format.
+            writer = csv.DictWriter(sys.stdout, fieldnames=["result"])
+            writer.writeheader()
+            writer.writerow({"result": ""})
             return
 
         # Collect all fieldnames across events
@@ -94,6 +129,92 @@ def print_result(result, output: str = "json") -> None:
 
     # Fallback if an unknown output format sneaks in
     print(json.dumps(data, indent=2, default=str))
+
+
+def _collect_error_strings(value):
+    found = []
+    if isinstance(value, str):
+        found.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            found.extend(_collect_error_strings(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.extend(_collect_error_strings(item))
+    return found
+
+
+def _with_permission_summary(data: dict) -> dict:
+    """Add a best-effort permission summary to any OperationResult payload."""
+    details = data.get("details", {}) if isinstance(data.get("details"), dict) else {}
+    errors = (list(data.get("errors", []))
+              + _collect_error_strings(details.get("checks", {}))
+              + _collect_error_strings(details.get("permission_checks", []))
+              + _collect_error_strings(details.get("profiles", {})))
+    denied = [error for error in errors if re.search(
+        r"access.?denied|unauthorized|forbidden|\b403\b|not.?authorized|permission.?denied|\bdenied\b",
+        error, re.I,
+    )]
+    services = set()
+    for error in denied:
+        match = re.search(
+            r"\b(lambda|ecs|ssm|ec2|codebuild|codearts|elasticbeanstalk|apprunner|batch|glue|amplify|s3|cloudwatch|functiongraph|cae|obs|lts|csms|iam|cce|github|rds|vpc|evs|cts|hss|secmaster|k8s)\b",
+            error, re.I,
+        )
+        if match:
+            services.add(match.group(1).lower())
+    details["permission_check"] = {
+        "status": "access_denied" if denied else "no_denials_observed",
+        "services_needing_access": sorted(services),
+        "message": ("You need extra permissions to access: " + ", ".join(sorted(services))) if services else
+                   ("Access was denied, but the affected service could not be identified." if denied else
+                    "No access-denied responses were observed in this command's API calls."),
+        "scope": "only APIs called by this command; not a complete policy simulation",
+    }
+    data["details"] = details
+    return data
+
+
+def _permission_only_result(data: dict) -> dict:
+    """Remove command findings and retain only access-check outcomes/errors."""
+    details = data.get("details", {}) if isinstance(data.get("details"), dict) else {}
+    compact_details = {"permission_check": details.get("permission_check", {})}
+    for key in ("permission_checks", "checks", "profiles"):
+        if key in details:
+            compact_details[key] = details[key]
+    return {
+        "operation": data.get("operation"),
+        "target": data.get("target"),
+        "success": data.get("success", True),
+        "errors": data.get("errors", []),
+        "details": compact_details,
+    }
+
+
+def _compact_result(data: dict) -> dict:
+    """Keep status, findings, counts and actionable errors in simple output."""
+    details = data.get("details", {}) if isinstance(data.get("details"), dict) else {}
+    compact = {key: data[key] for key in ("operation", "target", "success", "errors") if key in data}
+    compact["complete"] = details.get("complete", bool(data.get("success") and not data.get("errors")))
+    for key in ("summary", "total_findings", "permission_check", "permission_checks"):
+        if key in details:
+            compact[key] = details[key]
+    findings = details.get("findings")
+    if isinstance(findings, list):
+        compact["findings"] = [
+            {key: finding[key] for key in (
+                "check_id", "service", "tier", "severity", "title", "category", "redacted_value",
+                "resource_type", "resource_id", "region", "profile", "account_id", "project_id",
+                "sources", "recommendation",
+            ) if key in finding}
+            for finding in findings if isinstance(finding, dict)
+        ]
+    elif "credentials" in details:
+        compact["findings"] = details["credentials"]
+    for key, value in details.get("checks", {}).items() if isinstance(details.get("checks"), dict) else []:
+        if value.get("status") in {"failed", "partial"}:
+            compact.setdefault("failed_checks", {})[key] = value
+    return compact
 
 
 def _simple_secret_result(result, *, provider: str, permission_check: bool = False) -> dict:
@@ -136,6 +257,8 @@ def _simple_secret_result(result, *, provider: str, permission_check: bool = Fal
                                     and not details.get("scan_errors"))),
         "findings": findings,
     }
+    if details.get("permission_checks") is not None:
+        summary["permission_checks"] = details["permission_checks"]
     if not summary["success"] and data.get("errors"):
         summary["errors"] = data["errors"]
     if permission_check:
@@ -151,12 +274,13 @@ def _simple_secret_result(result, *, provider: str, permission_check: bool = Fal
         collect(details.get("scan_errors", []))
         collect(details.get("profiles", {}))
         collect(details.get("scopes", []))
+        collect(details.get("permission_checks", []))
         denied = [e for e in errors if re.search(
-            r"access.?denied|unauthorized|forbidden|\b403\b|not.?authorized|permission.?denied", e, re.I,
+            r"access.?denied|unauthorized|forbidden|\b403\b|not.?authorized|permission.?denied|\bdenied\b", e, re.I,
         )]
         services = set()
         for error in denied:
-            match = re.search(r"\b(lambda|ecs|ssm|ec2|codebuild|elasticbeanstalk|apprunner|batch|glue|amplify|s3|cloudwatch|functiongraph|cae|obs|lts|csms|iam|cce|github)\b", error, re.I)
+            match = re.search(r"\b(lambda|ecs|ssm|ec2|codebuild|codearts|codeartspipeline|elasticbeanstalk|apprunner|batch|glue|amplify|s3|cloudwatch|functiongraph|cae|obs|lts|csms|iam|cce|github)\b", error, re.I)
             if match:
                 services.add(match.group(1).lower())
         summary["permission_check"] = {
@@ -170,12 +294,21 @@ def _simple_secret_result(result, *, provider: str, permission_check: bool = Fal
 
 
 def print_simple_secret_result(result, *, provider: str, permission_check: bool = False) -> None:
-    print(json.dumps(_simple_secret_result(result, provider=provider, permission_check=permission_check), indent=2, default=str))
+    data = _simple_secret_result(result, provider=provider,
+                                 permission_check=permission_check or _CHECK_PERMISSIONS_OUTPUT)
+    if _CHECK_PERMISSIONS_OUTPUT:
+        data["findings"] = []
+        data.pop("complete", None)
+        data.pop("errors", None) if data.get("success") else None
+    print(json.dumps(data, indent=2, default=str))
 
 
 def print_table(headers: tuple, rows: list) -> None:
     """Print a simple space-aligned table. Falls back to a plain message
     when there are no rows."""
+    if _SIMPLE_OUTPUT:
+        print(json.dumps({"success": True, "count": len(rows), "items": rows}, indent=2, default=str))
+        return
     if not rows:
         print("(no results)")
         return
@@ -187,6 +320,33 @@ def print_table(headers: tuple, rows: list) -> None:
     print("    ".join(str(h).ljust(w) for h, w in zip(headers, widths)))
     for row in rows:
         print("    ".join(str(c).ljust(w) for c, w in zip(row, widths)))
+
+
+def print_review_table(result) -> None:
+    """Render posture findings as grouped, readable terminal rows."""
+    try:
+        data = asdict(result)
+    except TypeError:
+        data = result
+    details = data.get("details", {}) if isinstance(data, dict) else {}
+    findings = details.get("findings", []) if isinstance(details, dict) else []
+    headers = ("account", "service", "severity", "region", "finding",
+               "amount of findings", "recommendation")
+    grouped = {}
+    for item in findings or []:
+        if not isinstance(item, dict):
+            continue
+        row = (
+            item.get("account_id") or item.get("profile") or "-",
+            item.get("service") or "-",
+            item.get("severity") or "-",
+            item.get("region") or "-",
+            item.get("title") or item.get("check_id") or "-",
+            item.get("recommendation") or "-",
+        )
+        grouped[row] = grouped.get(row, 0) + 1
+    rows = [(*values[:5], count, values[5]) for values, count in grouped.items()]
+    print_table(headers, rows)
 
 
 # Column order for the incident report CSV — severity first so the report
@@ -726,6 +886,7 @@ def handle_aws_review(args: argparse.Namespace) -> None:
     review_options = dict(
         services=services,
         tiers=tiers,
+        check_permissions=bool(args.check_permissions),
         incident_start=parse_iso_datetime(getattr(args, "incident_start", None)),
         ips=_flatten_csv(getattr(args, "ip", None)) or None,
         include=_flatten_csv(getattr(args, "include", None)) or None,
@@ -752,7 +913,11 @@ def handle_aws_review(args: argparse.Namespace) -> None:
         AwsIRReview.to_html(res, args.html)
         print(f"wrote HTML: {args.html}", file=sys.stderr)
 
-    print_result(res, output=getattr(args, "output", "json"))
+    output = getattr(args, "output", "json")
+    if output == "table":
+        print_review_table(res)
+    else:
+        print_result(res, output=output)
 
 
 def handle_aws_delete_mfa_devices(args: argparse.Namespace) -> None:
@@ -1296,7 +1461,11 @@ def handle_huawei_review(args: argparse.Namespace) -> None:
         HuaweiIRReview.to_csv(result, args.csv)
     if args.html:
         HuaweiIRReview.to_html(result, args.html)
-    print_result(result, output=getattr(args, "output", "json"))
+    output = getattr(args, "output", "json")
+    if output == "table":
+        print_review_table(result)
+    else:
+        print_result(result, output=output)
 
 
 def handle_huawei_hunt_exposed_secrets(args: argparse.Namespace) -> None:
@@ -1307,6 +1476,22 @@ def handle_huawei_hunt_exposed_secrets(args: argparse.Namespace) -> None:
 
     if args.content_only and args.include:
         raise ValueError("--content-only cannot be combined with --include")
+    if args.check_permissions:
+        from dredge.huawei_ir.secret_sweep import check_exposed_secrets_permissions_multi_profile
+        if (args.scan_obs or args.scan_lts or args.scan_csms or args.scan_k8s_secrets or args.unredacted
+                or set(args.include or []) & {"cce", "cci"}):
+            raise ValueError("Permission-only checks support default Huawei scanners; OBS/LTS/CSMS/CCE/CCI require separate checks")
+        result = check_exposed_secrets_permissions_multi_profile(
+            profiles=args.huawei_profile, regions=args.huawei_region, project_id=args.huawei_project_id,
+            profile_source=args.huawei_profile_source, sso_login=args.sso_login, max_workers=args.max_workers,
+            timeout=args.huawei_timeout, enterprise_project_id=args.huawei_enterprise_project_id,
+            include=args.include,
+        )
+        if args.simple:
+            print_simple_secret_result(result, provider="huawei")
+        else:
+            print_result(result)
+        return
     if args.content_only and not (args.scan_obs or args.scan_lts or args.scan_csms):
         raise ValueError("--content-only requires --scan-obs, --scan-lts, or --scan-csms")
     sweep = (args.huawei_profile == "all" or args.huawei_region == "all" or args.huawei_project_id == "all"
@@ -2005,13 +2190,16 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--min-log-retention-days", type=int, default=30)
         p.add_argument("--csv", metavar="PATH", help="Write findings as CSV")
         p.add_argument("--html", metavar="PATH", help="Write a self-contained findings and coverage report")
+        p.add_argument("--output", choices=["json", "csv", "table"], default="json",
+                       help="Format written to stdout")
         p.set_defaults(func=handle_huawei_review, review_service=service)
 
     p = subparsers.command("huawei", "hunt", "exposed-secrets", help="Scan Huawei configurations and targeted OBS/LTS content for secrets")
     p.add_argument("--sso-login", action="store_true", help="Authorize missing/expired Huawei Identity Center sessions using a device code")
     p.add_argument("--max-workers", type=int, default=4, help="Concurrent Huawei account/agency scans, 1–32 (default: 4)")
-    p.add_argument("--include", nargs="+", choices=["functiongraph", "ecs_user_data", "cae", "cce"],
-                   help="Default: functiongraph ecs_user_data cae; CCE requires explicit Kubernetes auth")
+    p.add_argument("--include", nargs="+", choices=["functiongraph", "ecs_user_data", "cae", "codearts",
+                   "modelarts", "servicestage", "dataartsstudio", "cci", "cce"],
+                   help="Default: all seven Huawei API configuration scanners; CCE requires explicit Kubernetes auth")
     p.add_argument("--content-only", action="store_true", help="Skip configuration scans")
     p.add_argument("--scan-obs", action="append", metavar="obs://BUCKET/PREFIX", help="Targeted object prefix; repeatable")
     p.add_argument("--scan-lts", action="append", metavar="GROUP_ID/STREAM_ID", help="Targeted log stream; repeatable")
@@ -2029,7 +2217,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unredacted", metavar="NEW_FILE", help="Write raw exposure values to a new mode-0600 file")
     p.add_argument("--simple", action="store_true", help="Print only success, completeness, findings, and source locations")
     p.add_argument("--check-permissions", action="store_true",
-                   help="Report services where this scan received an access-denied response")
+                   help="Check read-only list API access only; skip secret scanning")
     p.set_defaults(func=handle_huawei_hunt_exposed_secrets)
 
     # --- AWS response subcommands ---
@@ -2742,8 +2930,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "concurrent profiles (1-32), with serial regions per profile")
         pp.add_argument("--sso-login", action="store_true",
                         help="Renew expired/missing SSO sessions through AWS CLI; browser/MFA approval may be required")
-        pp.add_argument("--output", choices=["json", "csv"], default="json",
-                        help="stdout format for the summary (--csv/--html files are separate)")
+        pp.add_argument("--output", choices=["json", "csv", "table"], default="json",
+                        help="stdout format for findings (--csv/--html files are separate)")
         if incident:
             pp.add_argument("--incident-start", default=None,
                             help="Incident start (ISO 8601). Enables the 'resources created since' check.")
@@ -3085,6 +3273,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", choices=["json", "csv"], default="json")
     p.set_defaults(func=handle_k8s_hunt_privileged_pods)
 
+    # These output/diagnostic flags are valid before or after any command path.
+    def add_mode_flags(current):
+        for option, dest, help_text in (
+            ("--simple", "simple", "Print a compact status/findings summary"),
+            ("--check-permissions", "check_permissions", "Report permission failures for this command"),
+        ):
+            existing = next((action for action in current._actions if option in action.option_strings), None)
+            if existing is None:
+                current.add_argument(option, dest=dest, action="store_true", default=argparse.SUPPRESS,
+                                     help=help_text)
+            else:
+                existing.default = argparse.SUPPRESS
+        for action in current._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for child in action.choices.values():
+                    add_mode_flags(child)
+
+    add_mode_flags(parser)
+
     # Used by the grouped `dredge -h` overview (_print_grouped_help).
     parser._dredge_commands = subparsers.commands
 
@@ -3113,10 +3320,21 @@ def compute_relative_range(weeks_ago: int = None, months_ago: int = None):
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    global _SIMPLE_OUTPUT, _CHECK_PERMISSIONS_OUTPUT
+    args.simple = bool(getattr(args, "simple", False))
+    args.check_permissions = bool(getattr(args, "check_permissions", False))
+    _SIMPLE_OUTPUT = args.simple
+    _CHECK_PERMISSIONS_OUTPUT = args.check_permissions
     func = getattr(args, "func", None)
     if func is None:  # pragma: no cover -- unreachable: every subparser sets func, and subparsers.add_subparsers(required=True) makes argparse itself raise SystemExit(2) before main() ever sees a commandless Namespace
         parser.print_help()
         raise SystemExit(1)
+    # Permission mode is read-only. Do not invoke response handlers or the
+    # Kubernetes exec command, which can mutate or execute workloads.
+    bucket = getattr(args, f"{getattr(args, 'provider', '')}_bucket", None)
+    command = getattr(args, f"{getattr(args, 'provider', '')}_{bucket}_command", None) if bucket else None
+    if args.check_permissions and (bucket == "response" or command == "exec-pod-command"):
+        parser.error("--check-permissions is available only for read-only commands")
     try:
         func(args)
     except ValueError as exc:

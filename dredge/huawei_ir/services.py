@@ -18,6 +18,10 @@ _SERVICES = {
     "functiongraph": ("v2", "FunctionGraph"),
     "ecs": ("v2", "Ecs"),
     "cae": ("v1", "Cae"),
+    "codeartspipeline": ("v2", "CodeArtsPipeline"),
+    "modelarts": ("v1", "ModelArts"),
+    "servicestage": ("v3", "ServiceStage"),
+    "dataartsstudio": ("v1", "DataArtsStudio"),
     "lts": ("v2", "Lts"),
     "csms": ("v1", "Csms"),
     "vpc": ("v3", "Vpc"),
@@ -51,6 +55,7 @@ class HuaweiServiceRegistry:
         self._refresh_client = None
         self._iam = None
         self._regional_obs = {}
+        self._cci_client = None
 
     def iam_call(self, operation, **params):
         from .profiles import IamDiscovery
@@ -93,6 +98,10 @@ class HuaweiServiceRegistry:
             client.with_credentials(credentials)
             if service == "lts" and isinstance(params.get("body"), dict):
                 params["body"] = module.QueryLtsLogParams(**params["body"])
+            if service == "codeartspipeline" and operation == "list_variable_groups" and isinstance(params.get("body"), dict):
+                params["body"] = module.ListVariableGroupsReq(**params["body"])
+            if service == "modelarts" and operation == "list_training_jobs" and isinstance(params.get("body"), dict):
+                params["body"] = module.JobSearches(**params["body"])
             request_class = "".join(part.capitalize() for part in operation.split("_")) + "Request"
             response = getattr(client, operation)(getattr(module, request_class)(**params))
             return _plain(response.to_dict())
@@ -141,6 +150,45 @@ class HuaweiServiceRegistry:
             raise HuaweiServiceError('Install Huawei support with pip install "dredge-ir[huawei]"') from None
         except Exception:
             raise HuaweiServiceError(f"obs.{operation} failed") from None
+
+    def cci_call(self, path, *, params=None):
+        """Call read-only CCI v2 APIs, which do not have a generated Python SDK."""
+        credentials = self.auth.get_credentials()
+        try:
+            from huaweicloudsdkcore.client import Client
+            from huaweicloudsdkcore.sdk_request import SdkRequest
+            from huaweicloudsdkcore.signer.signer import Signer
+            import requests
+
+            if self._refresh_client is None:
+                self._refresh_client = Client().with_config(self._http_config())
+                self._refresh_client.init_http_client()
+            credentials.process_sts(self._refresh_client.get_http_client())
+            if not credentials.ak or not credentials.sk:
+                raise HuaweiServiceError("Huawei credentials contain no AK/SK after refresh")
+            host = f"cci.{self.config.region_name}.myhuaweicloud.com"
+            query = [(key, value) for key, value in (params or {}).items() if value is not None]
+            headers = {"Accept": "application/json", "X-Project-Id": self.config.project_id}
+            if credentials.security_token:
+                headers["X-Security-Token"] = credentials.security_token
+            request = SdkRequest(method="GET", schema="https", host=host,
+                                 resource_path=path, query_params=query, header_params=headers)
+            signed = Signer(credentials).sign(request)
+            response = requests.get(f"https://{host}{signed.uri}", headers=signed.header_params,
+                                    timeout=self.config.timeout)
+            if response.status_code < 200 or response.status_code >= 300:
+                raise HuaweiServiceError(f"cci.get failed (HTTP {response.status_code})",
+                                         status=response.status_code)
+            try:
+                return response.json()
+            except ValueError:
+                raise HuaweiServiceError("cci.get returned invalid JSON") from None
+        except HuaweiServiceError:
+            raise
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            raise HuaweiServiceError(f"cci.get failed (HTTP {status or 'unavailable'})",
+                                     status=status) from None
 
     def close(self):
         for registry in self._regional_obs.values():

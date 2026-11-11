@@ -287,6 +287,20 @@ of every possible IAM permission.
 dredge aws hunt exposed-secrets --simple --check-permissions
 ```
 
+These two output/diagnostic flags are also accepted before or after any
+read-only command path. `--simple` returns a compact JSON summary. For review
+commands, `--check-permissions` runs the selected checks as permission probes
+and omits posture findings, for example:
+
+```bash
+dredge aws review ec2 --check-permissions --simple
+```
+
+For other read-only commands, permission reporting reflects access-denied
+responses from the APIs that command calls; it is not a full IAM policy
+simulation. Permission mode is rejected for response and Kubernetes exec
+commands because those can change or execute workloads.
+
 #### All configured profiles and enabled regions
 
 ```bash

@@ -63,6 +63,16 @@ _PEM_CERT_RE = re.compile(
 )
 
 
+def _policy_statements(document):
+    """Normalize IAM PolicyDocument Statement in either legal wire shape."""
+    statements = (document or {}).get("Statement", []) if isinstance(document, dict) else []
+    if isinstance(statements, dict):
+        return [statements]
+    if isinstance(statements, list):
+        return [item for item in statements if isinstance(item, dict)]
+    return []
+
+
 from ..secret_scanning import (
     _SecretBucket, _SecretDetector, _SECRET_DETECTORS, _hash_secret, _redact_secret, _detect_secret, _detect_aws_pair_in_bag, _emit_aws_pair, _emit_secret_bag, _emit_secret_text,
 )
@@ -1578,7 +1588,7 @@ class AwsIRHunt:
                             for pname in ip.get("PolicyNames", []):
                                 doc = iam.get_user_policy(UserName=name, PolicyName=pname)
                                 pd = doc.get("PolicyDocument", {})
-                                for stmt in pd.get("Statement", []):
+                                for stmt in _policy_statements(pd):
                                     if stmt.get("Effect") == "Allow" and stmt.get("Action") in ("*", ["*"]):
                                         is_admin = True
 
@@ -1601,7 +1611,7 @@ class AwsIRHunt:
                             for pname in ip.get("PolicyNames", []):
                                 doc = iam.get_role_policy(RoleName=name, PolicyName=pname)
                                 pd = doc.get("PolicyDocument", {})
-                                for stmt in pd.get("Statement", []):
+                                for stmt in _policy_statements(pd):
                                     if stmt.get("Effect") == "Allow" and stmt.get("Action") in ("*", ["*"]):
                                         is_admin = True
 

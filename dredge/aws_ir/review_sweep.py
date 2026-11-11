@@ -103,7 +103,7 @@ def review_multi_profile(
     options = _validate_options(review_options)
     auth, catalog, selected, regions = _prepare_profiles(auth, profiles, regions, max_workers)
     result = OperationResult("review_multi_profile", "configured AWS profiles", True, {
-        "findings": [], "summary": {}, "checks": {}, "profiles": {},
+        "findings": [], "summary": {}, "checks": {}, "profiles": {}, "permission_checks": [],
     })
     pending = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -121,7 +121,11 @@ def review_multi_profile(
                 record["errors"].append("profile review failed: " + _safe_error(exc))
                 continue
             record.update(success=outcome.success, checks=outcome.details.get("checks", {}),
-                          summary=outcome.details.get("summary", {}), meta=outcome.details.get("meta", {}))
+                  summary=outcome.details.get("summary", {}), meta=outcome.details.get("meta", {}),
+                  permission_checks=outcome.details.get("permission_checks", []))
+            result.details.setdefault("permission_checks", []).extend(
+                {"profile": label, "account_id": record.get("account_id"), **check}
+                for check in outcome.details.get("permission_checks", []))
             record["errors"].extend(outcome.errors)
             context = {key: record[key] for key in ("account_id", "principal_arn")}
             for finding in outcome.details.get("findings", []):
@@ -137,7 +141,17 @@ def review_multi_profile(
                         regional["success"] = False
     for label, record in result.details["profiles"].items():
         if not record["success"]:
-            result.add_error(f"Profile {label!r} was incomplete; see details.profiles")
+            specific = list(record.get("errors", []))
+            for check_id, check in record.get("checks", {}).items():
+                if check.get("error"):
+                    specific.append(f"{check_id}: {check['error']}")
+                for region, status in check.get("by_region", {}).items():
+                    if status.get("error"):
+                        specific.append(f"{check_id} ({region}): {status['error']}")
+            if specific:
+                result.add_error(f"Profile {label!r} was incomplete: " + "; ".join(dict.fromkeys(specific)))
+            else:
+                result.add_error(f"Profile {label!r} was incomplete; see details.profiles")
     result.details["profiles"] = dict(sorted(result.details["profiles"].items()))
     for check in result.details["checks"].values():
         states = [value["status"] for value in check["by_profile"].values()]
