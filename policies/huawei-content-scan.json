@@ -1,0 +1,15 @@
+{
+  "Version": "5.0",
+  "Statement": [
+    {
+      "Sid": "ReadTargetedContent",
+      "Effect": "Allow",
+      "Action": [
+        "obs:bucket:listBucket",
+        "obs:object:getObject",
+        "lts:logStream:searchLog"
+      ],
+      "Resource": ["*"]
+    }
+  ]
+}

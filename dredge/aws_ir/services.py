@@ -8,8 +8,9 @@ class AwsServiceRegistry:
     Central place to create and share boto3 clients/resources.
     """
 
-    def __init__(self, session: boto3.Session, region: str = None) -> None:
+    def __init__(self, session: boto3.Session, region: str = None, client_config=None) -> None:
         self._session = session
+        self._client_config = client_config
         # When set, every client this registry creates is bound to this region
         # (used for multi-region fan-out via .regional()). None = session default.
         self._region = region
@@ -53,12 +54,14 @@ class AwsServiceRegistry:
         bound region (if any) so .regional() registries hit the right endpoint."""
         if "region_name" not in kw and self._region:
             kw["region_name"] = self._region
+        if self._client_config is not None:
+            kw.setdefault("config", self._client_config)
         return self._session.client(name, **kw)
 
     def regional(self, region: str) -> "AwsServiceRegistry":
         """A fresh registry whose clients are all bound to `region` — used for
         multi-region fan-out (e.g. running regional review checks per region)."""
-        return AwsServiceRegistry(self._session, region=region)
+        return AwsServiceRegistry(self._session, region=region, client_config=self._client_config)
 
     @property
     def iam(self):

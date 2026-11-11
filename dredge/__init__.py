@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from .github_ir import GitHubIRNamespace
     from .gcp_ir import GcpIRNamespace
     from .k8s_ir import K8sIRNamespace
+    from .huawei_ir import HuaweiIRNamespace, HuaweiAuthConfig
 
 class Dredge:
     def __init__(
@@ -32,6 +33,7 @@ class Dredge:
         github_config: Optional["GitHubIRConfig"] = None,  # type: ignore[name-defined]
         gcp_config: Optional["GcpIRConfig"] = None,
         k8s_config: Optional["K8sAuthConfig"] = None,  # type: ignore[name-defined]
+        huawei_config: Optional["HuaweiAuthConfig"] = None,
     ) -> None:
         self.config = config or DredgeConfig(
             region_name=(auth.region_name if auth else None)
@@ -40,7 +42,10 @@ class Dredge:
         if session is not None and auth is not None:
             raise ValueError("Provide either 'session' or 'auth', not both.")
 
-        if session is not None:
+        if huawei_config is not None and session is None and auth is None:
+            # Huawei-only users need no AWS credentials or valid AWS profile.
+            self._session = None
+        elif session is not None:
             self._session = session
         else:
             auth_cfg = auth or AwsAuthConfig(region_name=self.config.region_name)
@@ -48,7 +53,7 @@ class Dredge:
             self._session = factory.get_session()
 
         # AWS IR namespace
-        self.aws_ir = AwsIRNamespace(self._session, self.config)
+        self._aws_ir = AwsIRNamespace(self._session, self.config) if self._session is not None else None
 
         # GitHub IR namespace (optional; only if config is provided) --
         # imported here, not at module top level, so a consumer that never
@@ -82,3 +87,19 @@ class Dredge:
             self.k8s_ir = K8sIRNamespace(k8s_config, self.config)
         else:
             self.k8s_ir = None
+
+        self.huawei_ir: Optional["HuaweiIRNamespace"]
+        if huawei_config is not None:
+            from .huawei_ir import HuaweiIRNamespace
+            self.huawei_ir = HuaweiIRNamespace(
+                huawei_config, k8s_services=self.k8s_ir._services if self.k8s_ir else None,
+            )
+        else:
+            self.huawei_ir = None
+
+    @property
+    def aws_ir(self) -> AwsIRNamespace:
+        if self._aws_ir is None:
+            self._session = AwsSessionFactory(AwsAuthConfig(region_name=self.config.region_name)).get_session()
+            self._aws_ir = AwsIRNamespace(self._session, self.config)
+        return self._aws_ir

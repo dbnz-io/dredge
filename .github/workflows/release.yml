@@ -55,8 +55,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install (with test extra)
-        run: pip install -e ".[test]"
+      - name: Install (with test and Huawei extras)
+        run: pip install -e ".[test,huawei]"
       - name: Run tests with coverage
         run: pytest --cov=dredge --cov-report=term-missing --cov-fail-under=80 -q
 

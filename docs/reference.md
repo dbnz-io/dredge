@@ -10,7 +10,25 @@ CLI itself. For a command's full options, run `dredge <provider> <bucket> <comma
 Library equivalents live under `d.<provider>_ir.<bucket>.<method>` and return an
 [`OperationResult`](library/README.md#operationresult). See the per-provider
 library pages: [AWS](library/aws.md) · [GitHub](library/github.md) ·
-[Kubernetes](library/kubernetes.md).
+[Kubernetes](library/kubernetes.md) · [Huawei Cloud](huawei.md).
+
+### Huawei Cloud — Review
+
+See the [assessment guide](huawei-review.md) for all 30 check IDs, coverage,
+permissions, limits, and library examples.
+
+| Command | Library method | Description |
+|---|---|---|
+| `dredge huawei review full --deep` | `d.huawei_ir.review.review(...)` | IAM, OBS, VPC, ECS, EVS, RDS, CCE, FunctionGraph, CTS, LTS, HSS, SecMaster, and recent-resource checks |
+| `dredge huawei review <service>` | `d.huawei_ir.review.review(services=[...])` | Both tiers for one service; CSV/HTML reports |
+| `dredge huawei --huawei-profile all --huawei-region all review full --deep --sso-login` | `dredge.huawei_ir.review_multi_profile(...)` | Global checks once per identity; regional checks across accessible projects |
+
+### Huawei Cloud — Hunt
+
+| Command | Library method | Description |
+|---|---|---|
+| `dredge huawei hunt exposed-secrets` | `d.huawei_ir.hunt.hunt_exposed_secrets(...)` | Configuration scanning, optional CCE, targeted OBS/LTS, and opt-in secret inventory |
+| `dredge huawei --huawei-profile all --huawei-region all hunt exposed-secrets --sso-login` | `dredge.huawei_ir.hunt_exposed_secrets_multi_profile(...)` | SSO/SDK profiles, assigned accounts/agencies, accessible regional projects, and partial-failure reporting |
 
 ### AWS — Review
 

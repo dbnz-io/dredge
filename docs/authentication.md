@@ -1,7 +1,10 @@
 # Authentication
 
 Auth is set with **global flags placed before the provider** on the CLI, or via
-config objects in the library. This page covers all four providers.
+config objects in the library. Huawei Cloud's AK/SK, temporary credentials,
+profiles, credential providers, and CCE access are documented in the
+[Huawei authentication guide](huawei.md#authentication), including
+[Identity Center SSO and multiple profiles](huawei.md#sso-and-multiple-profiles).
 
 ## AWS
 
@@ -17,6 +20,13 @@ assumption and MFA are supported on top of any of those.
 
 Region: `--aws-region` / `--region`, else `AWS_REGION` / `AWS_DEFAULT_REGION`,
 else the profile's configured region.
+
+AWS profile/region flags can also appear immediately after `aws`, before the
+bucket (`hunt`, etc.). The secret hunt and AWS posture reviews support
+[`--aws-profile all --aws-region all`](cli/aws.md#all-configured-profiles-and-enabled-regions)
+to authenticate each configured profile and scan its account's enabled regions.
+It reuses cached credentials; `--sso-login` can invoke AWS CLI login for expired
+SSO sessions, with any browser/MFA interaction still handled by the user.
 
 ```bash
 dredge --aws-profile ir --region us-east-1 aws hunt cloudtrail --today

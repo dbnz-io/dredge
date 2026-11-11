@@ -6,12 +6,12 @@ Dredge's CLI is nested by **provider → bucket → command**:
 dredge <provider> <bucket> <command> [options]
         │          │        │
         │          │        └─ e.g. cloudtrail, quarantine-pod, audit
-        │          └────────── hunt · response · forensics
-        └───────────────────── aws · k8s · github
+        │          └────────── review · hunt · response · forensics
+        └───────────────────── aws · k8s · github · huawei
 ```
 
-- **provider** — `aws`, `k8s`, `github`
-- **bucket** — `hunt` (read-only investigation), `response` (containment /
+- **provider** — `aws`, `k8s`, `github`, `huawei` ([Huawei guide](../huawei.md))
+- **bucket** — `review` (security assessment), `hunt` (read-only investigation), `response` (containment /
   mutating), `forensics` (evidence capture)
 - **command** — the specific action
 
@@ -39,6 +39,15 @@ dredge --aws-profile ir --region us-east-1 aws response disable-user --user bob
 
 See [Authentication](../authentication.md) for the full auth flag set per
 provider.
+
+AWS profile/region flags additionally work immediately after `aws`, before the
+bucket: `dredge aws --aws-profile ir --region us-east-1 hunt exposed-secrets`.
+Use `all` for either selector to expand the [secret hunt](aws.md#all-configured-profiles-and-enabled-regions).
+
+Huawei auth flags also work immediately after `huawei`.
+`dredge huawei --huawei-profile all --huawei-region all review full --deep`
+runs a [Huawei assessment](../huawei-review.md) across configured profiles and
+accessible projects; add `--sso-login` to authorize missing SSO sessions.
 
 ## Dry-run
 

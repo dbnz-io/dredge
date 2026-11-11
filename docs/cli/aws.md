@@ -43,10 +43,15 @@ dredge --aws-profile ir --region us-east-1 \
 
 # Full review, fanning the regional checks across every enabled region
 dredge --aws-profile ir --region us-east-1 aws review full --all-regions --html ./review.html
+
+# Deep review of every configured profile and its account's enabled regions
+dredge aws --aws-profile all --aws-region all review full --deep \
+  --sso-login --max-workers 4 --html ./review.html --csv ./review.csv
 ```
 
 Open the HTML in a browser: findings are colored by severity and **filterable by
-severity and by service**. The same findings print to stdout as JSON.
+severity and by service** (and by profile for profile sweeps). The same findings
+print to stdout as JSON.
 
 ### Services and checks
 
@@ -66,6 +71,24 @@ severity and by service**. The same findings print to stdout as JSON.
 - **Multi-region:** `--all-regions` (or `--regions us-east-1,eu-west-1`) fans the
   **regional** checks (EC2/RDS/Lambda/ECS/org guardrails) across regions
   concurrently; global checks (IAM/S3) run once. Findings carry their region.
+- **Multiple profiles:** `--aws-profile all` reviews every locally configured
+  profile. Combine it with `--aws-region all` (or `--region all`) to discover
+  enabled regions separately for each account. Both flags also work independently,
+  and with service-specific commands such as `review iam` or `review ecs`.
+  Global checks run once per profile. Profiles in the same account are reviewed
+  independently because their permissions may differ.
+- **Authentication:** cached credentials are reused. Optional `--sso-login`
+  renews failed SSO sessions once per shared session through AWS CLI; browser/MFA
+  interaction may still be required. See [profile authentication details](#all-configured-profiles-and-enabled-regions).
+- **Sweep concurrency:** with either provider-level `all` flag or `--sso-login`,
+  `--max-workers` limits concurrent profiles (default 12, range 1–32); regions
+  run sequentially within each profile. Without those flags it retains its
+  existing meaning of concurrent regions.
+- **Sweep reports:** findings include `profile`, `account_id`, `principal_arn`,
+  and `region`. JSON includes per-profile authentication/check/region outcomes;
+  CSV includes finding attribution; HTML shows profile coverage, errors, and
+  a profile filter. Failures mark the review incomplete while other profiles
+  continue. A region-discovery failure still allows global checks to run.
 - Org checks flag a **missing** control (e.g. GuardDuty off → a finding).
 - `--incident-start <iso>` enables the `recent` check — the fastest way to spot
   attacker-created resources.
@@ -73,8 +96,9 @@ severity and by service**. The same findings print to stdout as JSON.
 - Each check is independent: a permission error in one is reported in the result's
   `checks` map and the rest still run.
 
-> Regional checks (EC2/RDS/Lambda) use the region from `--region`; IAM/S3/org are
-> (mostly) global. Run per region for full regional coverage.
+Without a region selector, regional checks use the configured session region.
+IAM/S3 checks are global; organization guardrail checks are regional. Global-only
+profile sweeps skip region discovery, so they do not require `ec2:DescribeRegions`.
 
 ---
 
@@ -252,6 +276,64 @@ Secrets Manager / SSM references are not dereferenced. Findings are deduplicated
 and redacted by default. `--unredacted PATH` writes raw values to a file with mode
 0600; `--test` explicitly enables STS verification of detected AWS key pairs.
 Service access failures are reported while other sources continue.
+
+#### All configured profiles and enabled regions
+
+```bash
+dredge aws --aws-profile all --aws-region all hunt exposed-secrets
+
+# Start AWS CLI SSO login when a cached SSO session is missing/expired.
+dredge aws --aws-profile all --aws-region all hunt exposed-secrets \
+  --sso-login --max-workers 4 > secret-findings.json
+```
+
+`--aws-profile` and `--aws-region` / `--region` can appear before `aws` or immediately
+after it, before `hunt`. The command name is plural: `exposed-secrets`.
+The `all` values are supported for this hunt and [AWS posture reviews](#review-posture).
+
+- **Profiles:** every profile configured in the AWS shared config/credentials
+  files, honoring `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`. This does
+  not discover unconfigured SSO account/role combinations or organization accounts.
+- **Authentication:** the profile's existing SDK credential chain, including
+  static keys, `credential_process`, role profiles, and cached SSO sessions.
+  STS `GetCallerIdentity` validates each profile and records its account and
+  principal. An inaccessible profile is reported while the others continue.
+- **SSO:** `--sso-login` invokes `aws sso login` only after a missing/expired SSO
+  authentication error, at most once per shared `sso_session` (or legacy start
+  URL/region). Source-profile chains are followed. AWS CLI v2 must be installed;
+  browser/MFA approval can still be required. Without the flag, failures include
+  a login hint. Dredge does not configure new profiles or bypass MFA.
+- **Regions:** `ec2:DescribeRegions` discovers enabled regions separately for
+  each authenticated account. A discovery failure is reported; the sweep does
+  not silently substitute a static region list. Configure a region on each
+  profile, especially for GovCloud/China. Without any region information, the
+  bootstrap defaults to `us-east-1` (with partition-specific defaults for role ARNs).
+- **Concurrency:** at most four profiles scan concurrently (`--max-workers 1..32`).
+  Regions run sequentially within each profile; boto3 sessions are not shared
+  between workers. Initial authentication/login prompts run serially.
+- **Results:** findings are deduplicated across scans, with each occurrence's
+  profile, account, principal ARN, and region in `details.credentials[].sources`.
+  `details.profiles` retains individual authentication, region, source-error,
+  count, and content-budget results. Profiles using different roles in the same
+  account are scanned independently. Progress and SSO prompts go to stderr;
+  the final report goes to stdout.
+
+Using only one `all` flag also works: all profiles in a chosen region, or one
+profile across all its enabled regions. Combining all/named profile selection
+with explicit credential flags is rejected in the sweep API to prevent profiles
+from accidentally sharing one credential set. For this CLI, `--aws-profile all`
+cannot be combined with explicit credential flags.
+
+S3/CloudWatch remain opt-in. In a sweep, content limits apply **per profile and
+region**; totals increase with the number of scans. S3 prefixes run only once
+per profile and appear under the `global` result, relying on the SDK to route to
+the bucket's region. A targeted S3-only sweep skips region discovery entirely.
+CloudWatch group names are queried in each selected profile/region. To control
+cost, run content scans with a specific profile and region when possible.
+
+The AWS SDK handles profile authentication and credential refresh; interactive
+SSO renewal uses the [AWS CLI login flow](https://docs.aws.amazon.com/cli/latest/reference/sso/login.html).
+Several profiles can reuse one [SSO session](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html).
 
 S3 and CloudWatch content are **off by default**, including when all configuration
 sources are scanned. Each has a separate, repeatable opt-in flag. `--content-only`

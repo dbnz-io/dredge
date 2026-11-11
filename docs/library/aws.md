@@ -114,6 +114,26 @@ See the [CLI guide](../cli/aws.md#exposed-secrets) for defaults, precise budget
 semantics, coverage, and required permissions. `keep_raw=True` returns raw values;
 `test_pairs=True` opts in to live STS checks of detected AWS credential pairs.
 
+### All profiles and regions
+
+For secret hunting across locally configured profiles, use the sweep function:
+
+```python
+from dredge.aws_ir.secret_sweep import hunt_exposed_secrets_multi_profile
+
+result = hunt_exposed_secrets_multi_profile(
+    profiles="all", regions="all", max_workers=4,
+    include=["lambda", "ecs", "elasticbeanstalk"],
+    sso_login=False,  # True permits interactive AWS CLI SSO renewal.
+)
+```
+
+`profiles` also accepts a list of configured names; `profiles=None` uses the
+supplied `auth=AwsAuthConfig(...)` or default credential chain. `regions=None`
+uses each profile's base region; a list selects explicit regions. Other keyword
+arguments match `hunt_exposed_secrets`. See the [sweep behavior and content
+limits](../cli/aws.md#all-configured-profiles-and-enabled-regions).
+
 ## Security review (posture)
 
 A read-only posture review — prioritized findings across IAM, EC2, S3, RDS,
@@ -142,6 +162,27 @@ res.details["meta"]["regions"]        # regions queried; findings carry .region
 AwsIRReview.to_csv(res, "review.csv")
 AwsIRReview.to_html(res, "review.html")
 ```
+
+For all configured profiles (or an explicit list), use the shared-auth sweep:
+
+```python
+from dredge.aws_ir.review_sweep import review_multi_profile
+
+res = review_multi_profile(
+    profiles="all", regions="all", services="all", tiers=(1, 2),
+    max_workers=4, sso_login=True,
+)
+AwsIRReview.to_csv(res, "review.csv")
+AwsIRReview.to_html(res, "review.html")
+```
+
+`profiles=None` uses `auth.profile_name` or the default credential chain. The
+sweep authenticates each profile separately, runs global checks once per profile,
+and scans regions sequentially within each profile. `max_workers` caps concurrent
+profiles (1–32). Each finding carries profile/account/principal/region context;
+`details["profiles"]` records coverage and failures. The same report exporters
+accept single-profile and sweep results. SSO login is optional and may require
+browser/MFA interaction; all-region discovery requires `ec2:DescribeRegions`.
 
 `services` is `"all"` or a list; `tiers` is `(1,)` headline or `(1, 2)` deep;
 `include`/`exclude` force checks by id. See the

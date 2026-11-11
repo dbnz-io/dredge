@@ -20,6 +20,10 @@ Nested commands: `dredge <provider> <bucket> <command>`.
 - **[AWS](cli/aws.md)** — review (posture), hunt, response (containment), forensics.
 - **[GitHub](cli/github.md)** — audit-log hunting and containment.
 - **[Kubernetes](cli/kubernetes.md)** — hunt, response, forensics.
+- **[Huawei Cloud](huawei.md)** — authentication, secret scanning, targeted OBS/LTS,
+  CCE access, and assessment permission templates (CLI and library).
+- **[Huawei security assessment](huawei-review.md)** — 30 posture checks,
+  SSO/profile/project sweeps, coverage reporting, and CSV/HTML output.
 
 ## Library usage
 
@@ -45,3 +49,4 @@ Nested commands: `dredge <provider> <bucket> <command>`.
 | **Kubernetes** | Events API, RBAC exposure, privileged pods | RBAC, pods, nodes, NetworkPolicy quarantine, Secrets | pod/node manifests, logs, events, exec |
 | **GitHub** | Org/Enterprise audit log, secret/code scanning | block/remove members, revoke deploy keys, delete webhooks, archive repos | org/repo settings, webhooks, branch protection |
 | **GCP** | Cloud Logging (in progress) | — | — |
+| **Huawei Cloud** | Configuration secrets, CCE, targeted OBS/LTS, optional stored-secret inventory | — | — |

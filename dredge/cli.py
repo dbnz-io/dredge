@@ -162,7 +162,9 @@ def print_incident_report_csv(result) -> None:
 
 
 
-def build_aws_auth_from_args(args: argparse.Namespace) -> Optional[AwsAuthConfig]:
+def build_aws_auth_from_args(args: argparse.Namespace, *, allow_all=False) -> Optional[AwsAuthConfig]:
+    if not allow_all and (args.aws_profile == "all" or args.aws_region == "all"):
+        raise ValueError("--aws-profile all / --aws-region all are supported by aws hunt exposed-secrets and aws review")
     # If nothing is set, return None (Dredge will use default AWS chain)
     if not any(
         [
@@ -179,10 +181,10 @@ def build_aws_auth_from_args(args: argparse.Namespace) -> Optional[AwsAuthConfig
         access_key_id=args.aws_access_key_id,
         secret_access_key=args.aws_secret_access_key,
         session_token=args.aws_session_token,
-        profile_name=args.aws_profile,
+        profile_name=None if args.aws_profile == "all" else args.aws_profile,
         role_arn=args.aws_role_arn,
         external_id=args.aws_external_id,
-        region_name=args.aws_region,
+        region_name=None if args.aws_region == "all" else args.aws_region,
     )
 
 
@@ -198,20 +200,18 @@ def build_github_config_from_args(args: argparse.Namespace) -> Optional[GitHubIR
 
 
 def build_k8s_config_from_args(args: argparse.Namespace) -> Optional[K8sAuthConfig]:
+    token = args.k8s_token
+    if not token and args.k8s_token_env_var:
+        token = os.environ.get(args.k8s_token_env_var)
     if not any(
         [
-            args.k8s_token,
+            token,
             args.k8s_in_cluster,
             args.k8s_kubeconfig,
             args.k8s_context,
         ]
     ):
         return None
-
-    token = args.k8s_token
-    if not token and args.k8s_token_env_var:
-        import os
-        token = os.environ.get(args.k8s_token_env_var)
 
     return K8sAuthConfig(
         token=token,
@@ -626,11 +626,7 @@ def handle_aws_hunt_user_activity_by_ip(args: argparse.Namespace) -> None:
 
 
 def handle_aws_review(args: argparse.Namespace) -> None:
-    auth = build_aws_auth_from_args(args)
-    dredge = Dredge(
-        auth=auth,
-        config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
-    )
+    auth = build_aws_auth_from_args(args, allow_all=True)
     from dredge.aws_ir.review import AwsIRReview
 
     # `review_service` is set per subcommand: "full" (all services) or a single
@@ -642,24 +638,35 @@ def handle_aws_review(args: argparse.Namespace) -> None:
         services = [args.review_service]
         tiers = (1, 2)
 
-    # Region fan-out (regional checks): --all-regions or --regions r1,r2.
+    # Provider-wide --aws-region all is an alias for the review region selector.
     regions = None
-    if getattr(args, "all_regions", False):
+    if args.aws_region == "all" or getattr(args, "all_regions", False):
         regions = "all"
     elif getattr(args, "regions", None):
         r = _flatten_csv(args.regions)
         regions = "all" if "all" in r else r
 
-    res = dredge.aws_ir.review.review(
+    review_options = dict(
         services=services,
         tiers=tiers,
         incident_start=parse_iso_datetime(getattr(args, "incident_start", None)),
         ips=_flatten_csv(getattr(args, "ip", None)) or None,
         include=_flatten_csv(getattr(args, "include", None)) or None,
         exclude=_flatten_csv(getattr(args, "exclude", None)) or None,
-        regions=regions,
-        max_workers=getattr(args, "max_workers", 12),
     )
+    max_workers = getattr(args, "max_workers", 12)
+    if args.aws_profile == "all" or args.aws_region == "all" or getattr(args, "sso_login", False):
+        from dredge.aws_ir.review_sweep import review_multi_profile
+        res = review_multi_profile(
+            auth=auth or AwsAuthConfig(region_name=None if args.aws_region == "all" else args.aws_region),
+            profiles="all" if args.aws_profile == "all" else None,
+            regions=regions, max_workers=max_workers, sso_login=args.sso_login,
+            progress=lambda profile, region: print(f"Reviewing profile {profile!r}, region {region}", file=sys.stderr),
+            **review_options,
+        )
+    else:
+        dredge = Dredge(auth=auth, config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run))
+        res = dredge.aws_ir.review.review(**review_options, regions=regions, max_workers=max_workers)
 
     if getattr(args, "csv", None):
         AwsIRReview.to_csv(res, args.csv)
@@ -1125,12 +1132,8 @@ def handle_aws_hunt_exposed_secrets(args: argparse.Namespace) -> None:
         raise ValueError("--content-only requires --scan-s3 or --scan-cloudwatch")
     if args.content_only and args.include:
         raise ValueError("--content-only cannot be combined with --include")
-    auth = build_aws_auth_from_args(args)
-    dredge = Dredge(
-        auth=auth,
-        config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run),
-    )
-    res = dredge.aws_ir.hunt.hunt_exposed_secrets(
+    auth = build_aws_auth_from_args(args, allow_all=True)
+    scan_options = dict(
         include=[] if args.content_only else args.include or None,
         keep_raw=bool(args.unredacted),
         test_pairs=args.test,
@@ -1147,6 +1150,19 @@ def handle_aws_hunt_exposed_secrets(args: argparse.Namespace) -> None:
         content_max_api_calls=args.content_max_api_calls,
         content_max_seconds=args.content_max_seconds,
     )
+    if args.aws_profile == "all" or args.aws_region == "all" or args.sso_login:
+        from dredge.aws_ir.secret_sweep import hunt_exposed_secrets_multi_profile
+        res = hunt_exposed_secrets_multi_profile(
+            auth=auth or AwsAuthConfig(region_name=None if args.aws_region == "all" else args.aws_region),
+            profiles="all" if args.aws_profile == "all" else None,
+            regions="all" if args.aws_region == "all" else [args.aws_region] if args.aws_region else None,
+            max_workers=args.max_workers, sso_login=args.sso_login,
+            progress=lambda profile, region: print(f"Scanning profile {profile!r}, region {region}", file=sys.stderr),
+            **scan_options,
+        )
+    else:
+        dredge = Dredge(auth=auth, config=DredgeConfig(region_name=args.aws_region, dry_run=args.dry_run))
+        res = dredge.aws_ir.hunt.hunt_exposed_secrets(**scan_options)
     if args.unredacted:
         raw_values = res.details.pop("raw_values", {})
         with open(args.unredacted, "w") as fh:
@@ -1171,6 +1187,91 @@ def handle_aws_hunt_cloudwatch_logs(args: argparse.Namespace) -> None:
         max_wait_seconds=args.max_wait_seconds,
     )
     print_result(res, output=getattr(args, "output", "json"))
+
+
+def handle_huawei_review(args: argparse.Namespace) -> None:
+    from dredge.huawei_ir import HuaweiIRReview, review_multi_profile
+
+    regions = _flatten_csv(args.regions) if args.regions else args.huawei_region
+    if args.all_regions or regions == ["all"]:
+        regions = "all"
+    result = review_multi_profile(
+        profiles=args.huawei_profile, regions=regions, project_id=args.huawei_project_id,
+        profile_source=args.huawei_profile_source, sso_login=args.sso_login, max_workers=args.max_workers,
+        timeout=args.huawei_timeout, enterprise_project_id=args.huawei_enterprise_project_id,
+        services=None if args.review_service == "full" else [args.review_service],
+        tiers=(1, 2) if args.review_service != "full" or args.deep else (1,),
+        include=_flatten_csv(args.include) if args.include else None,
+        exclude=_flatten_csv(args.exclude) if args.exclude else None,
+        incident_start=args.incident_start, ips=args.ip,
+        max_resources=args.max_resources, max_api_calls=args.max_api_calls, max_seconds=args.max_seconds,
+        key_age_days=args.key_age_days, min_password_length=args.min_password_length,
+        min_backup_days=args.min_backup_days, min_log_retention_days=args.min_log_retention_days,
+    )
+    if args.csv:
+        HuaweiIRReview.to_csv(result, args.csv)
+    if args.html:
+        HuaweiIRReview.to_html(result, args.html)
+    print_result(result, output=getattr(args, "output", "json"))
+
+
+def handle_huawei_hunt_exposed_secrets(args: argparse.Namespace) -> None:
+    from dredge.huawei_ir import HuaweiAuthConfig, HuaweiIRNamespace
+    from dredge.k8s_ir.services import K8sClientFactory, K8sServiceRegistry
+    from dredge.huawei_ir.profiles import load_profiles
+    from dredge.huawei_ir.secret_sweep import hunt_exposed_secrets_multi_profile
+
+    if args.content_only and args.include:
+        raise ValueError("--content-only cannot be combined with --include")
+    if args.content_only and not (args.scan_obs or args.scan_lts or args.scan_csms):
+        raise ValueError("--content-only requires --scan-obs, --scan-lts, or --scan-csms")
+    sweep = (args.huawei_profile == "all" or args.huawei_region == "all" or args.huawei_project_id == "all"
+             or args.sso_login or args.huawei_profile_source == "koocli")
+    if args.huawei_profile and not sweep:
+        sweep = load_profiles().get(args.huawei_profile, {}).get("kind") == "sso"
+    if sweep and "cce" in (args.include or []):
+        raise ValueError("CCE requires a separate single-cluster invocation, without Huawei profile/project sweeps")
+    k8s_services = None
+    if "cce" in (args.include or []):
+        k8s_config = build_k8s_config_from_args(args)
+        if k8s_config is None:
+            raise ValueError("CCE requires --k8s-kubeconfig, --k8s-context, --k8s-in-cluster, or --k8s-token")
+        k8s_services = K8sServiceRegistry(K8sClientFactory(k8s_config).get_api_client())
+    options = dict(
+            include=[] if args.content_only else args.include, keep_raw=bool(args.unredacted),
+            max_resources=args.max_resources, scan_obs=args.scan_obs, scan_lts=args.scan_lts,
+            scan_csms=args.scan_csms, start_time=args.start_time, end_time=args.end_time,
+            obs_max_objects=args.obs_max_objects, obs_max_object_bytes=args.obs_max_object_bytes,
+            lts_max_events=args.lts_max_events, content_max_bytes=args.content_max_bytes,
+            content_max_api_calls=args.content_max_api_calls, content_max_seconds=args.content_max_seconds,
+            k8s_namespace=args.k8s_namespace, scan_k8s_secrets=args.scan_k8s_secrets,
+    )
+    if sweep:
+        result = hunt_exposed_secrets_multi_profile(
+            profiles=args.huawei_profile, regions=args.huawei_region, project_id=args.huawei_project_id,
+            profile_source=args.huawei_profile_source, sso_login=args.sso_login, max_workers=args.max_workers,
+            timeout=args.huawei_timeout, enterprise_project_id=args.huawei_enterprise_project_id, **options)
+    else:
+        config = HuaweiAuthConfig(region_name=args.huawei_region, project_id=args.huawei_project_id,
+                                 profile_name=args.huawei_profile, timeout=args.huawei_timeout,
+                                 enterprise_project_id=args.huawei_enterprise_project_id)
+        # A Huawei-only CLI invocation never initializes an AWS session.
+        namespace = HuaweiIRNamespace(config, k8s_services=k8s_services)
+        try:
+            result = namespace.hunt.hunt_exposed_secrets(**options)
+        finally:
+            namespace.close()
+    if args.unredacted:
+        raw = result.details.pop("raw_values", {})
+        # Exclusive creation prevents overwriting evidence or following symlinks;
+        # mode 0600 applies before the first byte of secret material is written.
+        try:
+            fd = os.open(args.unredacted, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as output:
+                json.dump(raw, output, indent=2)
+        except OSError:
+            raise ValueError("Unable to create --unredacted output; choose a new writable file") from None
+    print_result(result)
 
 
 # ------------- GitHub command handlers -------------
@@ -1533,8 +1634,8 @@ def handle_k8s_hunt_privileged_pods(args: argparse.Namespace) -> None:
 
 # Display order for the grouped `dredge -h` overview, by provider slug and
 # bucket slug.
-_PROVIDER_ORDER = ["aws", "k8s", "github", "gcp"]
-_PROVIDER_LABELS = {"aws": "AWS", "k8s": "Kubernetes", "github": "GitHub", "gcp": "GCP"}
+_PROVIDER_ORDER = ["aws", "k8s", "github", "gcp", "huawei"]
+_PROVIDER_LABELS = {"aws": "AWS", "k8s": "Kubernetes", "github": "GitHub", "gcp": "GCP", "huawei": "Huawei Cloud"}
 _BUCKET_ORDER = ["review", "hunt", "response", "forensics"]
 _BUCKET_LABELS = {
     "review": "Review (posture)",
@@ -1548,6 +1649,7 @@ _GLOBAL_OPTION_GROUPS = [
     ("AWS auth / region", "aws_"),
     ("GitHub auth", "github_"),
     ("Kubernetes auth", "k8s_"),
+    ("Huawei auth / region", "huawei_"),
 ]
 
 
@@ -1557,6 +1659,18 @@ def _make_help_printer(parser: argparse.ArgumentParser):
     def _printer(_args: argparse.Namespace) -> None:
         parser.print_help()
     return _printer
+
+
+def _add_huawei_auth_flags(parser, *, child=False):
+    def default(value=None):
+        return argparse.SUPPRESS if child else value
+    parser.add_argument("--huawei-region", default=default(), help="Huawei region, or all accessible project regions")
+    parser.add_argument("--huawei-project-id", default=default(), help="Regional project ID, or all accessible projects")
+    parser.add_argument("--huawei-profile", default=default(), help="SDK/SSO profile name, or all configured profiles")
+    parser.add_argument("--huawei-profile-source", choices=["sdk", "koocli"], default=default("sdk"),
+                        help="sdk: credential-file profiles; koocli: import SSO profile metadata")
+    parser.add_argument("--huawei-enterprise-project-id", default=default("0"), help="CAE enterprise project ID (default: 0)")
+    parser.add_argument("--huawei-timeout", type=int, default=default(20), help="SDK connect/read timeout in seconds")
 
 
 class _NestedRegistrar:
@@ -1585,6 +1699,16 @@ class _NestedRegistrar:
                 provider, help=f"{_PROVIDER_LABELS.get(provider, provider)} commands",
             )
             pp.set_defaults(func=_make_help_printer(pp))
+            if provider == "aws":
+                # Allow both `dredge --aws-profile X aws ...` and
+                # `dredge aws --aws-profile X ...`; absent child flags must not
+                # overwrite values already parsed by the root parser.
+                pp.add_argument("--aws-profile", default=argparse.SUPPRESS,
+                                help="AWS profile, or all for exposed-secrets/review")
+                pp.add_argument("--aws-region", "--region", dest="aws_region", default=argparse.SUPPRESS,
+                                help="AWS region, or all enabled regions for exposed-secrets/review")
+            elif provider == "huawei":
+                _add_huawei_auth_flags(pp, child=True)
             self._provider_buckets[provider] = pp.add_subparsers(
                 dest=f"{provider}_bucket", metavar="<bucket>",
             )
@@ -1691,7 +1815,7 @@ def _print_grouped_help(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dredge",
-        description="Dredge incident response CLI (AWS + Kubernetes + GitHub + GCP)",
+        description="Dredge incident response CLI (AWS + Kubernetes + GitHub + GCP + Huawei Cloud)",
         add_help=False,
     )
     parser.add_argument(
@@ -1704,10 +1828,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aws-region", "--region",
         dest="aws_region",
-        help="AWS region (e.g. us-east-1)",
+        help="AWS region (e.g. us-east-1); all for exposed-secrets/review",
         default=None,
     )    
-    parser.add_argument("--aws-profile", help="AWS profile name", default=None)
+    parser.add_argument("--aws-profile", help="AWS profile name; all for exposed-secrets/review", default=None)
     parser.add_argument("--aws-access-key-id", default=None)
     parser.add_argument("--aws-secret-access-key", default=None)
     parser.add_argument("--aws-session-token", default=None)
@@ -1739,6 +1863,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k8s-insecure-skip-tls-verify", action="store_true", help="Disable TLS verification (used with --k8s-token)")
     parser.add_argument("--k8s-namespace", default=None, help="Default namespace for namespaced k8s subcommands")
 
+    _add_huawei_auth_flags(parser)
+
     # --version flag
     try:
         dredge_version = version("dredge-ir")
@@ -1756,6 +1882,53 @@ def build_parser() -> argparse.ArgumentParser:
     # subparsers action: each `subparsers.command("aws", "hunt", "x", ...)` below
     # registers `dredge aws hunt x` in the provider → bucket → command tree.
     subparsers = _NestedRegistrar(parser)
+
+    from dredge.huawei_ir.review import SERVICES as HUAWEI_REVIEW_SERVICES
+    for service in ["full", *HUAWEI_REVIEW_SERVICES]:
+        p = subparsers.command("huawei", "review", service,
+            help="Review Huawei security posture" if service == "full" else f"Review Huawei {service.upper()} security posture")
+        p.add_argument("--deep", action="store_true", help="Include tier-2 checks in full review; service reviews always include both tiers")
+        p.add_argument("--sso-login", action="store_true", help="Authorize missing/expired Identity Center sessions using a device code")
+        p.add_argument("--max-workers", type=int, default=4, help="Concurrent account/agency reviews, 1–32")
+        region_flags = p.add_mutually_exclusive_group()
+        region_flags.add_argument("--regions", action="append", help="Region or comma-separated regions; repeatable; all discovers accessible projects")
+        region_flags.add_argument("--all-regions", action="store_true", help="Discover accessible projects across all Huawei regions")
+        p.add_argument("--include", action="append", help="Check IDs to include, comma-separated or repeatable")
+        p.add_argument("--exclude", action="append", help="Check IDs to exclude, comma-separated or repeatable")
+        p.add_argument("--incident-start", type=parse_iso_datetime, help="ISO 8601 incident start for recent-resource checks")
+        p.add_argument("--ip", action="append", help="Incident IP/CIDR to match against security-group rules; repeatable")
+        p.add_argument("--max-resources", type=int, default=1000, help="Resource visits per check/project, including nested resources")
+        p.add_argument("--max-api-calls", type=int, default=2000, help="Metadata API requests per check/project")
+        p.add_argument("--max-seconds", type=int, default=120, help="Time budget per check/project; an in-flight request uses the HTTP timeout")
+        p.add_argument("--key-age-days", type=int, default=90)
+        p.add_argument("--min-password-length", type=int, default=12)
+        p.add_argument("--min-backup-days", type=int, default=7)
+        p.add_argument("--min-log-retention-days", type=int, default=30)
+        p.add_argument("--csv", metavar="PATH", help="Write findings as CSV")
+        p.add_argument("--html", metavar="PATH", help="Write a self-contained findings and coverage report")
+        p.set_defaults(func=handle_huawei_review, review_service=service)
+
+    p = subparsers.command("huawei", "hunt", "exposed-secrets", help="Scan Huawei configurations and targeted OBS/LTS content for secrets")
+    p.add_argument("--sso-login", action="store_true", help="Authorize missing/expired Huawei Identity Center sessions using a device code")
+    p.add_argument("--max-workers", type=int, default=4, help="Concurrent Huawei account/agency scans, 1–32 (default: 4)")
+    p.add_argument("--include", nargs="+", choices=["functiongraph", "ecs_user_data", "cae", "cce"],
+                   help="Default: functiongraph ecs_user_data cae; CCE requires explicit Kubernetes auth")
+    p.add_argument("--content-only", action="store_true", help="Skip configuration scans")
+    p.add_argument("--scan-obs", action="append", metavar="obs://BUCKET/PREFIX", help="Targeted object prefix; repeatable")
+    p.add_argument("--scan-lts", action="append", metavar="GROUP_ID/STREAM_ID", help="Targeted log stream; repeatable")
+    p.add_argument("--scan-csms", action="append", metavar="SECRET_NAME", help="Inventory a named CSMS secret's latest value; repeatable")
+    p.add_argument("--scan-k8s-secrets", action="store_true", help="Inventory Kubernetes Secrets (requires --include cce)")
+    p.add_argument("--start-time", type=parse_iso_datetime, help="LTS start, ISO 8601; required with --scan-lts")
+    p.add_argument("--end-time", type=parse_iso_datetime, help="LTS end, ISO 8601; window at most 24 hours")
+    p.add_argument("--max-resources", type=int, default=500, help="Maximum resources per configuration scanner")
+    p.add_argument("--obs-max-objects", type=int, default=100)
+    p.add_argument("--obs-max-object-bytes", type=int, default=1048576)
+    p.add_argument("--lts-max-events", type=int, default=1000)
+    p.add_argument("--content-max-bytes", type=int, default=10485760)
+    p.add_argument("--content-max-api-calls", type=int, default=100)
+    p.add_argument("--content-max-seconds", type=int, default=60)
+    p.add_argument("--unredacted", metavar="NEW_FILE", help="Write raw exposure values to a new mode-0600 file")
+    p.set_defaults(func=handle_huawei_hunt_exposed_secrets)
 
     # --- AWS response subcommands ---
 
@@ -2137,6 +2310,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = subparsers.command("aws", "hunt", "exposed-secrets",
         help="Scan AWS configuration for secrets; opt in to targeted S3/CloudWatch content",
     )
+    p.add_argument("--sso-login", action="store_true",
+                   help="On expired/missing SSO auth, run AWS CLI login once per shared session (may require browser/MFA)")
+    p.add_argument("--max-workers", type=int, default=4,
+                   help="Concurrent profiles in all-profile mode (1-32, default: 4); regions are serial per profile")
     p.add_argument(
         "--include",
         action="append",
@@ -2456,7 +2633,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Fan out regional checks across these regions (comma-separated and/or "
                         "repeatable; 'all' means every enabled region).")
         pp.add_argument("--max-workers", type=int, default=12, dest="max_workers",
-                        help="Concurrency for the multi-region fan-out")
+                        help="Concurrent regions (default 12); with provider-level 'all' or --sso-login, "
+                        "concurrent profiles (1-32), with serial regions per profile")
+        pp.add_argument("--sso-login", action="store_true",
+                        help="Renew expired/missing SSO sessions through AWS CLI; browser/MFA approval may be required")
         pp.add_argument("--output", choices=["json", "csv"], default="json",
                         help="stdout format for the summary (--csv/--html files are separate)")
         if incident:

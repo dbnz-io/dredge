@@ -29,6 +29,9 @@ Provider namespaces (each optional — only built if you pass its config):
 | `d.github_ir` | `github_config=GitHubIRConfig(...)` |
 | `d.k8s_ir` | `k8s_config=K8sAuthConfig(...)` |
 | `d.gcp_ir` | `gcp_config=GcpIRConfig(...)` |
+| `d.huawei_ir` | `huawei_config=HuaweiAuthConfig(...)`; [Huawei guide](../huawei.md) |
+
+For Huawei-only initialization, AWS is initialized lazily when `d.aws_ir` is accessed.
 
 GitHub/GCP/Kubernetes clients are imported lazily, so a consumer that never
 passes their config never imports those dependencies.

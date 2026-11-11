@@ -23,7 +23,7 @@
 ---
 
 Dredge is a cloud incident-response and threat-hunting toolkit — a Python library
-**and** a CLI — for **AWS, Kubernetes, GitHub, and GCP**. It's built for moving
+**and** a CLI — for **AWS, Kubernetes, GitHub, GCP, and Huawei Cloud**. It's built for moving
 fast when you don't have all the plumbing ready at 3AM: collect logs, hunt
 through them, and contain — from one tool.
 
@@ -41,6 +41,10 @@ through them, and contain — from one tool.
   forensics against any cluster (EKS/GKE/AKS/self-managed).
 - **GitHub** — org/enterprise audit-log hunting **and** containment.
 - **GCP** — Cloud Logging hunting (in progress).
+- **Huawei Cloud** — [security assessment](docs/huawei-review.md) with 30 checks
+  across 13 service groups, CSV/HTML reports, and [secret scanning](docs/huawei.md) with SDK/SSO authentication,
+  multi-profile/project sweeps, FunctionGraph, ECS user data, CAE, CCE, and
+  targeted OBS/LTS scans.
 
 📚 **Full documentation is in [`docs/`](docs/README.md).**
 
@@ -180,6 +184,10 @@ dredge --aws-profile ir --region us-east-1 \
   aws review full --incident-start 2026-04-01T00:00:00Z \
   --csv ./review.csv --html ./review.html
 
+# Deep posture review across configured profiles and enabled regions
+dredge aws --aws-profile all --aws-region all review full --deep \
+  --sso-login --max-workers 4 --csv ./review.csv --html ./review.html
+
 # Contain — always dry-run destructive actions first (global --dry-run)
 dredge --aws-profile ir --region us-east-1 --dry-run \
   aws response disable-user --user compromised-user
@@ -269,7 +277,7 @@ GCP `logging.viewer`). Local file tools are confined to `DREDGE_MCP_WORKDIR`
 |---|---|
 | [Getting started](docs/getting-started.md) | Install → collect → first hunt |
 | [Installation](docs/installation.md) | PyPI, source, Docker |
-| [Authentication](docs/authentication.md) | AWS · GitHub · Kubernetes · GCP |
+| [Authentication](docs/authentication.md) | AWS · GitHub · Kubernetes · GCP · Huawei |
 | [CLI](docs/cli/README.md) | [AWS](docs/cli/aws.md) · [GitHub](docs/cli/github.md) · [Kubernetes](docs/cli/kubernetes.md) |
 | [Library](docs/library/README.md) | [AWS](docs/library/aws.md) · [GitHub](docs/library/github.md) · [Kubernetes](docs/library/kubernetes.md) |
 | [MCP server](docs/mcp.md) | Chat with Dredge's read-only surface from an MCP client |

@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
+
+from ..secret_scanning import ContentBudget
 from datetime import datetime, timedelta
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -147,47 +148,6 @@ def validate_content_options(s3_targets, log_groups, start, end, **limits):
             raise ValueError("CloudWatch scan window must be greater than zero and at most 24 hours")
     elif start is not None or end is not None:
         raise ValueError("start_time/end_time require scan_cloudwatch targets")
-
-
-@dataclass
-class ContentBudget:
-    max_calls: int
-    max_bytes: int
-    max_seconds: int
-    started: float = field(default_factory=time.monotonic)
-    calls: int = 0
-    bytes_read: int = 0
-    bytes_reserved: int = 0
-    scanned: int = 0
-    examined: int = 0
-    skipped: int = 0
-    reasons: list = field(default_factory=list)
-
-    def stop(self, reason):
-        if reason not in self.reasons:
-            self.reasons.append(reason)
-
-    def request(self):
-        if self.calls >= self.max_calls:
-            self.stop("max_api_calls")
-        if time.monotonic() - self.started >= self.max_seconds:
-            self.stop("max_seconds")
-        if self.bytes_reserved >= self.max_bytes:
-            self.stop("max_bytes")
-        if self.reasons:
-            return False
-        self.calls += 1
-        return True
-
-    def summary(self):
-        return {
-            "scanned": self.scanned, "examined": self.examined, "skipped": self.skipped,
-            "api_calls": self.calls, "bytes_read": self.bytes_read,
-            "bytes_budgeted": self.bytes_reserved, "truncated": bool(self.reasons),
-            "stop_reasons": self.reasons,
-            "limits": {"max_api_calls": self.max_calls, "max_bytes": self.max_bytes,
-                       "max_seconds": self.max_seconds},
-        }
 
 
 def scan_s3(client, targets, emit_text, errors, budget, max_objects, max_object_bytes):

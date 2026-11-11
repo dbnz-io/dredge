@@ -98,6 +98,13 @@ class K8sServiceRegistry:
         self._apps_v1 = None
         self._rbac_v1 = None
         self._networking_v1 = None
+        self._batch_v1 = None
+
+    @property
+    def batch_v1(self) -> client.BatchV1Api:
+        if self._batch_v1 is None:
+            self._batch_v1 = client.BatchV1Api(self._api_client)
+        return self._batch_v1
 
     @property
     def core_v1(self) -> client.CoreV1Api:

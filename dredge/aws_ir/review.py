@@ -37,6 +37,7 @@ from ..log import get_logger, event
 from .services import AwsServiceRegistry
 from .hunt import AwsIRHunt
 from .models import OperationResult
+from .profile_sweep import _safe_error
 
 _log = get_logger(__name__)
 
@@ -49,6 +50,16 @@ _STALE_KEY_DAYS = 90
 # Services a review can target. "recent" is incident-relative; "org" is
 # account/region-wide guardrails.
 SERVICES = ["iam", "ec2", "s3", "rds", "lambda", "ecs", "org", "recent"]
+
+
+class _HuntCheckFailed(Exception):
+    """A composed hunt returned an incomplete result instead of raising."""
+
+
+def _require_hunt_success(result):
+    if not result.success:
+        # Hunt error strings can contain raw AWS response bodies.
+        raise _HuntCheckFailed("Underlying hunt was incomplete; check permissions and API availability")
 
 
 @dataclass
@@ -178,8 +189,10 @@ class AwsIRReview:
                     if region and not f.region:
                         f.region = region
                 return produced, None
-            except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+            except _HuntCheckFailed as exc:
                 return [], str(exc)
+            except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+                return [], _safe_error(exc)
 
         # Global checks: once, against the base services.
         for check_id, service, tier, method_name, scope in selected:
@@ -206,7 +219,10 @@ class AwsIRReview:
             else:
                 # Multi-region fan-out: one region-scoped review per region.
                 def _region_worker(region):
-                    robj = AwsIRReview(self._services.regional(region), self._config)
+                    try:
+                        robj = AwsIRReview(self._services.regional(region), self._config)
+                    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+                        return region, [], {c[0]: {"error": _safe_error(exc)} for c in regional_selected}
                     per = {}
                     got: List[Finding] = []
                     for check_id, service, tier, method_name, _s in regional_selected:
@@ -216,15 +232,25 @@ class AwsIRReview:
                     return region, got, per
 
                 agg: Dict[str, Dict[str, Any]] = {c[0]: {"by_region": {}} for c in regional_selected}
-                with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    for region, got, per in pool.map(_region_worker, region_list):
-                        findings.extend(got)
-                        for cid, info in per.items():
-                            agg[cid]["by_region"][region] = info
+
+                def _region_outcomes():
+                    if max_workers == 1:
+                        # A profile sweep owns its session in this thread;
+                        # avoid nested workers and concurrent session access.
+                        for region in region_list:
+                            yield _region_worker(region)
+                    else:
+                        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                            yield from pool.map(_region_worker, region_list)
+
+                for region, got, per in _region_outcomes():
+                    findings.extend(got)
+                    for cid, info in per.items():
+                        agg[cid]["by_region"][region] = info
                 for cid, info in agg.items():
                     total = sum(v.get("count", 0) for v in info["by_region"].values())
                     errors = {r: v["error"] for r, v in info["by_region"].items() if "error" in v}
-                    info["status"] = "failed" if errors and total == 0 else ("partial" if errors else "ran")
+                    info["status"] = "failed" if errors and len(errors) == len(region_list) else ("partial" if errors else "ran")
                     info["count"] = total
                     if errors:
                         result.add_error(f"{cid}: failed in {len(errors)} region(s)")
@@ -265,6 +291,7 @@ class AwsIRReview:
 
     def _check_admin_principals(self, **_) -> List[Finding]:
         res = self._hunt.list_iam_admin_principals()
+        _require_hunt_success(res)
         out: List[Finding] = []
         for name in res.details.get("admin_users", []):
             out.append(_f("iam-admin-principals", "IAM user with administrator-equivalent access",
@@ -278,6 +305,7 @@ class AwsIRReview:
 
     def _check_console_without_mfa(self, **_) -> List[Finding]:
         res = self._hunt.get_iam_credential_report()
+        _require_hunt_success(res)
         out: List[Finding] = []
         for row in res.details.get("users", []):
             if str(row.get("password_enabled")).lower() == "true" and str(row.get("mfa_active")).lower() != "true":
@@ -312,6 +340,7 @@ class AwsIRReview:
 
     def _check_stale_access_keys(self, **_) -> List[Finding]:
         res = self._hunt.get_iam_credential_report()
+        _require_hunt_success(res)
         cutoff = datetime.now(timezone.utc) - timedelta(days=_STALE_KEY_DAYS)
         out: List[Finding] = []
         for row in res.details.get("users", []):
@@ -333,6 +362,7 @@ class AwsIRReview:
 
     def _check_public_s3(self, **_) -> List[Finding]:
         res = self._hunt.hunt_exposed_s3_buckets()
+        _require_hunt_success(res)
         return [
             _f("s3-public-buckets", "Publicly exposed S3 bucket", "CRITICAL",
                "AWS::S3::Bucket", e.get("bucket", "?"),
@@ -398,6 +428,7 @@ class AwsIRReview:
 
     def _check_open_critical_ports(self, **_) -> List[Finding]:
         res = self._hunt.list_open_security_groups(ports=_CRITICAL_PORTS)
+        _require_hunt_success(res)
         return [
             _f("ec2-open-critical-ports", "Security group open to 0.0.0.0/0 on a sensitive port",
                "CRITICAL", "AWS::EC2::SecurityGroup", g.get("group_id", "?"),
@@ -407,6 +438,7 @@ class AwsIRReview:
 
     def _check_public_snapshots(self, **_) -> List[Finding]:
         res = self._hunt.list_public_snapshots()
+        _require_hunt_success(res)
         return [
             _f("ec2-public-snapshots", "Publicly restorable snapshot", "HIGH",
                "AWS::EC2::Snapshot", s.get("snapshot_id", "?"),
@@ -430,6 +462,7 @@ class AwsIRReview:
 
     def _check_sg_by_ip(self, *, ips=None, **_) -> List[Finding]:
         res = self._hunt.hunt_security_groups_by_ip(ips, direction="both")
+        _require_hunt_success(res)
         out: List[Finding] = []
         for m in res.details.get("matches", []):
             out.append(_f("ec2-sg-references-ip", "Security group references a supplied IP/CIDR",
@@ -615,7 +648,8 @@ class AwsIRReview:
         import csv
         findings = result.details.get("findings", [])
         cols = ["severity", "service", "tier", "check_id", "resource_type", "resource_id",
-                "region", "created_time", "title", "recommendation", "detail"]
+                "region", "created_time", "title", "recommendation", "detail",
+                "profile", "account_id", "principal_arn"]
         with open(path, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=cols)
             w.writeheader()
@@ -701,6 +735,7 @@ def _render_html(result: OperationResult) -> str:
     summary = result.details.get("summary", {})
     meta = result.details.get("meta", {})
     checks = result.details.get("checks", {})
+    profiles = result.details.get("profiles", {})
 
     def esc(x) -> str:
         return html.escape("" if x is None else str(x))
@@ -708,24 +743,52 @@ def _render_html(result: OperationResult) -> str:
     chips = "".join(
         f'<span class="chip" style="background:{_SEVERITY_COLOR.get(sev,"#567")}">{esc(sev)}: {summary.get(sev,0)}</span>'
         for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"] if summary.get(sev)
-    ) or '<span class="chip" style="background:#3a7">No findings</span>'
+    ) or ('<span class="chip" style="background:#3a7">No findings</span>' if result.success
+          else '<span class="chip" style="background:#d9640a">No findings collected; review incomplete</span>')
 
     rows = "".join(
-        f'<tr data-sev="{esc(f.get("severity"))}" data-svc="{esc(f.get("service"))}">'
+        f'<tr data-sev="{esc(f.get("severity"))}" data-svc="{esc(f.get("service"))}" data-profile="{esc(f.get("profile"))}">'
         f'<td><span class="sev" style="background:{_SEVERITY_COLOR.get(f.get("severity"),"#567")}">{esc(f.get("severity"))}</span></td>'
         f'<td>{esc(f.get("service"))}</td><td>T{esc(f.get("tier"))}</td>'
         f'<td>{esc(f.get("check_id"))}</td>'
         f'<td class="mono">{esc(f.get("resource_id"))}</td>'
+        f'<td class="mono" title="{esc(f.get("principal_arn"))}">{esc(f.get("profile"))}'
+        f'<div class="small">{esc(f.get("account_id") or meta.get("account_id"))}</div></td>'
         f'<td>{esc(f.get("region") or "")}</td>'
         f'<td>{esc(f.get("title"))}<div class="rec">{esc(f.get("recommendation"))}</div></td></tr>'
         for f in findings
     )
 
+    def check_note(check):
+        notes = [check.get("error") or check.get("reason") or ""]
+        notes.extend(f'{region}: {status["error"]}' for region, status in check.get("by_region", {}).items()
+                     if status.get("error"))
+        return "; ".join(note for note in notes if note)
+
     check_rows = "".join(
-        f'<tr><td class="mono">{esc(cid)}</td><td>{esc(c.get("status"))}</td>'
-        f'<td>{esc(c.get("count"))}</td><td>{esc(c.get("error") or c.get("reason") or "")}</td></tr>'
-        for cid, c in checks.items()
+        f'<tr><td class="mono">{esc(cid)}</td><td>{esc(profile)}</td><td>{esc(c.get("status"))}</td>'
+        f'<td>{esc(c.get("count"))}</td><td>{esc(check_note(c))}</td></tr>'
+        for cid, aggregate in sorted(checks.items())
+        for profile, c in aggregate.get("by_profile", {"": aggregate}).items()
     )
+    profile_rows = "".join(
+        f'<tr><td>{esc(profile)}</td><td class="mono">{esc(record.get("account_id"))}</td>'
+        f'<td class="mono">{esc(record.get("principal_arn"))}</td>'
+        f'<td>{"Complete" if record.get("success") else "Incomplete"}</td>'
+        f'<td>{esc("; ".join(record.get("errors", [])))} {esc(record.get("login_hint"))}</td></tr>'
+        for profile, record in profiles.items()
+    )
+    profile_table = ('<h2>Profiles</h2><table><thead><tr><th>Profile</th><th>Account</th>'
+                     '<th>Principal</th><th>Status</th><th>Errors</th></tr></thead>'
+                     f'<tbody>{profile_rows}</tbody></table>') if profiles else ""
+    profile_filter = ('<label>Profile: <select id="profile-filter"><option value="">All</option>'
+                      + "".join(f'<option value="{esc(p)}">{esc(p)}</option>' for p in profiles)
+                      + '</select></label>') if profiles else ""
+    scope = (f'Accounts <b>{esc(", ".join(meta.get("account_ids", [])))}</b> · '
+             f'{len(profiles)} profiles · regions <b>{esc(meta.get("regions") or "profile defaults")}</b>') if profiles else (
+                 f'Account <b>{esc(meta.get("account_id"))}</b> · region <b>{esc(meta.get("region"))}</b>')
+    incomplete = (f'<p role="alert"><b>Review incomplete.</b> {esc("; ".join(result.errors))}</p>'
+                  if not result.success else "")
 
     svc_buttons = "".join(
         f'<button class="filter svc" data-k="svc" data-v="{esc(s)}">{esc(s)}</button>'
@@ -757,11 +820,13 @@ details {{ margin-top: 24px; }}
 <body>
 <h1>Dredge — Security Review</h1>
 <div class="meta">
-  Account <b>{esc(meta.get('account_id'))}</b> · region <b>{esc(meta.get('region'))}</b> ·
+  {scope} ·
   services <b>{esc(', '.join(meta.get('services', [])))}</b> · tiers <b>{esc(meta.get('tiers'))}</b> ·
   generated {esc(meta.get('generated_at'))}
   {('· incident start <b>' + esc(meta.get('incident_start')) + '</b>') if meta.get('incident_start') else ''}
 </div>
+{incomplete}
+{profile_table}
 <div class="chips">{chips}</div>
 <div class="controls">
   <b class="small">Severity:</b>
@@ -770,22 +835,24 @@ details {{ margin-top: 24px; }}
   &nbsp; <b class="small">Service:</b>
   <button class="filter svc active" data-k="svc" data-v="ALL">All</button>
   {svc_buttons}
+  {profile_filter}
 </div>
 <table id="t">
-<thead><tr><th>Severity</th><th>Service</th><th>Tier</th><th>Check</th><th>Resource</th><th>Region</th><th>Finding</th></tr></thead>
-<tbody>{rows or '<tr><td colspan="7" class="small">No findings — clean, or checks were skipped (see below).</td></tr>'}</tbody>
+<thead><tr><th>Severity</th><th>Service</th><th>Tier</th><th>Check</th><th>Resource</th><th>Profile / account</th><th>Region</th><th>Finding</th></tr></thead>
+<tbody>{rows or '<tr><td colspan="8" class="small">No findings collected. Review check and profile status for coverage.</td></tr>'}</tbody>
 </table>
 <details><summary class="small">Checks run</summary>
-<table><thead><tr><th>Check</th><th>Status</th><th>Findings</th><th>Note</th></tr></thead>
+<table><thead><tr><th>Check</th><th>Profile</th><th>Status</th><th>Findings</th><th>Note</th></tr></thead>
 <tbody>{check_rows}</tbody></table>
 </details>
 <script>
-const state = {{ sev: 'ALL', svc: 'ALL' }};
+const state = {{ sev: 'ALL', svc: 'ALL', profile: '' }};
 function apply() {{
   document.querySelectorAll('#t tbody tr').forEach(tr => {{
     const okS = state.sev === 'ALL' || tr.dataset.sev === state.sev;
     const okV = state.svc === 'ALL' || tr.dataset.svc === state.svc;
-    tr.style.display = (okS && okV) ? '' : 'none';
+    const okP = !state.profile || tr.dataset.profile === state.profile;
+    tr.style.display = (okS && okV && okP) ? '' : 'none';
   }});
 }}
 document.querySelectorAll('.filter').forEach(b => b.onclick = () => {{
@@ -795,5 +862,7 @@ document.querySelectorAll('.filter').forEach(b => b.onclick = () => {{
   state[k] = b.dataset.v;
   apply();
 }});
+const profileFilter = document.getElementById('profile-filter');
+if (profileFilter) profileFilter.onchange = () => {{ state.profile = profileFilter.value; apply(); }};
 </script>
 </body></html>"""

@@ -6,6 +6,12 @@
 pip install dredge-ir
 ```
 
+For [Huawei Cloud secret scanning](huawei.md), install the optional SDK extra:
+
+```bash
+pip install 'dredge-ir[huawei]'
+```
+
 The **distribution** name is `dredge-ir` (the bare `dredge` name was already
 taken on PyPI by an unrelated package). The **import package** and the **CLI
 command** are both `dredge`:

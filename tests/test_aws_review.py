@@ -104,6 +104,17 @@ class TestOrchestration:
         assert res.details["checks"]["org-guardduty-enabled"]["status"] == "failed"
         assert res.details["checks"]["org-cloudtrail-logging"]["status"] == "ran"
 
+    def test_composed_hunt_failure_is_reported_without_error_body(self):
+        hunt = make_hunt()
+        failed = OperationResult("get_iam_credential_report", "iam", False, errors=["PRIVATE ERROR BODY"])
+        hunt.get_iam_credential_report.return_value = failed
+        res = make_review(hunt=hunt).review(services=["iam"])
+        assert not res.success
+        assert res.details["checks"]["iam-console-without-mfa"]["status"] == "failed"
+        assert res.details["checks"]["iam-stale-access-keys"]["status"] == "failed"
+        assert res.details["checks"]["iam-admin-principals"]["status"] == "ran"
+        assert "PRIVATE ERROR BODY" not in str(res)
+
     def test_recent_skipped_without_incident_start(self):
         res = make_review().review(services=["recent"])
         assert res.details["checks"]["recent-resources"]["status"] == "skipped"

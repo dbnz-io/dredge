@@ -3,8 +3,8 @@
 # unrelated 2019 package). The import package and CLI stay "dredge":
 #   pip install dredge-ir  ->  import dredge  /  $ dredge ...
 name = "dredge-ir"
-version = "1.1.7"
-description = "Cloud Incident Response & Threat Hunting for AWS, Kubernetes, GitHub & GCP"
+version = "1.1.8"
+description = "Cloud Incident Response & Threat Hunting for AWS, Kubernetes, GitHub, GCP & Huawei Cloud"
 readme = "README.md"
 keywords = [
     "incident-response",
@@ -57,6 +57,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+huawei = [
+    "huaweicloudsdkcore>=3.1.221,<4",
+    "huaweicloudsdkidentitycenteroidc>=3.1.221,<4",
+    "huaweicloudsdkidentitycenterportalapi>=3.1.221,<4",
+    "huaweicloudsdkiam>=3.1.221,<4",
+    "huaweicloudsdkfunctiongraph>=3.1.221,<4",
+    "huaweicloudsdkecs>=3.1.221,<4",
+    "huaweicloudsdkcae>=3.1.221,<4",
+    "huaweicloudsdklts>=3.1.221,<4",
+    "huaweicloudsdkcsms>=3.1.221,<4",
+    "huaweicloudsdkvpc>=3.1.221,<4",
+    "huaweicloudsdkrds>=3.1.221,<4",
+    "huaweicloudsdkevs>=3.1.221,<4",
+    "huaweicloudsdkcce>=3.1.221,<4",
+    "huaweicloudsdkcts>=3.1.221,<4",
+    "huaweicloudsdkhss>=3.1.221,<4",
+    "huaweicloudsdksecmaster>=3.1.221,<4",
+    "esdk-obs-python>=3.26.6,<4",
+]
 # Test toolchain, so contributors and CI install the same set from one place:
 #   pip install -e ".[test]"
 test = [
