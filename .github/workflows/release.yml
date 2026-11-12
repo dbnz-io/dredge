@@ -3,22 +3,15 @@ name: CI / Release
 # Single pipeline, split by domain so a red check tells you exactly what broke:
 #
 #   test  ─┐
-#   security ─┼─►  release   (only on push to main; auto-bumps the patch version)
+#   security ─┼─►  release   (only on push to main; publishes the declared version)
 #   package ─┘
 #
 # test / security / package run on every PR and push. release waits for all
-# three to pass (needs:), then, ONLY on a push to main, auto-increments the
-# PATCH version: it writes the new version into pyproject.toml + README.md and
-# commits that back to main ("[skip ci]" so the bump push doesn't re-trigger)
-# BEFORE building and publishing. Contributors no longer hand-edit the version;
-# pyproject's version on main always equals the last published release, and each
-# real merge publishes (last patch + 1). The bump is keyed off the version at
-# the triggering commit and guarded on the target tag, so manual re-runs are
-# idempotent (a re-run after success finds the tag already present and no-ops).
-#
-# PREREQUISITE: the release job pushes the bump commit to main with the default
-# GITHUB_TOKEN. If main is protected, allow github-actions[bot] to bypass the
-# push restriction (or the push — and the release — will fail).
+# three to pass (needs:), then, ONLY on a push to main, publishes the version
+# declared in pyproject.toml. The version bump belongs in the PR, as documented
+# in docs/contributing.md. This avoids silently skipping a version by adding one
+# to an already-bumped version. Re-runs are idempotent: an existing tag/release
+# is detected and skipped.
 #
 # NOTE: this file is intentionally named release.yml (not ci.yml). The PyPI
 # Trusted Publisher is bound to the workflow *filename* release.yml -- renaming
@@ -134,24 +127,18 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      # The version at the *triggering* commit is the stable input: computing
-      # next = patch + 1 from it (rather than from main's moving tip) keeps
-      # manual re-runs deterministic. Contributors don't hand-bump anymore, so
-      # this equals the last published release.
-      - name: Compute next patch version
+      # Publish exactly the version reviewed in the triggering commit.
+      - name: Read release version
         id: ver
         run: |
-          base=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          next=$(python - "$base" <<'PY'
-          import sys
-          major, minor, patch = (int(x) for x in sys.argv[1].split("."))
-          print(f"{major}.{minor}.{patch + 1}")
-          PY
-          )
-          echo "base=$base"    >> "$GITHUB_OUTPUT"
-          echo "version=$next" >> "$GITHUB_OUTPUT"
-          echo "tag=v$next"    >> "$GITHUB_OUTPUT"
-          echo "::notice::Auto patch bump $base -> $next"
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unsupported release version: $version (expected MAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "::notice::Release version is $version"
 
       - name: Has this version already been released?
         id: check
@@ -167,34 +154,29 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # ---- everything below only runs when the version is new ----
-
-      # Write the new version into pyproject.toml + README.md and commit it to
-      # main BEFORE building/publishing, so the published artifact and the repo
-      # agree. Work against origin/main's tip so the push fast-forwards; a prior
-      # partial run that already bumped it produces no diff (no-op commit). The
-      # "[skip ci]" tag stops this push from re-triggering the pipeline.
-      - name: Bump version on main
-        id: bump
+      - name: Verify version is newer than the latest release
         if: steps.check.outputs.release == 'true'
         run: |
-          next="${{ steps.ver.outputs.version }}"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git checkout -B main origin/main
-          sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"/version = "'"$next"'"/' pyproject.toml
-          sed -i -E "s/Dredge - [0-9]+\.[0-9]+\.[0-9]+/Dredge - $next/" README.md
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -am "chore(release): v$next [skip ci]"
-            git push origin main
-          fi
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          latest=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -n 1)
+          python - "${{ steps.ver.outputs.version }}" "$latest" <<'PY'
+          import re
+          import sys
 
-      # Rebuild from the bumped tree: the package job's artifact carries the
-      # pre-bump version, so it can't be the thing we publish. That job stays as
-      # the per-PR build/validate gate; this is the authoritative build.
-      - name: Build the bumped distribution
+          current = tuple(map(int, sys.argv[1].split(".")))
+          latest_tag = sys.argv[2]
+          match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", latest_tag)
+          if match:
+              previous = tuple(map(int, match.groups()))
+              if current <= previous:
+                  raise SystemExit(
+                      f"Release version {sys.argv[1]} must be greater than {latest_tag}. "
+                      "Bump project.version in pyproject.toml in the PR."
+                  )
+          PY
+
+      # The release job rebuilds from the same triggering commit after the
+      # package validation job, preserving the validated source and version.
+      - name: Build the release distribution
         if: steps.check.outputs.release == 'true'
         run: |
           python -m pip install --upgrade build twine
@@ -234,7 +216,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ steps.ver.outputs.tag }}" \
-            --target "${{ steps.bump.outputs.sha }}" \
+            --target "${{ github.sha }}" \
             --title "dredge ${{ steps.ver.outputs.version }}" \
             --generate-notes \
             dist/* "dredge-ir-${{ steps.ver.outputs.version }}-sbom.cdx.json"
